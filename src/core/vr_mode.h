@@ -20,6 +20,7 @@ void set_cutscene_3d(bool on);
 void force_cutscene(int state);
 void set_separation(float s);  // 3D cutscenes' eye separation (fraction of the IPD), applied at once  // test: -1 the native decides, 0 no cutscene, 1 a cutscene ("mode force cutscene ...")
 bool gameplay_stereo();
+int cutscene_now();  // CUTSCENE_MANAGER_IS_CUTSCENE_PLAYING as watched: 1, 0, or -1 unknown ("cutscene" test command)
 int state_flags();  // the last frame's state bits: 1 no scene, 2 paused, 4 script stalled, 8 faded, 16 cutscene, 32 resized  // the automatic modes run and the view is gameplay stereo (not cinema, not a 3D cutscene)
 void status_text(char* out, size_t len);
 

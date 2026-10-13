@@ -29,6 +29,8 @@ function InWorld {
     if ($paused -notmatch '\(int 0,') { return "paused ($paused)" }
     $faded = Ask 'native 4EFFFC06'    # HUD_IS_FADED
     if ($faded -notmatch '\(int 0,') { return "faded ($faded)" }
+    $cut = Ask 'cutscene'             # CUTSCENE_MANAGER_IS_CUTSCENE_PLAYING as the core watches it (Enter skips one); never
+    if ($cut -ne 'cutscene 0') { return "cutscene ($cut)" }  # through "native": that hash is not callable so (crashed)
     return ''
 }
 $deadline = (Get-Date).AddSeconds($TimeoutSec)
@@ -37,13 +39,15 @@ $why = ''
 while ((Get-Date) -lt $deadline) {
     $why = InWorld
     if ($why -eq '') {
-        if (++$good -ge 2) { 'in the world'; return }
+        if (++$good -ge 4) { 'in the world'; return }  # (4 x 3 s: the gaps between a cutscene's shots read as the world)
         Start-Sleep -Seconds $IntervalSec
         continue
     }
     $good = 0
     "  not yet: $why"
-    try { & "$here\keys.ps1" '{ENTER}' -DelayMs 200 | Out-Null } catch { "  Enter not sent: $_" }
+    # a cutscene takes a few presses to skip (the user, 2026-10-13); a menu one
+    $keys = if ($why -like 'cutscene*') { @('{ENTER}', '{ENTER}', '{ENTER}', '{ENTER}') } else { @('{ENTER}') }
+    try { & "$here\keys.ps1" $keys -DelayMs 300 | Out-Null } catch { "  Enter not sent: $_" }
     Start-Sleep -Seconds $IntervalSec
 }
 throw "not in the world after $TimeoutSec s (last: $why)"

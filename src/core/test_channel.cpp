@@ -673,6 +673,7 @@ std::string execute(const std::vector<std::string>& t) {
         xr::perf_probe(pr, sizeof(pr));
         return std::string(st) + " || " + pr;
     }
+    if (c == "cutscene") return "cutscene " + std::to_string(vr_mode::cutscene_now());  // (not through "native": not callable so)
     if (c == "mode") {
         // mode | mode auto on|off | mode cutscene screen|3d
         if (t.size() >= 3 && t[1] == "auto") vr_mode::set_auto(t[2] == "on");

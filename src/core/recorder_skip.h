@@ -16,7 +16,7 @@
 
 namespace rdrvr::recorder_skip {
 
-void install();               // with [Stereo] ViMain: the vtable entries through the thunks (off until begin)
+void install();               // with [Stereo] ViMain and ViSkipRecord (default 1): the vtable entries through the thunks; on
 bool installed();
 void begin();                 // the render thread: its recorder's draw and state methods return at once
 void end();

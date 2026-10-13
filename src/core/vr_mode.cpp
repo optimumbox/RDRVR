@@ -137,6 +137,11 @@ void force_cutscene(int state) {
 
 bool gameplay_stereo() { return g_auto.load() && g_view == View::Stereo; }
 int state_flags() { return g_flags.load(std::memory_order_relaxed); }
+int cutscene_now() {  // the watched native's last value: 1 playing, 0 not, -1 unknown (no watch, stale)
+    uint64_t v = 0, t = 0;
+    if (g_w_cutscene < 0 || !api::watched(g_w_cutscene, &v, &t) || api::script_ticks() > t + 30) return -1;
+    return (v & 0xff) != 0 ? 1 : 0;
+}
 
 void status_text(char* out, size_t len) {
     int f = g_flags.load();

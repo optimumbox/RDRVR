@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "core/anchors.h"
+#include "core/camera_lever.h"
 #include "core/config.h"
 #include "core/log.h"
 
@@ -83,7 +84,8 @@ void install() {
     for (size_t i = 0; i < kN; ++i) vt[kSlots[i] / 8] = g_b->code[i];
     VirtualProtect(first, span, old, &old);
     g_installed = true;
-    log::info("[recskip] %zu recorder methods through the second-scene switch (vi pass2 skip)", kN);
+    camera_lever::set_vi_skip2(true);  // (on from the start: "vi pass2 draw" records the second scene whole again)
+    log::info("[recskip] %zu recorder methods through the second-scene switch (on; vi pass2 draw|skip)", kN);
 }
 
 bool installed() { return g_installed; }
