@@ -257,6 +257,50 @@ pass:
 - the full-screen passes in between (the Shadow Collector) read the arrays per view;
 - the second pass skips everything the first drew.
 
+## Correction (2026-10-13): the world matrices are absolute; the warped right eye
+
+**What the matrices really are.** `VSFlattenTerrain`'s position math:
+
+```
+world = vertex x gWorldSingle    (rows 0-3, absolute)
+rel   = world - gViewInverse[3]  (row 15: the camera's position)
+clip  = rel x gWorldView         (rows 4-7: the view-projection without the camera's translation)
+```
+
+- Eye 2's rows exactly as upstream predicts them (eye 2's own viewport) are therefore the game's
+  pass 2 rows. Redirecting rows 4-7 and 12-15 is the whole camera change.
+- The "camera-relative world" reading was wrong, and with it the eye-offset shift added to eye 2's
+  gWorldView. The shift moved eye 2's shared geometry by part of the eye separation: at 0.5 m
+  apart, captures showed -12 px of disparity against the correct -60. It was the real cause of
+  the EQUAL-test holes.
+- The pass-2 camera trick built on it ("camfix") never reached the main pass. It stays as an off
+  switch.
+
+**The warped right eye in the headset.** The pre-pass's occlusion queries are resolved and
+predicate the main pass's draws in the same pass. With eye 2's pre-pass draws skipped, eye 2's
+queries counted nothing; its main pass then skipped those objects, and eye 1's pixels stayed in
+the shared target. A draw inside an open occlusion query is now drawn in slice 1's region
+(KF2VR's lesson: occlusion per eye). That is about 40% of eye 2's pre-pass draws, a cost to win
+back later, for example by copying the union's query results.
+
+**Verified with the eye-capture tools** (flat, 0.5 m apart):
+
+- eye 2's disparity is -55 px with view instancing on, against -54 px with it off;
+- eye 2's depth differs from the normal pass no more than two normal frames differ from each
+  other;
+- the pair shows no ghosts and no holes.
+
+**Motion vectors:** D (the eye-1 to eye-2 previous-frame correction) matched the game's own pass 2
+to 3.9e-8 relative, but that was measured with the camera trick on. To be re-checked without it,
+under DLSS.
+
+**Tools:**
+
+- `eyecap` / `grabeyes`, with `tools/sp/eyecap.py`: disparity, vertical mismatch and unmatched
+  patches;
+- `grabdepth`, with `tools/sp/depthdiff.py`;
+- `vi queries` (the query probe), `vi skip|pred|qdraw|camfix` (A/B switches), `vilog`.
+
 ## Risks
 
 - The recorded packets may point into per-pass transient memory that is recycled before the
