@@ -31,6 +31,9 @@ NO_TWIN_PS = {
     'PSFootprintColor': 'reads the scene depth through DepthBufferSampler',
     'PSMiragerSingle': 'the heat haze reads the scene copy through RenderMapBilinearSampler',
 }
+import os
+for _n in filter(None, os.environ.get('RDRVR_NO_TWIN_EXTRA', '').split(',')):  # (experiments)
+    NO_TWIN_PS[_n] = 'experiment'
 # (found with tools/sp/dxil/read_samplers.py: the $Globals texture indices a pixel shader really uses)
 
 

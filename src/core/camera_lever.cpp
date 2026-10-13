@@ -281,6 +281,17 @@ alignas(16) char g_cover_vp[kViewportSize + 0x10];
 alignas(16) char g_union_vp[kViewportSize + 0x10];  // render thread only: shadow_union_vp
 alignas(16) char g_eye2_vp[kViewportSize + 0x10];   // render thread only: [Stereo] PrepassViews' private eye-2 viewport (never current)
 uint64_t g_eye2_frame = ~0ull;                       // the frame it was built in
+// [Stereo] ViUnionCull (default on): a view-instanced frame draws eye 1's scene for both eyes, and the scene culls with
+// the viewport it draws with, so what only eye 2 sees was never drawn (2026-10-13, the headset: a chest and a barrel at
+// the right eye's right edge, eye 2's view reaching further right). Eye 1's viewport keeps its matrices but takes the
+// cull planes (+0x390..+0x46f, written by 0x132f70 from SetCamera and Perspective, each followed by Regenerate) of a
+// head-centred viewport over both eyes' FOVs plus a margin (as [XR] HeadCover's visibility build); the shadow
+// cascades, fitted to the same planes, then cover eye 2 too.
+alignas(16) char g_vicull_vp[kViewportSize + 0x10];  // render thread only
+std::atomic<bool> g_vi_cull{true};
+thread_local bool t_vi_cull = false;  // eye 1's scene of a view-instanced frame: its viewport's planes replaced
+constexpr size_t kCullPlanes = 0x390, kCullPlanesBytes = 0x470 - 0x390;
+std::atomic<uint64_t> g_vi_culls{0};
 bool g_union_ok = false;
 // The union's margin: each eye sits 3 cm or so off the centre, so its frustum edge leaves the centre's by up to
 // atan(0.032/z) at depth z, against tangents near 1.4 at the edge: 3 degrees covers it from about 0.25 m on.
@@ -456,6 +467,7 @@ void hk_SceneRender(void* renderer, void* vp, const float* cam_game, void* a4) {
         const double t1 = probe ? log::now_ms() : 0;
         if (probe) frame_probe::set_phase(frame_probe::kPhasePass1);
         scene_once(renderer, vp, cam, a4, first);
+        t_vi_cull = false;
         const double t2 = probe ? log::now_ms() : 0;
         if (probe) frame_probe::set_phase(frame_probe::kBetween);
         dual_pass::between_passes(renderer, first);
@@ -580,6 +592,21 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
         prepass::set_eye2_offset(copy + 12, other + 12);
         prepass::set_eye2(g_eye2_vp, nullptr);  // (without jitter; the TAA update's jittered rows replace these)
         g_eye2_frame = state::presents.load();
+        if (t_vi_frame && g_vi_cull.load(std::memory_order_relaxed)) {  // ViUnionCull: the cull planes over both eyes
+            const float m = kCoverMarginDeg / 57.29577951f;
+            float hw = 0, hh = 0;
+            for (int e = 0; e < 2; ++e) {
+                hw = std::fmax(hw, std::fmax(std::tan(-views[e].fov[0] + m), std::tan(views[e].fov[1] + m)));
+                hh = std::fmax(hh, std::fmax(std::tan(views[e].fov[2] + m), std::tan(-views[e].fov[3] + m)));
+            }
+            alignas(16) float centre[16];
+            if (xr_eye_camera(cam, 2, centre, true)) {
+                std::memcpy(g_vicull_vp, g_saved_vp, kViewportSize);
+                apply_tangents(g_vicull_vp, -hw, hw, hh, -hh);
+                o_SetCamera(g_vicull_vp, centre);
+                t_vi_cull = true;
+            }
+        }
     } else if (!xr_pose && ipd != 0 && cam && first_pass && prepass::views_wanted()) {
         // the flat double pass ("double on <ipd>", no headset): eye 2's viewport is the frame's with the other eye's
         // camera, so the view-instanced pre-pass can be tested on the monitor
@@ -683,6 +710,10 @@ void hk_SetCamera(void* vp, const float* cam) {
 Regenerate_t o_Regenerate = nullptr;
 void hk_Regenerate(void* vp, char push) {
     o_Regenerate(vp, push);
+    if (t_vi_cull && vp == t_scene_vp) {  // [Stereo] ViUnionCull: eye 1's viewport culls for both eyes
+        std::memcpy(static_cast<char*>(vp) + kCullPlanes, g_vicull_vp + kCullPlanes, kCullPlanesBytes);
+        g_vi_culls.fetch_add(1, std::memory_order_relaxed);
+    }
     if (t_vi_fix) vi_log("Regenerate", vp);
     if (!(t_vi_fix && vp == t_scene_vp)) return;
     float* m = reinterpret_cast<float*>(static_cast<char*>(vp) + 0xc0);
@@ -969,6 +1000,7 @@ bool install() {
         log::warn("[cam] Regenerate not hooked: pass 2 of a view-instanced frame keeps its own rows");
     g_perspective = reinterpret_cast<Perspective_t>(anchors::addr(anchors::Id::ViewportPerspective));
     g_head_cover = config::get_bool("XR", "HeadCover", true);
+    g_vi_cull = config::get_bool("Stereo", "ViUnionCull", true);
     bool ok = hooks::install("RDR SceneRender", reinterpret_cast<void*>(anchors::addr(anchors::Id::SceneRender)),
                              hk_SceneRender, &o_SceneRender);
     ok = hooks::install("RDR grcViewport::SetCamera", reinterpret_cast<void*>(anchors::addr(anchors::Id::ViewportSetCamera)),
@@ -1013,6 +1045,8 @@ void request_log() { g_log = true; }
 void request_vi_log() { g_vi_log = 1; }
 void request_push_log() { g_push_log = 1; }
 void set_vi_camfix(bool on) { g_vi_camfix = on; }
+void set_vi_cull(bool on) { g_vi_cull = on; }
+uint64_t vi_culls() { return g_vi_culls.load(); }
 void set_vi_skip2(bool on) { g_vi_skip2 = on; }
 uint64_t vi_skipped2() { return g_vi_skipped2.load(); }
 

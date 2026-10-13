@@ -23,6 +23,8 @@ void set(Mode mode, float dx, float dy, float dz);  // metres, along the camera 
 void request_log();                                  // log the next scene camera and viewport state
 void request_vi_log();
 void request_push_log();  // "pushlog": the next view-instanced double frame's PushGlobals calls
+void set_vi_cull(bool on);  // "vi cull on|off": [Stereo] ViUnionCull (eye 1's scene culls for both eyes)
+uint64_t vi_culls();
 void set_vi_camfix(bool on);  // pass 2 of a view-instanced frame from eye 1's position ("vi camfix", off: see camera_lever.cpp)  // "vilog": the next view-instanced frame's pass 2, its viewport calls (Regenerate, SetCamera, PushGlobals)
 void set_vi_skip2(bool on);  // [Stereo] ViSkipPass2 / "vi pass2 skip|draw"
 uint64_t vi_skipped2();

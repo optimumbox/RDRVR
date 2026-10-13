@@ -32,9 +32,14 @@ namespace {
 enum Kind { kDepth, kCollector, kVelocity, kGrassColour, kGrassLight, kTree, kLight, kFsc, kReact, kRefr, kKinds };
 constexpr int kPrepassKinds = kLight;
 // The global_textures slot each kind is read through (the main pass's shaders: 11 LightBufferSampler, 13
-// ShadowCollectorSampler, 12 GlobalWaterSampler0: the refraction copy glass and river water see through, 2026-10-13; the scene depth: its own index, vi::kDepthBufferSlot), -1 none. Eye 2's copy of such a kind
+// ShadowCollectorSampler; the scene depth: its own index, vi::kDepthBufferSlot), -1 none. Eye 2's copy of such a kind
 // is made for view 1's reads (stereo_vi.h).
-const int kSlot[kKinds] = {vi::kDepthBufferSlot, 13, -1, -1, -1, -1, 11, -1, -1, 12};
+// Slot 12 (GlobalWaterSampler0: the refraction copy glass and river water look through) reads eye 2's copy of the
+// scene colour (FullScreenCopy), not of the refraction copy: the copy (PS_Blit, no twin) is drawn for eye 2 in eye 2's
+// region, after slice 0's region drew the glass into eye 2's scene colour, so eye 2 saw the glass through the glass
+// (2026-10-13, the headset: a grey haze in the right eye's windows). FullScreenCopy is copied out (into eye 2's copy
+// too) as the refraction copy reads it, before the glass; the copy is a plain blit of it.
+const int kSlot[kKinds] = {vi::kDepthBufferSlot, 13, -1, -1, -1, -1, 11, 12, -1, -1};
 constexpr int kDepthSlot = 15;  // the scene depth's slot: the game's "Depth Resolve" copy
 const char* const kNames[kKinds] = {"Shadow Collector Depth Buffer", "Shadow Collector",        "Velocity RT",
                                     "Grass FS Colour",               "Grass FS Light Multiply", "Tree FS Colour Diffuse",

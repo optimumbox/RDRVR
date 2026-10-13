@@ -584,6 +584,10 @@ std::string command(const std::vector<std::string>& t) {
         ReleaseSRWLockShared(&g_lock);
         return r;
     }
+    if (sub == "cull" && t.size() >= 3) {  // vi cull on|off: [Stereo] ViUnionCull
+        camera_lever::set_vi_cull(t[2] == "on");
+        return std::string("union cull ") + t[2] + " (" + std::to_string(camera_lever::vi_culls()) + " plane swaps so far)";
+    }
     if (sub == "camfix" && t.size() >= 3) {
         camera_lever::set_vi_camfix(t[2] == "on");
         return std::string("pass 2 from eye 1's position: ") + t[2];
