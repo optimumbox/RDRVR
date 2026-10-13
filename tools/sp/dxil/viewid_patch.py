@@ -17,17 +17,26 @@ a view-dependent block bound through more than one range, or a shader that alrea
 import re
 import sys
 
-# block type name -> (rows that differ per eye, the row offset of eye 2's copy). gWorldViewProj (rows 8-11) has no eye-2
-# copy yet (PrepassViews=2 writes gWorldView and gViewInverse): a shader reading it is refused.
+# block type name -> (rows that differ per eye, the row offset of eye 2's copy). gWorldViewProj (rows 8-11, per draw)
+# has no eye-2 copy: view 1 builds eye 2's from the draw's gWorldSingle and eye 2's camera (patch_wvp).
 VIEW_BLOCKS = {
     'rage_matrices': ([*range(4, 8), *range(12, 16)], 13),
     'rage_prev_proj': (range(0, 4), 4),
 }
-REFUSED_ROWS = {'rage_matrices': range(8, 12)}
+WVP_ROWS = range(8, 12)  # rage_matrices: gWorldViewProj = gWorldSingle x T(-camera) x gWorldView
+WV2_ROW, CAM2_ROW = 17, 28  # rage_matrices: eye 2's gWorldView, eye 2's camera position (gViewInverse row 3)
+# eye 2's inverse gWorldView, packed (a perspective's inverse: row 2 is (0, 0, 0, k), rows 0 and 1 end in 0):
+# row 29 (inv[0].xyz, inv[2].w), row 30 (inv[1].xyz, 0), row 31 inv[3] (prepass_arrays.cpp write_inv_wv2)
+INV2_ROW = 29
+# Variables that are the inverse of (a world x) the camera's view-projection: view 1 reads
+#   X2 = inverse(gWorldView2) x T(camera2 - camera1) x gWorldView1 x X1  (patch_inverse)
+INVERSE_VARS = {'WorldViewProjInverse', 'WorldViewProjInverseTrees', 'InverseViewProj'}
+# Blocks the same for both eyes in a view-instanced frame: the shadow camera (both eyes use pass 1's shadow maps)
+SHARED_BLOCKS = {'rage_shadowmap_common'}
 # Any other variable whose name says it depends on the camera, read from any block: refused (eye 2 would read eye 1's).
 VIEW_NAME = re.compile(r'View(?!port)|Camera|Proj|Eye|FOV', re.I)
-# ... except these: the same for both eyes, or handled above
-VIEW_NAME_OK = {'gViewport'}
+# ... except these: the same for both eyes, or handled above (scalars: a distance each)
+VIEW_NAME_OK = {'gViewport', 'gBiasToCamera', 'gCameraDistanceAtMaxDisplacement', 'gNearCameraFade'}
 # rage_prev_world's gPrevWorldViewProjSingle (rows 0-3, per draw: the motion vectors) is eye 1's in the shared rows; in
 # view 1 each row read is multiplied by D (eye 1's previous view-projection inverted, times eye 2's; the core writes it
 # to rage_matrices rows 21-24, eye 2's unused gWorldViewProj slot): eye 2's own previous-frame position, as the game's
@@ -73,8 +82,12 @@ def layouts(text):
     return out
 
 
-def check_reads(text, allow_prev_world):
-    """refuses a shader that reads a camera-dependent variable no eye-2 copy exists for"""
+def check_reads(text, allow_prev_world, found=None):
+    """refuses a shader that reads a camera-dependent variable no eye-2 copy exists for; `found` (a dict) gets 'wvp'
+    (gWorldViewProj read) and 'inverse' ({block: [first rows of its INVERSE_VARS read]})"""
+    found = {} if found is None else found
+    found.setdefault('wvp', False)
+    found.setdefault('inverse', {})
     lay = layouts(text)
     ranges = {}
     for m in re.finditer(r'^!\d+ = !\{i32 (\d+), %"?(?:hostlayout\.)?([^"*]+)"?\* undef, !"[^"]*", i32 \d+, i32 \d+, i32 \d+, i32 \d+, null\}',
@@ -87,11 +100,19 @@ def check_reads(text, allow_prev_world):
     for m in re.finditer(r'@dx\.op\.cbufferLoadLegacy\.\w+\(i32 59, %dx\.types\.Handle (%\d+), i32 ([%\w.]+)\)', text):
         block = handles.get(m.group(1), '?')
         if block in VIEW_BLOCKS:
-            if not m.group(2).startswith('%') and int(m.group(2)) in REFUSED_ROWS.get(block, ()):
-                raise Refused(f'reads {block} row {m.group(2)} (no eye-2 copy)')
+            if block == 'rage_matrices' and not m.group(2).startswith('%') and int(m.group(2)) in WVP_ROWS:
+                found['wvp'] = True
             continue
-        names = [n for a, b, n in lay.get(block, []) if m.group(2).startswith('%') or a <= int(m.group(2)) <= b]
-        for n in names:
+        if block in SHARED_BLOCKS:
+            continue
+        names = [(a, n) for a, b, n in lay.get(block, []) if m.group(2).startswith('%') or a <= int(m.group(2)) <= b]
+        for a, n in names:
+            if n in INVERSE_VARS:
+                if m.group(2).startswith('%'):
+                    raise Refused(f'dynamic row index into {block}.{n}')
+                if a not in found['inverse'].setdefault(block, []):
+                    found['inverse'][block].append(a)
+                continue
             if VIEW_NAME.search(n) and n not in VIEW_NAME_OK:
                 if block == PREV_WORLD and not m.group(2).startswith('%') and int(m.group(2)) in PREV_WORLD_ROWS:
                     prev_world = True  # handled: patch_prev_world
@@ -110,21 +131,20 @@ def patch(text, allow_prev_world=True):  # (allow_prev_world: kept for callers; 
                          text, re.M):
         if m.group(2) in VIEW_BLOCKS:
             ranges[m.group(1)] = m.group(2)
-    approx = check_reads(text, allow_prev_world)
+    found = {}
+    approx = check_reads(text, allow_prev_world, found)
     handles = {}
     for m in re.finditer(r'(%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 2, i32 (\d+), i32 (\S+), i1', text):
         if m.group(2) in ranges:
             handles[m.group(1)] = ranges[m.group(2)]
     screen = screen_slot_reads(text)
-    if not handles and not screen:
-        raise Refused('no view-dependent block')
-
     out, n_redirect, in_entry, inserted = [], 0, False, False
     load = re.compile(r'(@dx\.op\.cbufferLoadLegacy\.\w+\(i32 59, %dx\.types\.Handle (%\d+), i32 )([%\w.]+)\)')
     for ln in lines:
         if ln.startswith('define void @') and not inserted:
             out.append(ln)
             out.append(f'  %vid.sp = call i32 @dx.op.viewID.i32(i32 {VIEWID_OPCODE})')
+            out.append('  %isv1.sp = icmp ne i32 %vid.sp, 0')
             inserted = True
             in_entry = True
             continue
@@ -147,10 +167,13 @@ def patch(text, allow_prev_world=True):  # (allow_prev_world: kept for callers; 
     if not inserted:
         raise Refused('no entry function')
     out, n_screen = patch_screen_slots(out, screen)
-    if n_redirect + n_screen == 0:
-        raise Refused('no view-dependent block')
-    n_redirect += n_screen
     text = '\n'.join(out)
+    text, n_wvp = patch_wvp(text) if found['wvp'] else (text, 0)
+    text, n_inv = patch_inverse(text, found['inverse']) if found['inverse'] else (text, 0)
+    text, n_remap = patch_index_remap(text, set(screen))
+    if n_redirect + n_screen + n_wvp + n_inv + n_remap == 0:
+        raise Refused('no view-dependent block')
+    n_redirect += n_screen + n_wvp + n_inv + n_remap
     # the ViewID op's declaration, beside the other dx.op declarations (readnone, as the compiler declares it)
     ro = re.search(r'^attributes (#\d+) = \{ nounwind readnone \}', text, re.M)
     if not ro:
@@ -245,6 +268,180 @@ def patch_screen_slots(lines, screen):
     return out, n
 
 
+def range_ids(text):
+    """{block type name: CBV range id}"""
+    return {m.group(2): m.group(1) for m in re.finditer(
+        r'^!\d+ = !\{i32 (\d+), %"?(?:hostlayout\.)?([^"*]+)"?\* undef, !"[^"]*", i32 \d+, i32 \d+, i32 \d+, i32 \d+, null\}', text, re.M)}
+
+
+def cb_handles(text, rid):
+    return sorted({m.group(1) for m in re.finditer(r'(%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 2, i32 ' + rid + r',', text)},
+                  key=lambda h: int(h[1:]))
+
+
+F32_LOAD = re.compile(r'^  (%\d+) = call %dx\.types\.CBufRet\.f32 @dx\.op\.cbufferLoadLegacy\.f32\(i32 59, %dx\.types\.Handle (%\d+), i32 (\d+)\)')
+
+
+def emit_row(out, t, h, row, past_end=False, kind='f32'):
+    """a load of row `row` of the block behind handle h; its four components are t.c0..c3 (a row past the block's
+    declared end is read through a dynamic index, view 0 reading row 0, unused: a constant one fails validation)"""
+    idx = row
+    if past_end:
+        out.append(f'  {t}.i = select i1 %isv1.sp, i32 {row}, i32 0')
+        idx = f'{t}.i'
+    out.append(f'  {t} = call %dx.types.CBufRet.{kind} @dx.op.cbufferLoadLegacy.{kind}(i32 59, %dx.types.Handle {h}, i32 {idx})')
+    for k in range(4):
+        out.append(f'  {t}.c{k} = extractvalue %dx.types.CBufRet.{kind} {t}, {k}')
+    return [f'{t}.c{k}' for k in range(4)]
+
+
+def emit_vec_mat(out, t, v, rows):
+    """v x M, the row vector v (None entries: zero) times the matrix whose rows are `rows`: four value names"""
+    res = []
+    for k in range(4):
+        acc = None
+        for j in range(4):
+            if v[j] is None:
+                continue
+            out.append(f'  {t}.m{j}c{k} = fmul float {v[j]}, {rows[j][k]}')
+            if acc is None:
+                acc = f'{t}.m{j}c{k}'
+            else:
+                out.append(f'  {t}.a{j}c{k} = fadd float {acc}, {t}.m{j}c{k}')
+                acc = f'{t}.a{j}c{k}'
+        res.append(acc)
+    return res
+
+
+def alias_loads(out, rename):
+    """the original component reads of each renamed load (load value -> t) now read t.s0..s3 (the original reads stay,
+    unused: removing them would renumber the unnamed values after them)"""
+    ext = re.compile(r'^  (%\d+) = extractvalue %dx\.types\.CBufRet\.f32 (%\d+), (\d)$')
+    alias, defs = {}, set()
+    for i, ln in enumerate(out):
+        m = ext.match(ln.split('  ;')[0].rstrip())
+        if m and m.group(2) in rename:
+            alias[m.group(1)] = f'{rename[m.group(2)]}.s{m.group(3)}'
+            defs.add(i)
+    tok = re.compile(r'%\d+(?![\w.])')
+    return chr(10).join(ln if i in defs else tok.sub(lambda mm: alias.get(mm.group(0), mm.group(0)), ln) for i, ln in enumerate(out))
+
+
+def select_rows(out, t, L, r):
+    """t.s0..s3: view 1 the values r, view 0 the load L's own"""
+    for k in range(4):
+        out.append(f'  {t}.e{k} = extractvalue %dx.types.CBufRet.f32 {L}, {k}')
+        out.append(f'  {t}.s{k} = select i1 %isv1.sp, float {r[k]}, float {t}.e{k}')
+
+
+def patch_wvp(text):
+    """view 1's reads of rage_matrices rows 8-11 (gWorldViewProj, per draw) become eye 2's, from the draw's own
+    gWorldSingle: row i = (gWorldSingle row i - its w x camera2) x gWorldView2"""
+    hs = cb_handles(text, range_ids(text)['rage_matrices'])
+    hm = hs[0]
+    out, rename, n = [], {}, 0
+    for ln in text.split(chr(10)):
+        m = F32_LOAD.match(ln)
+        out.append(ln)
+        if not m or m.group(2) not in hs or int(m.group(3)) not in WVP_ROWS:
+            continue
+        n += 1
+        L, t, i = m.group(1), f'%wvp{n}.sp', int(m.group(3)) - WVP_ROWS[0]
+        w = emit_row(out, f'{t}.w', hm, i)
+        c2 = emit_row(out, f'{t}.cam', hm, CAM2_ROW, True)
+        wv2 = [emit_row(out, f'{t}.wv{j}', hm, WV2_ROW + j, True) for j in range(4)]
+        v = []
+        for k in range(3):
+            out.append(f'  {t}.o{k} = fmul float {w[3]}, {c2[k]}')
+            out.append(f'  {t}.v{k} = fsub float {w[k]}, {t}.o{k}')
+            v.append(f'{t}.v{k}')
+        v.append(w[3])
+        select_rows(out, t, L, emit_vec_mat(out, f'{t}.x', v, wv2))
+        rename[L] = t
+    return (alias_loads(out, rename), n) if n else (text, 0)
+
+
+def patch_inverse(text, inverse):
+    """view 1's reads of an inverse view-projection X (INVERSE_VARS, rows f..f+3 of its block) become eye 2's:
+    X2 row i = (P row i + its w x (camera2 - camera1)) x gWorldView1 x X1, P = inverse(gWorldView2) (packed, INV2_ROW)"""
+    rid = range_ids(text)
+    if 'rage_matrices' not in rid:
+        raise Refused('reads an inverse view-projection without rage_matrices')
+    hm = cb_handles(text, rid['rage_matrices'])[0]
+    firsts = {}  # handle -> first rows of its inverse matrices
+    for block, f in inverse.items():
+        for h in cb_handles(text, rid[block]):
+            firsts[h] = f
+    out, rename, n = [], {}, 0
+    for ln in text.split(chr(10)):
+        m = F32_LOAD.match(ln)
+        out.append(ln)
+        if not m or m.group(2) not in firsts:
+            continue
+        row = int(m.group(3))
+        first = next((f for f in firsts[m.group(2)] if f <= row < f + 4), None)
+        if first is None:
+            continue
+        n += 1
+        L, t, i = m.group(1), f'%inv{n}.sp', row - first
+        x1 = [emit_row(out, f'{t}.x{j}', m.group(2), first + j) for j in range(4)]
+        wv1 = [emit_row(out, f'{t}.wv{j}', hm, 4 + j) for j in range(4)]
+        if i in (0, 1):  # P row i = (inv[i].xyz, 0): no translation
+            pr = emit_row(out, f'{t}.p', hm, INV2_ROW + i, True)
+            v = [pr[0], pr[1], pr[2], None]
+        else:  # row 2 (0, 0, 0, inv[2].w: row 29's w), row 3 (row 31)
+            pr = emit_row(out, f'{t}.p', hm, INV2_ROW if i == 2 else INV2_ROW + 2, True)
+            pxyz = [None] * 3 if i == 2 else pr[:3]
+            c1 = emit_row(out, f'{t}.c1', hm, 15)
+            c2 = emit_row(out, f'{t}.c2', hm, CAM2_ROW, True)
+            v = []
+            for k in range(3):
+                out.append(f'  {t}.d{k} = fsub float {c2[k]}, {c1[k]}')
+                out.append(f'  {t}.dw{k} = fmul float {pr[3]}, {t}.d{k}')
+                if pxyz[k] is None:
+                    v.append(f'{t}.dw{k}')
+                else:
+                    out.append(f'  {t}.v{k} = fadd float {pxyz[k]}, {t}.dw{k}')
+                    v.append(f'{t}.v{k}')
+            v.append(pr[3])
+        q = emit_vec_mat(out, f'{t}.q', v, wv1)
+        select_rows(out, t, L, emit_vec_mat(out, f'{t}.y', q, x1))
+        rename[L] = t
+    return (alias_loads(out, rename), n) if n else (text, 0)
+
+
+def patch_index_remap(text, done):
+    """view 1's bindless 2D texture indices from any source (a material's own index too) that name a screen image the
+    game also put in a global_textures screen slot read eye 2's copy: idx == slot's value ? EYE2_SLOT_BASE + slot : idx"""
+    rid = range_ids(text)
+    if 'global_textures' not in rid:
+        return text, 0
+    srv = re.search(r'^!\d+ = !\{i32 (\d+), \[0 x %"class\.Texture2D<[^"]*>"\]\* undef, !"[^"]*", i32 \d+, i32 0, i32 -1, i32 2,', text, re.M)
+    hg = cb_handles(text, rid['global_textures'])
+    if not srv or not hg:
+        return text, 0
+    hre = re.compile(r'^  (%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 0, i32 ' + srv.group(1) + r', i32 (%\d+), i1')
+    out, n = [], 0
+    for ln in text.split(chr(10)):
+        m = hre.match(ln)
+        if not m or m.group(1) in done:
+            out.append(ln)
+            continue
+        n += 1
+        t, idx = f'%rmp{n}.sp', m.group(2)
+        rows, cur = {}, idx
+        for slot in sorted(SCREEN_SLOTS):
+            r = slot // 4
+            if r not in rows:
+                rows[r] = emit_row(out, f'{t}.g{r}', hg[0], r, kind='i32')
+            out.append(f'  {t}.q{slot} = icmp eq i32 {idx}, {rows[r][slot % 4]}')
+            out.append(f'  {t}.b{slot} = and i1 {t}.q{slot}, %isv1.sp')
+            out.append(f'  {t}.n{slot} = select i1 {t}.b{slot}, i32 {EYE2_SLOT_BASE + slot}, i32 {cur}')
+            cur = f'{t}.n{slot}'
+        out.append(ln.replace(f', i32 {idx}, i1', f', i32 {cur}, i1', 1))
+    return chr(10).join(out), n
+
+
 def patch_prev_world(text):
     """view 1's reads of rage_prev_world rows 0-3 become row x D (D: rage_matrices rows 21-24); view 0's unchanged"""
     rid = {}
@@ -263,10 +460,6 @@ def patch_prev_world(text):
     load = re.compile(r'^  (%\d+) = call %dx\.types\.CBufRet\.f32 @dx\.op\.cbufferLoadLegacy\.f32\(i32 59, %dx\.types\.Handle (%\d+), i32 (\d+)\)')
     out, rename, n = [], {}, 0
     for i, ln in enumerate(lines):
-        if ln.startswith('  %vid.sp = '):
-            out.append(ln)
-            out.append('  %isv1.sp = icmp ne i32 %vid.sp, 0')
-            continue
         m = load.match(ln)
         out.append(ln)
         if not m or m.group(2) not in hp or int(m.group(3)) not in PREV_WORLD_ROWS:

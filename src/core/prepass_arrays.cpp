@@ -5,6 +5,7 @@
 
 #include <intrin.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cmath>
@@ -548,7 +549,7 @@ bool ensure_grown() {
         refuse_grow(why);
         return false;
     }
-    if (!grow(g_b1, cb_wv, 0x110, 0x1d0, 0x200)) {
+    if (!grow(g_b1, cb_wv, 0x110, 0x200, 0x200)) {
         refuse_grow("rage_matrices not grown (its size is not 0x110, or a read failed)");
         return false;
     }
@@ -557,7 +558,7 @@ bool ensure_grown() {
         return false;
     }
     g_grow_state = 1;
-    log::info("[prepass] views: rage_matrices %#llx grown 0x110 -> 0x1d0 (storage %#llx), rage_prev_proj %#llx 0x40 -> 0x80 (storage %#llx)",
+    log::info("[prepass] views: rage_matrices %#llx grown 0x110 -> 0x200 (storage %#llx), rage_prev_proj %#llx 0x40 -> 0x80 (storage %#llx)",
               static_cast<unsigned long long>(g_b1.cb), static_cast<unsigned long long>(g_b1.block), static_cast<unsigned long long>(g_pp.cb),
               static_cast<unsigned long long>(g_pp.block));
     return true;
@@ -570,7 +571,7 @@ void apply_size_want() {
         uintptr_t layout = 0;
         if (rd(g->cb + 0x08, &layout)) wr<uint32_t>(layout + 0x14, w ? g->grown : g->declared);
     }
-    log::info("[prepass] views: the declared sizes %s", w ? "grown (0x1d0, 0x80)" : "as the game's (0x110, 0x40)");
+    log::info("[prepass] views: the declared sizes %s", w ? "grown (0x200, 0x80)" : "as the game's (0x110, 0x40)");
 }
 bool still_grown(const Grown& g) {
     uintptr_t storage = 0, layout = 0;
@@ -578,6 +579,31 @@ bool still_grown(const Grown& g) {
     return rd(g.cb, &storage) && storage == g.block && rd(g.cb + 0x08, &layout) && rd(layout + 0x14, &size) && size == g.grown;
 }
 // pass 1, before the pre-pass: rows 17-20 (gWorldView) and 25-28 (gViewInverse) of b1, rows 4-7 of rage_prev_proj
+// Eye 2's gWorldView inverted (double precision), packed into rage_matrices rows 29-31 for the converted shaders that
+// read an inverse view-projection (tools/sp/dxil/viewid_patch.py patch_inverse: X2 = inv(gWorldView2) x T(camera2 -
+// camera1) x gWorldView1 x X1). A perspective's inverse has rows 0 and 1 ending in 0 and row 2 (0, 0, 0, k), so three
+// rows hold it: row 29 (inv[0].xyz, inv[2].w), row 30 (inv[1].xyz, 0), row 31 inv[3]. The parts the packing drops are
+// checked: their largest, relative to the matrix's largest entry, is in "vi status".
+uint64_t g_inv_written = 0, g_inv_failed = 0;
+float g_inv_dropped = 0;
+void write_inv_wv2(const float* wv) {
+    double a[16], inv[16];
+    for (int i = 0; i < 16; ++i) a[i] = wv[i];
+    float rows[12] = {};
+    if (!invert4(a, inv)) {
+        ++g_inv_failed;
+        write_raw(g_b1.block + 0x1d0, rows, sizeof(rows));
+        return;
+    }
+    double big = 0, dropped = 0;
+    for (double x : inv) big = std::max(big, std::fabs(x));
+    for (int i : {3, 7, 8, 9, 10}) dropped = std::max(dropped, std::fabs(inv[i]));
+    if (big > 0) g_inv_dropped = std::max(g_inv_dropped, static_cast<float>(dropped / big));
+    const int map[12] = {0, 1, 2, 11, 4, 5, 6, -1, 12, 13, 14, 15};
+    for (int i = 0; i < 12; ++i) rows[i] = map[i] < 0 ? 0.f : static_cast<float>(inv[map[i]]);
+    write_raw(g_b1.block + 0x1d0, rows, sizeof(rows));
+    ++g_inv_written;
+}
 void write_eye2(const float* wv, const float* vi, const float* pvp) {
     if (!ensure_grown()) return;
     apply_size_want();
@@ -594,6 +620,7 @@ void write_eye2(const float* wv, const float* vi, const float* pvp) {
     if (pvp) std::memcpy(pp, pvp, sizeof(pp));
     else if (!read_raw(g_pp.block, pp, sizeof(pp))) return;  // no jitter: both eyes' gPrevViewProj are the same
     if (!write_raw(g_b1.block + 0x110, wv, 64) || !write_raw(g_b1.block + 0x190, vi, 64) || !write_raw(g_pp.block + 0x40, pp, 64)) return;
+    write_inv_wv2(wv);
     wr<int>(g_b1.cb + 0x24, -1);  // (re-uploaded at its next commit)
     wr<int>(g_pp.cb + 0x24, -1);
     std::memcpy(g_written_wv, wv, 64);
@@ -1030,16 +1057,17 @@ int vi_region(const ID3D12GraphicsCommandList* cl, bool* all_arrays) {
     return g_r.slice + 1;
 }
 std::string vi_status() {
-    char b[700];
+    char b[900];
     std::snprintf(b, sizeof(b), "view-instanced regions: slice 0 %llu, slice 1 %llu | pass 2's rows as the pre-pass's: same %llu, differ %llu (max %.7f)"
                   " | motion vectors: D %s, checked %llu frames, largest relative difference %.2e (not checked: unread %llu, not vi %llu, no D %llu)"
-                  " | main pass %s: publishes %llu, depth copies %llu",
+                  " | main pass %s: publishes %llu, depth copies %llu | eye 2's inverse gWorldView: %llu written, %llu not invertible, packing drops %.1e",
                   static_cast<unsigned long long>(g_vi_regions[0].load()), static_cast<unsigned long long>(g_vi_regions[1].load()),
                   static_cast<unsigned long long>(g_vi_rows_same), static_cast<unsigned long long>(g_vi_rows_differ), g_vi_rows_max,
                   g_e2_delta_ok ? "from the updates" : "identity", static_cast<unsigned long long>(g_mv_checks), g_mv_err,
                   static_cast<unsigned long long>(g_mv_unread), static_cast<unsigned long long>(g_mv_not_vi),
                   static_cast<unsigned long long>(g_mv_no_delta), g_i2.load() ? "on" : "off",
-                  static_cast<unsigned long long>(g_publishes.load()), static_cast<unsigned long long>(g_depth_copies.load()));
+                  static_cast<unsigned long long>(g_publishes.load()), static_cast<unsigned long long>(g_depth_copies.load()),
+                  static_cast<unsigned long long>(g_inv_written), static_cast<unsigned long long>(g_inv_failed), g_inv_dropped);
     return b;
 }
 
