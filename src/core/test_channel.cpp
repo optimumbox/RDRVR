@@ -704,6 +704,10 @@ std::string execute(const std::vector<std::string>& t) {
         ring_probe::matrix_check(t[1] == "on");
         return "ok";
     }
+    if (c == "vilog") {
+        camera_lever::request_vi_log();
+        return "armed: the next view-instanced frame's pass 2 ([cam] vilog lines)";
+    }
     if (c == "camlog") {
         camera_lever::request_log();
         return "logging the next scene camera";

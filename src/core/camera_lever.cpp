@@ -89,7 +89,9 @@ bool level_camera(const float* c, float* out) {
     return level_from(g_game_cam_valid.load(std::memory_order_relaxed) ? g_game_cam : c, c, out);
 }
 
+void vi_log_pass2(const char* what, void* vp);  // (below: only inside pass 2 of a view-instanced frame)
 void hk_PushGlobals(void* vp, char push_view_inverse) {
+    vi_log_pass2(push_view_inverse ? "PushGlobals+vi" : "PushGlobals", vp);
     if (push_view_inverse && vp && g_vi_level.load(std::memory_order_relaxed) && vp == g_scene_vp.load(std::memory_order_relaxed)) {
         float* vi = reinterpret_cast<float*>(static_cast<char*>(vp) + 0x140);
         float saved[8], lv[16];
@@ -362,6 +364,19 @@ bool t_vi_frame = false;          // this frame's pre-pass is view-instanced (pr
 bool t_vi_fix = false;            // inside pass 2 of such a frame
 float t_vi_c1[3], t_vi_c2[3];     // eye 1's and eye 2's camera positions (pass 1)
 std::atomic<uint64_t> g_vi_fixes{0}, g_vi_frames{0};
+// "cam vilog": the next view-instanced frame's pass 2: every Regenerate, SetCamera and PushGlobals on the render thread,
+// with the viewport, its camera position (+0x140 row 3) and whether it is the scene's
+std::atomic<int> g_vi_log{0};  // 1 armed, 2 logging this pass 2
+void vi_log(const char* what, void* vp);
+void vi_log_pass2(const char* what, void* vp) {
+    if (t_vi_fix) vi_log(what, vp);
+}
+void vi_log(const char* what, void* vp) {
+    if (g_vi_log.load(std::memory_order_relaxed) != 2 || !vp) return;
+    const float* p = reinterpret_cast<const float*>(static_cast<char*>(vp) + 0x140 + 48);
+    log::info("[cam] vilog %s vp %p%s pos (%.3f %.3f %.3f) ret %p", what, vp, vp == t_scene_vp ? " (scene)" : vp == g_eye2_vp ? " (eye 2's)" : "",
+              p[0], p[1], p[2], _ReturnAddress());
+}
 thread_local float t_frame_yaw = 0.0f;  // the test yaw latched once a frame: both passes and the union see the same
 
 void hk_SceneRender(void* renderer, void* vp, const float* cam_game, void* a4) {
@@ -548,7 +563,13 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
         if (t_vi_frame && second) {  // drawn from eye 1's position, its view rows moved after each SetCamera (hk_SetCamera)
             std::memcpy(copy + 12, t_vi_c1, sizeof(t_vi_c1));
             t_vi_fix = true;
+            if (g_vi_log.load() == 1) {
+                g_vi_log = 2;
+                log::info("[cam] vilog pass 2: eye 1 (%.3f %.3f %.3f) eye 2 (%.3f %.3f %.3f)", t_vi_c1[0], t_vi_c1[1], t_vi_c1[2], t_vi_c2[0],
+                          t_vi_c2[1], t_vi_c2[2]);
+            }
             o_SceneRender(renderer, vp, copy, a4);
+            if (g_vi_log.load() == 2) g_vi_log = 0;
             t_vi_fix = false;
             ring_probe::matrix_expect(-2, nullptr, nullptr, nullptr);
             t_scene_vp = outer;
@@ -584,6 +605,7 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
 
 void hk_SetCamera(void* vp, const float* cam) {
     o_SetCamera(vp, cam);
+    if (t_vi_fix) vi_log("SetCamera", vp);
     if (t_vi_fix && vp == t_scene_vp) {
         // (the view-projection's move is made in hk_Regenerate, which SetCamera calls and which rebuilds +0xc0 each time)
         char* v = static_cast<char*>(vp);
@@ -613,6 +635,7 @@ void hk_SetCamera(void* vp, const float* cam) {
 Regenerate_t o_Regenerate = nullptr;
 void hk_Regenerate(void* vp, char push) {
     o_Regenerate(vp, push);
+    if (t_vi_fix) vi_log("Regenerate", vp);
     if (!((t_vi_fix && vp == t_scene_vp) || (t_vi_frame && vp == g_eye2_vp))) return;
     float* m = reinterpret_cast<float*>(static_cast<char*>(vp) + 0xc0);
     const float d[3] = {t_vi_c1[0] - t_vi_c2[0], t_vi_c1[1] - t_vi_c2[1], t_vi_c1[2] - t_vi_c2[2]};
@@ -939,6 +962,7 @@ void set(Mode mode, float dx, float dy, float dz) {
 }
 
 void request_log() { g_log = true; }
+void request_vi_log() { g_vi_log = 1; }
 
 void set_eye_projection(int eye) {
     g_eye = (eye == 0 || eye == 1 || eye == 3) ? eye : -1;
