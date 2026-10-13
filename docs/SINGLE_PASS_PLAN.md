@@ -351,3 +351,26 @@ now ~1 ms (what is left: its shadow maps' scene, the few draws that are not shar
 copied out 12 times a region (both planes, and into eye 2's copy): the next saving is to read the arrays' slices
 directly (an array-slice view per eye for the converted shaders) instead of copying the depth into the game's texture.
 Eye 2's shadow-map pass is also still drawn in a view-instanced frame though pass 1's maps serve both eyes.
+
+### I2 CPU: the second scene recorded without draws (2026-10-13)
+
+- Skipping eye 2's draws at the D3D12 calls, or even its packets at playback (`ops`, `[Stereo] ViSkipPackets`: the
+  dispatch hooked, the D3D12 calls each opcode makes profiled), saved no playback time: the playback thread consumes
+  packets as the render thread records them, so eye 2's region lasted as long as its recording.
+- Skipping the whole second SceneRender hung the frame (the main thread waits for a completion that never came; the
+  post run also needs PostFx +0xf8, the scene depth target, which the scene sets).
+- What works: the second scene runs, but the render thread's recorder methods for draws and draw state return at once
+  (`recorder_skip`: 19 RecorderVtbl entries through thunks gated on the render thread's id; the opcode each method
+  writes in `research/recorder_ops.txt`). Clears, target binds, copies, queries and markers are still recorded, so the
+  region's bookkeeping and the frame's signalling are intact. On by default (`[Stereo] ViSkipRecord=1`; `vi pass2 draw`).
+
+Flat A/B, Armadillo station, `vi ab 30` (both modes alternating in one view):
+
+| per frame | two passes | view-instanced, second scene without draws |
+|---|---|---|
+| whole frame (playback thread, start to start) | 9.69 ms | **7.80 ms** |
+| playback thread cycles | 37.0 M | 31.0 M (eye 2's region 11.2 -> 6.2 M) |
+| GPU, both regions | 7.86 ms | 5.84 ms (copies 3.10 / 2.98) |
+
+Both eyes' captures (porch shadows included) match the second scene drawn whole. Next: the headset measurement
+against the M0 table, DLSS/TAA per eye with the skip (the second scene's TAA update still runs), and the copies.
