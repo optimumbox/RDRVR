@@ -364,6 +364,9 @@ bool t_vi_frame = false;          // this frame's pre-pass is view-instanced (pr
 bool t_vi_fix = false;            // inside pass 2 of such a frame
 float t_vi_c1[3], t_vi_c2[3];     // eye 1's and eye 2's camera positions (pass 1)
 std::atomic<uint64_t> g_vi_fixes{0}, g_vi_frames{0};
+// Pass 2 from eye 1's position (above): off by default since the eye captures of 2026-10-13 (at 0.5 m apart, eye 2 came out
+// as eye 1: the main pass does not take its transform from +0xc0). Kept as a switch ("vi camfix on|off") for the record.
+std::atomic<bool> g_vi_camfix{false};
 // "cam vilog": the next view-instanced frame's pass 2: every Regenerate, SetCamera and PushGlobals on the render thread,
 // with the viewport, its camera position (+0x140 row 3) and whether it is the scene's
 std::atomic<int> g_vi_log{0};  // 1 armed, 2 logging this pass 2
@@ -560,7 +563,7 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
     if (pass_eye >= 0 && (ipd != 0 || xr_pose) && cam) {
         if (have) round_draw::note_pass(pass_eye, copy, l, r, u, d);  // [Reload] RoundInHand: this eye's camera
         const bool second = !first_pass;
-        if (t_vi_frame && second) {  // drawn from eye 1's position, its view rows moved after each SetCamera (hk_SetCamera)
+        if (t_vi_frame && second && g_vi_camfix.load(std::memory_order_relaxed)) {  // drawn from eye 1's position, its view rows moved after each SetCamera (hk_SetCamera)
             std::memcpy(copy + 12, t_vi_c1, sizeof(t_vi_c1));
             t_vi_fix = true;
             if (g_vi_log.load() == 1) {
@@ -963,6 +966,7 @@ void set(Mode mode, float dx, float dy, float dz) {
 
 void request_log() { g_log = true; }
 void request_vi_log() { g_vi_log = 1; }
+void set_vi_camfix(bool on) { g_vi_camfix = on; }
 
 void set_eye_projection(int eye) {
     g_eye = (eye == 0 || eye == 1 || eye == 3) ? eye : -1;

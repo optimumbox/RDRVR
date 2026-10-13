@@ -16,6 +16,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "core/camera_lever.h"
 #include "core/config.h"
 #include "core/log.h"
 #include "core/prepass_arrays.h"
@@ -456,6 +457,10 @@ std::string command(const std::vector<std::string>& t) {
     if (sub == "on" || sub == "off") {
         g_on = sub == "on";
         return std::string("vi ") + sub + " (from the next pre-pass)";
+    }
+    if (sub == "camfix" && t.size() >= 3) {
+        camera_lever::set_vi_camfix(t[2] == "on");
+        return std::string("pass 2 from eye 1's position: ") + t[2];
     }
     if (sub == "skip" && t.size() >= 3) {
         g_skip = t[2] == "on";

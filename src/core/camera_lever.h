@@ -21,7 +21,8 @@ enum class Mode { Off, Camera, View, World };
 bool install();
 void set(Mode mode, float dx, float dy, float dz);  // metres, along the camera matrix rows a, b, c
 void request_log();                                  // log the next scene camera and viewport state
-void request_vi_log();  // "vilog": the next view-instanced frame's pass 2, its viewport calls (Regenerate, SetCamera, PushGlobals)
+void request_vi_log();
+void set_vi_camfix(bool on);  // pass 2 of a view-instanced frame from eye 1's position ("vi camfix", off: see camera_lever.cpp)  // "vilog": the next view-instanced frame's pass 2, its viewport calls (Regenerate, SetCamera, PushGlobals)
 void status_text(char* out, size_t len);
 // For the matrices checker, on the render thread: which viewport is current (the scene pass's own, the renderer's
 // master, or another) and where its camera is.
