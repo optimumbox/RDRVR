@@ -601,11 +601,13 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
             move_along_rows(moved, o.d);
             g_applied.fetch_add(1, std::memory_order_relaxed);
             o_SceneRender(renderer, vp, moved, a4);
+            prepass::scene_end();
             t_scene_vp = outer;
             return;
         }
     }
     o_SceneRender(renderer, vp, cam, a4);
+    prepass::scene_end();  // (a single pass's region ends with its scene too)
     ring_probe::matrix_expect(-2, nullptr, nullptr, nullptr);
     t_scene_vp = outer;
 }

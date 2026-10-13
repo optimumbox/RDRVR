@@ -1019,7 +1019,7 @@ bool copy_resource(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, ID3D12Res
 
 void scene_end() {
     if (g_i2.load(std::memory_order_relaxed) && g_on.load(std::memory_order_relaxed) && !g_failed.load(std::memory_order_relaxed))
-        append_marker(&walk_end_cb);  // (the region's end: the scene's, not the pre-pass walk's)
+        if (append_marker(&walk_end_cb)) g_markers.fetch_add(1, std::memory_order_relaxed);  // (the region's end: the scene's, not the pre-pass walk's)
 }
 
 int last_slice() { return g_frame_seen == state::presents.load() ? g_pass_in_frame - 1 : -1; }
