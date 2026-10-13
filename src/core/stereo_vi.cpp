@@ -59,6 +59,7 @@ struct Kept {
 };
 
 std::atomic<bool> g_configured{false}, g_on{true};
+std::atomic<bool> g_query_draws{true};  // slice 1's draws inside an occlusion query drawn ("vi qdraw on|off": the A/B)
 ID3D12Device2* g_dev = nullptr;
 int g_tier = -1;
 std::string g_dir;
@@ -388,7 +389,7 @@ bool before_draw(ID3D12GraphicsCommandList* cl) {
         // the main pass's draws in the same pass; skipped here, eye 2's queries saw nothing, its main pass skipped those
         // objects and eye 1's pixels stayed in the shared target). Drawn again as the game's, with pass 2's same math, so
         // the depth is equal and the query counts what eye 2 sees (KF2VR's lesson: occlusion per eye).
-        if (s.queries_open > 0) {
+        if (s.queries_open > 0 && g_query_draws.load(std::memory_order_relaxed)) {
             g_draws_queried.fetch_add(1, std::memory_order_relaxed);
             if (s.game) bind(cl, s, s.game);
             return false;
@@ -443,6 +444,10 @@ std::string command(const std::vector<std::string>& t) {
     if (sub == "on" || sub == "off") {
         g_on = sub == "on";
         return std::string("vi ") + sub + " (from the next pre-pass)";
+    }
+    if (sub == "qdraw" && t.size() >= 3) {
+        g_query_draws = t[2] == "on";
+        return std::string("eye 2's queried draws ") + (g_query_draws.load() ? "drawn" : "skipped (the bug's A/B)");
     }
     if (sub == "load") {
         if (t.size() >= 3) g_dir = t[2];
