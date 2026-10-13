@@ -183,6 +183,10 @@ void load() {
     g_echoed.clear();  // re-echo after a reload so the log shows what the new values are
     parse_file(ini, "ini");
     if (g_user_path[0]) parse_file(g_user_path, "user");
+    // RDRVR.dev.ini in the game folder (optional, last): a development build's test switches, removed by deleting it
+    wchar_t dev[MAX_PATH];
+    log::path_in_game_dir(L"RDRVR.dev.ini", dev, MAX_PATH);
+    if (GetFileAttributesW(dev) != INVALID_FILE_ATTRIBUTES) parse_file(dev, "dev");
     ReleaseSRWLockExclusive(&g_lock);
 }
 

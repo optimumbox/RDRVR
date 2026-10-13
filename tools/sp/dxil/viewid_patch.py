@@ -17,11 +17,20 @@ a view-dependent block bound through more than one range, or a shader that alrea
 import re
 import sys
 
-# block type name -> (rows that differ per eye, the row offset of eye 2's copy)
+# block type name -> (rows that differ per eye, the row offset of eye 2's copy). gWorldViewProj (rows 8-11) has no eye-2
+# copy yet (PrepassViews=2 writes gWorldView and gViewInverse): a shader reading it is refused.
 VIEW_BLOCKS = {
-    'rage_matrices': (range(4, 16), 13),
+    'rage_matrices': ([*range(4, 8), *range(12, 16)], 13),
     'rage_prev_proj': (range(0, 4), 4),
 }
+REFUSED_ROWS = {'rage_matrices': range(8, 12)}
+# Any other variable whose name says it depends on the camera, read from any block: refused (eye 2 would read eye 1's).
+VIEW_NAME = re.compile(r'View(?!port)|Camera|Proj|Eye|FOV', re.I)
+# ... except these: the same for both eyes, or handled above
+VIEW_NAME_OK = {'gViewport'}
+# rage_prev_world's gPrevWorldViewProjSingle (per draw: the motion vectors) has no eye-2 copy yet. With allow_prev_world
+# its reads stay eye 1's (eye 2's motion vectors are wrong; harmless without TAA, DLSS or motion blur); else refused.
+PREV_WORLD = 'rage_prev_world'
 VIEWID_OPCODE = 138
 VIEWID_FLAG = 1 << 21  # ShaderFlags: ViewID
 
@@ -30,7 +39,58 @@ class Refused(Exception):
     pass
 
 
-def patch(text):
+def layouts(text):
+    """{block type name: [(first row, last row, variable name)]} from dumpbin's buffer definitions"""
+    out, cur, entries = {}, None, []
+    for ln in text.split('\n'):
+        m = re.match(r'^; cbuffer (\S+)$', ln)
+        if m:
+            cur, entries = m.group(1), []
+            continue
+        if cur:
+            v = re.match(r'^;\s+(?:row_major |column_major )?[\w$.]+\s+([\w$]+)(\[\d+\])?;\s+; Offset:\s+(\d+)', ln)
+            if v:
+                entries.append((int(v.group(3)), v.group(1)))
+            e = re.match(r'^;\s+\} [\w$]+;\s+; Offset:\s+\d+ Size:\s+(\d+)', ln)
+            if e:
+                size = int(e.group(1))
+                rows = []
+                for i, (off, name) in enumerate(entries):
+                    end = entries[i + 1][0] - 1 if i + 1 < len(entries) else size - 1
+                    rows.append((off // 16, max(off, end) // 16, name))
+                out[cur] = rows
+                cur = None
+    return out
+
+
+def check_reads(text, allow_prev_world):
+    """refuses a shader that reads a camera-dependent variable no eye-2 copy exists for"""
+    lay = layouts(text)
+    ranges = {}
+    for m in re.finditer(r'^!\d+ = !\{i32 (\d+), %"?(?:hostlayout\.)?([^"*]+)"?\* undef, !"[^"]*", i32 \d+, i32 \d+, i32 \d+, i32 \d+, null\}',
+                         text, re.M):
+        ranges[m.group(1)] = m.group(2)
+    handles = {}
+    for m in re.finditer(r'(%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 2, i32 (\d+),', text):
+        handles[m.group(1)] = ranges.get(m.group(2), '?')
+    prev_world = False
+    for m in re.finditer(r'@dx\.op\.cbufferLoadLegacy\.\w+\(i32 59, %dx\.types\.Handle (%\d+), i32 ([%\w.]+)\)', text):
+        block = handles.get(m.group(1), '?')
+        if block in VIEW_BLOCKS:
+            if not m.group(2).startswith('%') and int(m.group(2)) in REFUSED_ROWS.get(block, ()):
+                raise Refused(f'reads {block} row {m.group(2)} (no eye-2 copy)')
+            continue
+        names = [n for a, b, n in lay.get(block, []) if m.group(2).startswith('%') or a <= int(m.group(2)) <= b]
+        for n in names:
+            if VIEW_NAME.search(n) and n not in VIEW_NAME_OK:
+                if block == PREV_WORLD and allow_prev_world:
+                    prev_world = True
+                    continue
+                raise Refused(f'reads {block}.{n} (camera-dependent, no eye-2 copy)')
+    return prev_world
+
+
+def patch(text, allow_prev_world=True):
     if '@dx.op.viewID' in text:
         raise Refused('already uses ViewID')
     lines = text.split('\n')
@@ -40,6 +100,7 @@ def patch(text):
                          text, re.M):
         if m.group(2) in VIEW_BLOCKS:
             ranges[m.group(1)] = m.group(2)
+    approx = check_reads(text, allow_prev_world)
     if not ranges:
         raise Refused('no view-dependent block')
     handles = {}
@@ -77,7 +138,7 @@ def patch(text):
     if not inserted:
         raise Refused('no entry function')
     if n_redirect == 0:
-        raise Refused('no view-dependent row read')
+        raise Refused('no view-dependent block')
     text = '\n'.join(out)
     # the ViewID op's declaration, beside the other dx.op declarations (readnone, as the compiler declares it)
     ro = re.search(r'^attributes (#\d+) = \{ nounwind readnone \}', text, re.M)
@@ -93,7 +154,7 @@ def patch(text):
     if not dxver or not sm:
         raise Refused('no dx.version or dx.shaderModel')
     text = re.sub(r'^(' + re.escape(dxver.group(1)) + r' = !\{i32 1, i32 )(\d+)(\})', bump, text, flags=re.M)
-    text = re.sub(r'^(' + re.escape(sm.group(1)) + r' = !\{!"vs", i32 6, i32 )(\d+)(\})', bump, text, flags=re.M)
+    text = re.sub(r'^(' + re.escape(sm.group(1)) + r' = !\{!"(?:vs|ps)", i32 6, i32 )(\d+)(\})', bump, text, flags=re.M)
     # the entry's shader flags (extended properties, tag 0) declare ViewID use (DXIL ShaderFlags bit 21)
     ep = re.search(r'^!dx\.entryPoints = !\{(!\d+)\}', text, re.M)
     epm = ep and re.search(r'^' + re.escape(ep.group(1)) + r' = !\{[^\n]*, (!\d+|null)\}$', text, re.M)
@@ -105,13 +166,13 @@ def patch(text):
         raise Refused('no shader flags entry in the entry properties')
     new_props = props.group(1).replace(flags.group(0), f'i32 0, i64 {int(flags.group(1)) | VIEWID_FLAG}', 1)
     text = text[:props.start(1)] + new_props + text[props.end(1):]
-    return text, n_redirect
+    return text, n_redirect, approx
 
 
 def main():
     src, dst = sys.argv[1], sys.argv[2]
     try:
-        text, n = patch(open(src, encoding='utf-8', errors='replace').read())
+        text, n, _ = patch(open(src, encoding='utf-8', errors='replace').read())
     except Refused as e:
         print(f'refused: {e}', file=sys.stderr)
         return 2

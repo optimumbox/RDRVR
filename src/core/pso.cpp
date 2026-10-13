@@ -17,6 +17,7 @@
 #include "core/hooks.h"
 #include "core/log.h"
 #include "core/ring_probe.h"
+#include "core/stereo_vi.h"
 
 namespace rdrvr::pso {
 namespace {
@@ -210,6 +211,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateGraphics(ID3D12Device* dev, const D3D12_GRAPH
                 g_graphics.fetch_add(1, std::memory_order_relaxed);
                 record(*out, d->VS);  // counted under the game's own hash
                 record_info(*out, d);
+                vi::on_pipeline(dev, d, static_cast<ID3D12PipelineState*>(*out));
                 return hs;
             }
             g_swap_fails.fetch_add(1, std::memory_order_relaxed);
@@ -222,6 +224,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateGraphics(ID3D12Device* dev, const D3D12_GRAPH
         g_graphics.fetch_add(1, std::memory_order_relaxed);
         record(*out, d->VS);
         record_info(*out, d);
+        if (riid == __uuidof(ID3D12PipelineState)) vi::on_pipeline(dev, d, static_cast<ID3D12PipelineState*>(*out));
     }
     return hr;
 }
@@ -305,15 +308,16 @@ HRESULT STDMETHODCALLTYPE hk_CreateStream(ID3D12Device* dev, const D3D12_PIPELIN
     return hr;
 }
 
-void STDMETHODCALLTYPE hk_SetPipelineState(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps) {
+void STDMETHODCALLTYPE hk_SetPipelineState(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* game) {
+    ID3D12PipelineState* ps = vi::on_set_pso(cl, game);  // the game's, or its view-instanced twin (stereo_vi.h)
     if (!g_census.load(std::memory_order_relaxed)) return o_SetPipelineState(cl, ps);
     uint64_t h = 0;
     PsoInfo in;
     {
         std::lock_guard lock(g_mutex);
-        auto it = g_vs_of.find(ps);
+        auto it = g_vs_of.find(game);
         if (it != g_vs_of.end()) h = it->second;
-        auto ii = g_info.find(ps);
+        auto ii = g_info.find(game);
         if (ii != g_info.end()) in = ii->second;
     }
     t_cl = cl;
@@ -352,6 +356,11 @@ void on_frame_end(uint64_t) {
 
 void arm_census() {
     if (!g_census.exchange(true)) log::info("[pso] the draw census started (the frame graph)");
+}
+
+void raw_set_pipeline(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps) {
+    if (o_SetPipelineState) o_SetPipelineState(cl, ps);
+    else cl->SetPipelineState(ps);
 }
 
 bool current(const ID3D12GraphicsCommandList* cl, uint64_t* vs, uint64_t* ps, uint32_t* writes) {

@@ -31,6 +31,11 @@ void before_draw(ID3D12GraphicsCommandList* cl);  // a draw in a region: the wal
 void note_bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int single,
                const D3D12_CPU_DESCRIPTOR_HANDLE* ds);
 std::string status();
+// View-instanced stereo (stereo_vi.h): in a region of a view-instanced frame on this list, 1 (slice 0's: the draws go to
+// both slices) or 2 (slice 1's: the draws made in slice 0's are skipped), else 0. *all_arrays: every target bound now is
+// one of the six (only then can a view-instanced pipeline draw).
+int vi_region(const ID3D12GraphicsCommandList* cl, bool* all_arrays);
+std::string vi_status();
 // [Stereo] PrepassViews (milestone 3, test only; stageVI-prepass.md): eye 2's per-view constants for pass 1.
 // Step 1, observe only (nothing written to the game): camera_lever builds a private eye-2 viewport in pass 1 and hands
 // its rows here; after each pass's walk the game's own rows are read from the constant buffers' storage, and pass 2's

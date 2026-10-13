@@ -18,6 +18,7 @@
 #include "core/dual_pass.h"
 #include "core/log.h"
 #include "core/state.h"
+#include "core/stereo_vi.h"
 
 namespace rdrvr::prepass {
 namespace {
@@ -41,7 +42,7 @@ struct Arr {
     DXGI_FORMAT res_fmt = DXGI_FORMAT_UNKNOWN, view_fmt = DXGI_FORMAT_UNKNOWN;
     ID3D12Resource* arr = nullptr;  // 2 slices
     UINT planes = 1;
-    D3D12_CPU_DESCRIPTOR_HANDLE view[2]{};
+    D3D12_CPU_DESCRIPTOR_HANDLE view[3]{};  // slice 0, slice 1, both (view-instanced stereo: views 0 and 1 to slices 0 and 1)
 };
 Arr g_arr[kKinds];
 struct Retired {
@@ -58,6 +59,8 @@ UINT g_rtv_inc = 0, g_dsv_inc = 0;
 struct Region {
     ID3D12GraphicsCommandList* cl = nullptr;
     int slice = 0;
+    bool vi = false;          // view-instanced (stereo_vi.h): slice 0's region draws both slices, slice 1's skips those draws
+    bool all_arrays = true;   // every target of the current bind is one of the six (a view-instanced draw may run)
     unsigned touched = 0, known = 0;   // bit (kind * 2 + plane): that plane's state known
     D3D12_RESOURCE_STATES state[kKinds][2]{};  // per plane (the depth's two: the game moves them one at a time)
 } g_r;
@@ -71,6 +74,10 @@ void set_state(int k, int plane, D3D12_RESOURCE_STATES s) {  // plane -1: every 
 }
 uint64_t g_frame_seen = ~0ull;
 int g_pass_in_frame = 0;
+uint64_t g_vi_frame = ~0ull;  // the frame whose slice-0 region drew both eyes (view-instanced)
+std::atomic<uint64_t> g_vi_regions[2]{};
+// the region's target view: slice 0's region of a view-instanced frame binds both slices
+int region_view_index() { return g_r.vi && g_r.slice == 0 ? 2 : g_r.slice; }
 struct LastBind {  // the list's last bind outside a region (the playback thread)
     ID3D12GraphicsCommandList* cl = nullptr;
     unsigned n = 0;
@@ -111,10 +118,10 @@ int kind_of_resource(const ID3D12Resource* res) {
 
 bool heaps() {
     if (g_rtv_heap && g_dsv_heap) return true;
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2 * kKinds, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3 * kKinds, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     if (FAILED(g_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_rtv_heap)))) return false;
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-    hd.NumDescriptors = 2;
+    hd.NumDescriptors = 3;
     if (FAILED(g_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_dsv_heap)))) return false;
     g_rtv_inc = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     g_dsv_inc = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
@@ -155,12 +162,13 @@ bool ensure(int k, ID3D12Resource* res, DXGI_FORMAT view_fmt) {
     }
     D3D12_FEATURE_DATA_FORMAT_INFO fi{d.Format, 0};
     a.planes = SUCCEEDED(g_dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &fi, sizeof(fi))) && fi.PlaneCount ? fi.PlaneCount : 1;
-    for (int s = 0; s < 2; ++s) {
+    for (int s = 0; s < 3; ++s) {  // s 2: both slices (the view-instanced draws' target)
+        const UINT first = s == 2 ? 0u : static_cast<UINT>(s), count = s == 2 ? 2u : 1u;
         if (is_depth(k)) {
             D3D12_DEPTH_STENCIL_VIEW_DESC dv{};
             dv.Format = vf;
             dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
-            dv.Texture2DArray = {0, static_cast<UINT>(s), 1};
+            dv.Texture2DArray = {0, first, count};
             a.view[s] = g_dsv_heap->GetCPUDescriptorHandleForHeapStart();
             a.view[s].ptr += static_cast<SIZE_T>(s) * g_dsv_inc;
             g_dev->CreateDepthStencilView(arr, &dv, a.view[s]);
@@ -168,9 +176,9 @@ bool ensure(int k, ID3D12Resource* res, DXGI_FORMAT view_fmt) {
             D3D12_RENDER_TARGET_VIEW_DESC rv{};
             rv.Format = vf;
             rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
-            rv.Texture2DArray = {0, static_cast<UINT>(s), 1, 0};
+            rv.Texture2DArray = {0, first, count, 0};
             a.view[s] = g_rtv_heap->GetCPUDescriptorHandleForHeapStart();
-            a.view[s].ptr += static_cast<SIZE_T>(k * 2 + s) * g_rtv_inc;
+            a.view[s].ptr += static_cast<SIZE_T>(k * 3 + s) * g_rtv_inc;
             g_dev->CreateRenderTargetView(arr, &rv, a.view[s]);
         }
     }
@@ -605,6 +613,15 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_dsv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
     g_r = Region{};
     g_r.cl = cl;
     g_r.slice = slice;
+    // view-instanced stereo: slice 0's region draws both eyes when wanted; slice 1's region follows it in the same frame
+    // only (a frame whose slice 0 drew one eye draws slice 1 itself)
+    if (slice == 0) {
+        g_r.vi = vi::wanted();
+        g_vi_frame = g_r.vi ? f : ~0ull;
+    } else {
+        g_r.vi = g_vi_frame == f;
+    }
+    if (g_r.vi) g_vi_regions[slice].fetch_add(1, std::memory_order_relaxed);
     g_r.touched = 1u << kDepth;
     set_state(kDepth, -1, D3D12_RESOURCE_STATE_DEPTH_WRITE);  // (a depth clear needs it)
     g_end_pending = false;
@@ -615,7 +632,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_dsv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
         if (bind(cl, g_last.n, g_last.rts, g_last.single, g_last.has_ds ? &g_last.ds : nullptr, r2, &d2))
             d3d::raw_bind(cl, g_last.n, r2, g_last.single, g_last.has_ds ? &d2 : nullptr);
     }
-    return g_arr[kDepth].view[slice];
+    return g_arr[kDepth].view[region_view_index()];
 }
 
 void note_bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int single,
@@ -644,7 +661,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_rtv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
     if (k <= kDepth || !ensure(k, res, fmt)) return h;
     g_r.touched |= 1u << k;
     set_state(k, -1, D3D12_RESOURCE_STATE_RENDER_TARGET);  // (a clear needs it)
-    return g_arr[k].view[g_r.slice];
+    return g_arr[k].view[region_view_index()];
 }
 
 bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int single,
@@ -655,9 +672,11 @@ bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_
         return false;
     }
     bool any = false;
+    g_r.all_arrays = true;  // until a target that is not one of the six
     if (single && n >= 1 && rts) {  // a contiguous range: one handle for all n (not substituted one by one)
         ID3D12Resource* res = nullptr;
         DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+        g_r.all_arrays = false;
         if (kind_of(rts[0], &res, &fmt) > kDepth) {
             end_region(cl);
             fail("a pre-pass target bound as a range");
@@ -669,10 +688,13 @@ bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_
         ID3D12Resource* res = nullptr;
         DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
         const int k = kind_of(rts[i], &res, &fmt);
-        if (k <= kDepth || !ensure(k, res, fmt)) continue;
+        if (k <= kDepth || !ensure(k, res, fmt)) {
+            g_r.all_arrays = false;
+            continue;
+        }
         if (!(g_r.known & (1u << (k * 2)))) set_state(k, -1, D3D12_RESOURCE_STATE_RENDER_TARGET);  // (its barrier before the region)
         g_r.touched |= 1u << k;
-        out_rts[i] = g_arr[k].view[g_r.slice];
+        out_rts[i] = g_arr[k].view[region_view_index()];
         any = true;
     }
     if (ds) {
@@ -680,8 +702,10 @@ bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_
         ID3D12Resource* res = nullptr;
         DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
         if (kind_of(*ds, &res, &fmt) == kDepth && res == g_arr[kDepth].game) {
-            *out_ds = g_arr[kDepth].view[g_r.slice];
+            *out_ds = g_arr[kDepth].view[region_view_index()];
             any = true;
+        } else {
+            g_r.all_arrays = false;
         }
     }
     if (any) g_redirects.fetch_add(1, std::memory_order_relaxed);
@@ -714,6 +738,18 @@ void barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BAR
 
 void before_draw(ID3D12GraphicsCommandList* cl) {
     if (cl == g_r.cl && g_end_pending.load(std::memory_order_acquire)) end_region(cl);
+}
+
+int vi_region(const ID3D12GraphicsCommandList* cl, bool* all_arrays) {
+    if (!g_active.load(std::memory_order_relaxed) || cl != g_r.cl || !g_r.vi) return 0;
+    if (all_arrays) *all_arrays = g_r.all_arrays;
+    return g_r.slice + 1;
+}
+std::string vi_status() {
+    char b[160];
+    std::snprintf(b, sizeof(b), "view-instanced regions: slice 0 %llu, slice 1 %llu",
+                  static_cast<unsigned long long>(g_vi_regions[0].load()), static_cast<unsigned long long>(g_vi_regions[1].load()));
+    return b;
 }
 
 bool views_wanted() { return g_views.load(std::memory_order_relaxed); }

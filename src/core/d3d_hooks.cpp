@@ -19,6 +19,7 @@
 #include "core/frame_probe.h"
 #include "core/hooks.h"
 #include "core/prepass_arrays.h"
+#include "core/stereo_vi.h"
 #include "core/pso.h"
 #include "core/log.h"
 #include "core/ring_probe.h"
@@ -376,6 +377,7 @@ void fg_draw(ID3D12GraphicsCommandList* cl) {
 
 void STDMETHODCALLTYPE hk_DrawInstanced(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, UINT d) {
     if (prepass::active()) prepass::before_draw(cl);
+    if (vi::before_draw(cl)) return;  // view-instanced stereo: drawn for both eyes already
     if (pso::on_draw(cl)) return;
     ++t_draws;
     fg_draw(cl);
@@ -384,6 +386,7 @@ void STDMETHODCALLTYPE hk_DrawInstanced(ID3D12GraphicsCommandList* cl, UINT a, U
 }
 void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, INT d, UINT e) {
     if (prepass::active()) prepass::before_draw(cl);
+    if (vi::before_draw(cl)) return;
     if (pso::on_draw(cl)) return;
     ++t_draws;
     fg_draw(cl);
@@ -397,6 +400,8 @@ void STDMETHODCALLTYPE hk_Dispatch(ID3D12GraphicsCommandList* cl, UINT x, UINT y
 void STDMETHODCALLTYPE hk_ExecuteIndirect(ID3D12GraphicsCommandList* cl, ID3D12CommandSignature* s, UINT n, ID3D12Resource* a,
                                           UINT64 b, ID3D12Resource* c, UINT64 d) {
     fg_count(cl, [](ListLog& l) { ++l.indirect; });
+    if (prepass::active()) prepass::before_draw(cl);
+    if (vi::before_draw(cl)) return;
     o_ExecuteIndirect(cl, s, n, a, b, c, d);
 }
 // ---- barrier watch (d3d::watch_add)
@@ -452,6 +457,7 @@ HRESULT STDMETHODCALLTYPE hk_Close(ID3D12GraphicsCommandList* cl) {
 }
 HRESULT STDMETHODCALLTYPE hk_Reset(ID3D12GraphicsCommandList* cl, ID3D12CommandAllocator* a, ID3D12PipelineState* ps) {
     watch_list_ends(cl);
+    vi::on_reset(cl, ps);
     return o_Reset(cl, a, ps);
 }
 void STDMETHODCALLTYPE hk_EndQuery(ID3D12GraphicsCommandList* cl, ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) {
@@ -500,7 +506,11 @@ void STDMETHODCALLTYPE hk_ClearRTV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESC
         fg_event(cl, "ClearRTV %s (%.2f %.2f %.2f %.2f)", name.c_str(), c[0], c[1], c[2], c[3]);
     }
     if (prepass::tracing()) prepass::trace_clear(cl, h, false);
-    if (prepass::active()) h = prepass::clear_rtv(cl, h);
+    if (prepass::active()) {
+        const D3D12_CPU_DESCRIPTOR_HANDLE game = h;
+        h = prepass::clear_rtv(cl, h);
+        if (h.ptr != game.ptr && vi::skip_clear(cl)) return;  // slice 1 drawn with slice 0 (view-instanced): kept
+    }
     o_ClearRTV(cl, h, c, n, r);
 }
 void STDMETHODCALLTYPE hk_ClearDSV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE h, D3D12_CLEAR_FLAGS f, FLOAT d,
@@ -515,7 +525,11 @@ void STDMETHODCALLTYPE hk_ClearDSV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESC
         fg_event(cl, "ClearDSV %s depth %.3f", name.c_str(), d);
     }
     if (prepass::tracing()) prepass::trace_clear(cl, h, true);
-    if (prepass::on()) h = prepass::clear_dsv(cl, h);  // (the pre-pass's start: its depth's clear)
+    if (prepass::on()) {
+        const D3D12_CPU_DESCRIPTOR_HANDLE game = h;
+        h = prepass::clear_dsv(cl, h);  // (the pre-pass's start: its depth's clear)
+        if (h.ptr != game.ptr && vi::skip_clear(cl)) return;
+    }
     o_ClearDSV(cl, h, f, d, s, n, r);
 }
 void STDMETHODCALLTYPE hk_BeginEvent(ID3D12GraphicsCommandList* cl, UINT meta, const void* data, UINT size) {

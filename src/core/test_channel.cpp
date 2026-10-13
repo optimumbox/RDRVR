@@ -38,6 +38,7 @@
 #include "core/log.h"
 #include "core/lum_check.h"
 #include "core/prepass_arrays.h"
+#include "core/stereo_vi.h"
 #include "core/pso.h"
 #include "core/render_settings.h"
 #include "core/align_grab.h"
@@ -726,6 +727,7 @@ std::string execute(const std::vector<std::string>& t) {
         }
         return "teleported: " + r;
     }
+    if (c == "vi") return vi::command(t);  // view-instanced stereo (stereo_vi.h)
     if (c == "prepass") {  // prepass [on|off]: [Stereo] PrepassArrays (test only, stageVI-prepass.md milestone 2)
         if (t.size() >= 2 && (t[1] == "on" || t[1] == "off")) prepass::set_on(t[1] == "on");
         if (t.size() >= 2 && t[1] == "trace") prepass::trace_start(t.size() >= 3 ? std::atoi(t[2].c_str()) : 2);

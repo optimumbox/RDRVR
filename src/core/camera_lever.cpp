@@ -511,6 +511,14 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
         o_SetCamera(g_eye2_vp, other);
         prepass::set_eye2(g_eye2_vp, nullptr);  // (without jitter; the TAA update's jittered rows replace these)
         g_eye2_frame = state::presents.load();
+    } else if (!xr_pose && ipd != 0 && cam && pass_eye == (g_swap.load(std::memory_order_relaxed) ? 1 : 0) &&
+               prepass::views_wanted()) {
+        // the flat double pass ("double on <ipd>", no headset): eye 2's viewport is the frame's with the other eye's
+        // camera, so the view-instanced pre-pass can be tested on the monitor
+        std::memcpy(g_eye2_vp, g_saved_vp, kViewportSize);
+        o_SetCamera(g_eye2_vp, other);
+        prepass::set_eye2(g_eye2_vp, nullptr);
+        g_eye2_frame = state::presents.load();
     }
     if (pass_eye >= 0 && (ipd != 0 || xr_pose) && cam) {
         if (have) round_draw::note_pass(pass_eye, copy, l, r, u, d);  // [Reload] RoundInHand: this eye's camera

@@ -1,9 +1,10 @@
-"""stereo_vs.py: the game's vertex shaders made view-instanced, in bulk.
+"""stereo_vs.py: the game's vertex and pixel shaders made view-instanced, in bulk.
 
-For each <hash>.dxbc in IN (the core's "pso dump" output): dumpbin -> viewid_patch -> dxa (assemble) -> extract the
-module -> dxopt (-viewid-state: the ViewID dependency tables the validator checks) -> dxa -> dxv (the retail
-validator). Writes OUT/vs_<hash>.dxil for each shader that validates, and OUT/report.txt (one line per shader:
-ok, refused with the reason, or failed with the stage).
+For each vs_<hash>.dxbc and ps_<hash>.dxbc in IN (the core's "vi dump" output; a bare <hash>.dxbc is a vertex shader):
+dumpbin -> viewid_patch -> dxa (assemble) -> extract the module -> dxopt (-viewid-state: the ViewID dependency tables the
+validator checks) -> dxa -> dxv (the retail validator). Writes OUT/<vs|ps>_<hash>.dxil for each shader that validates,
+OUT/ps_safe.txt (pixel shaders that read nothing camera-dependent: used as they are) and OUT/report.txt (one line per
+shader: ok, safe, refused with the reason, or failed with the stage).
 
     python stereo_vs.py <in dir> <out dir> [--dxc-build research\\dxc-build\\bin] [--dxv research\\dxc\\x\\bin\\x64\\dxv.exe]
 """
@@ -35,19 +36,29 @@ def main():
     dxc, dxa, dxopt = bin_dir / 'dxc.exe', bin_dir / 'dxa.exe', bin_dir / 'dxopt.exe'
     out = pathlib.Path(a.dst)
     out.mkdir(parents=True, exist_ok=True)
-    report, counts = [], {'ok': 0, 'refused': 0, 'failed': 0}
+    report, safe = [], []
+    counts = {'ok': 0, 'safe': 0, 'refused': 0, 'failed': 0}
     with tempfile.TemporaryDirectory() as tmp:
         t = pathlib.Path(tmp)
         for f in sorted(pathlib.Path(a.src).glob('*.dxbc')):
-            h = f.stem.split('_')[-1]
+            kind, h = f.stem.split('_', 1) if '_' in f.stem else ('vs', f.stem)
             code, text = run([dxc, '-dumpbin', f])
             if code:
-                report.append(f'{h} failed dumpbin: {text[:200]}'); counts['failed'] += 1; continue
+                report.append(f'{kind} {h} failed dumpbin: {text[:200]}')
+                counts['failed'] += 1
+                continue
             try:
-                patched, n = viewid_patch.patch(text)
+                patched, n, approx = viewid_patch.patch(text)
             except viewid_patch.Refused as e:
-                report.append(f'{h} refused: {e}'); counts['refused'] += 1; continue
-            ll, c1, bc, bc2, fin = (t / f'{h}{s}' for s in ('.ll', '.1.dxbc', '.bc', '.2.bc', '.dxil'))
+                if kind == 'ps' and str(e) == 'no view-dependent block':
+                    safe.append(h)
+                    report.append(f'ps {h} safe')
+                    counts['safe'] += 1
+                else:
+                    report.append(f'{kind} {h} refused: {e}')
+                    counts['refused'] += 1
+                continue
+            ll, c1, bc, bc2, fin = (t / f'{kind}{h}{s}' for s in ('.ll', '.1.dxbc', '.bc', '.2.bc', '.dxil'))
             ll.write_text(patched, encoding='utf-8', newline='\n')
             steps = [
                 ('dxa', [dxa, ll, '-o', c1], None),
@@ -64,11 +75,15 @@ def main():
                     failed = f'{name}: {text.splitlines()[0] if text else code}'
                     break
             if failed:
-                report.append(f'{h} failed {failed}'); counts['failed'] += 1; continue
-            (out / f'vs_{h}.dxil').write_bytes(fin.read_bytes())
-            report.append(f'{h} ok ({n} row reads)'); counts['ok'] += 1
+                report.append(f'{kind} {h} failed {failed}')
+                counts['failed'] += 1
+                continue
+            (out / f'{kind}_{h}.dxil').write_bytes(fin.read_bytes())
+            report.append(f'{kind} {h} ok ({n} row reads{"; eye 1 motion vectors" if approx else ""})')
+            counts['ok'] += 1
+    (out / 'ps_safe.txt').write_text(''.join(x + '\n' for x in safe), encoding='utf-8')
     (out / 'report.txt').write_text('\n'.join(report) + '\n', encoding='utf-8')
-    print(f"ok {counts['ok']}, refused {counts['refused']}, failed {counts['failed']} -> {out}")
+    print(f"ok {counts['ok']}, safe {counts['safe']}, refused {counts['refused']}, failed {counts['failed']} -> {out}")
     return 0
 
 

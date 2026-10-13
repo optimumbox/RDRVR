@@ -37,6 +37,7 @@
 #include "core/log.h"
 #include "core/render_settings.h"
 #include "core/prepass_arrays.h"
+#include "core/stereo_vi.h"
 #include "core/ring_probe.h"
 #include "core/body.h"
 #include "core/holster.h"
@@ -135,6 +136,7 @@ DWORD WINAPI bootstrap_thread(void*) {
     gpu_timer::init();
     ring_probe::init();
     prepass::init();
+    vi::init();
     exit_guard::install();
     frame_grab::init();
     eye_grab::init();

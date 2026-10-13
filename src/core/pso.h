@@ -23,5 +23,7 @@ std::string command(const std::string& line);
 // pixel shaders' hashes and what it writes (bits 0-7 the render targets, bit 8 depth). False: not known (another list).
 void arm_census();
 bool current(const ID3D12GraphicsCommandList* cl, uint64_t* vs, uint64_t* ps, uint32_t* writes);
+// The list's SetPipelineState past the hook (stereo_vi.cpp binds a twin or the game's pipeline back).
+void raw_set_pipeline(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps);
 
 }  // namespace rdrvr::pso
