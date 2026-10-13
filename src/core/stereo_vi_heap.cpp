@@ -43,6 +43,7 @@ struct HeapInfo {
     UINT inc = 0, count = 0;
     int64_t base = -1;  // its SRV table's first descriptor
     uint64_t binds = 0, moves = 0;
+    std::unordered_map<int64_t, uint64_t> counts;  // binds of parameter 11 per base
 };
 std::unordered_map<ID3D12DescriptorHeap*, HeapInfo> g_heaps;
 thread_local std::unordered_map<ID3D12GraphicsCommandList*, ID3D12DescriptorHeap*> t_list_heap;
@@ -167,13 +168,18 @@ void STDMETHODCALLTYPE hk_SetTable(ID3D12GraphicsCommandList* cl, UINT param, D3
         g_outside.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    // Parameter 11 is the bindless SRV table in the game's main root signatures only (other root signatures bind other
+    // tables there: the 2026-10-13 session saw bases 32 and 20401 alternate). The table's base is the one bound most
+    // often, taken once 2000 binds are counted and kept unless another base overtakes it by far.
     const int64_t base = static_cast<int64_t>((gh.ptr - h.gpu) / h.inc);
-    if (base == h.base) return;
+    const uint64_t c = ++h.counts[base];
+    if (h.binds < 2000 || base == h.base) return;
+    if (h.base >= 0 && c < 2 * h.counts[h.base]) return;
     if (h.base >= 0) ++h.moves;
     if (g_logged_bases < 12) {
         ++g_logged_bases;
-        log::info("[vi] heap %p: the SRV table at %lld (was %lld)", static_cast<void*>(lh->second), static_cast<long long>(base),
-                  static_cast<long long>(h.base));
+        log::info("[vi] heap %p: the SRV table at %lld (bound %llu times; was %lld)", static_cast<void*>(lh->second), static_cast<long long>(base),
+                  static_cast<unsigned long long>(c), static_cast<long long>(h.base));
     }
     h.base = base;
     write_pending(lh->second);
