@@ -29,7 +29,11 @@ if ($Clean -and (Test-Path $build)) { Remove-Item -Recurse -Force $build }
 $vcpkgRoot = if ($env:VCPKG_ROOT) { $env:VCPKG_ROOT } else { 'C:\dev\vcpkg' }
 
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-$vsRoot  = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+# The newest install with the C++ tools and VS's own Ninja (a newer install without the CMake component has no Ninja)
+$vsAll   = @(& $vswhere -sort -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+$vsRoot  = $vsAll | Where-Object { Test-Path (Join-Path $_ 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe') } |
+           Select-Object -First 1
+if (-not $vsRoot) { $vsRoot = $vsAll | Select-Object -First 1 }
 if (-not $vsRoot) { throw 'No Visual Studio installation with the C++ toolchain was found.' }
 $cmakeDir = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin'
 $ninjaDir = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja'
