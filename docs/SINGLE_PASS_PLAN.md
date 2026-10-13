@@ -336,3 +336,18 @@ Performance: not measured properly yet. Playback draws fell 16.5k -> 10.6k a fra
 rose (14.3 -> 16.0 ms, GPU-bound, and the view moved between windows). Suspects: the publishes' full-screen copies (the
 depth's two planes at each write->read barrier, now also into eye 2's copies). Next: GPU timestamps around the regions
 and the publishes, A/B in a fixed view, then fewer copies (publish once per region end where the game allows).
+
+### I2 GPU time (`prepass gpu`, `vi ab 30`: both modes alternating in one view), 2026-10-13
+
+Flat, 2560x1440 per eye, Armadillo station. "Both regions" = the two scenes' regions (pre-pass to scene end, each eye).
+
+| build | two passes | view-instanced | copies in them (2p / vi) |
+|---|---|---|---|
+| copy at every write->read barrier | 12.14 ms | 13.76 ms | 5.61 / 8.41 |
+| copy only what was written since (b74b7a7+) | 10.39 ms | **9.35 ms** | 3.88 / 4.12 |
+
+The view-instanced region's own work (copies excluded) is ~5.2 ms against ~6.5 ms for two passes; eye 2's region is
+now ~1 ms (what is left: its shadow maps' scene, the few draws that are not shared, its copies). The depth is still
+copied out 12 times a region (both planes, and into eye 2's copy): the next saving is to read the arrays' slices
+directly (an array-slice view per eye for the converted shaders) instead of copying the depth into the game's texture.
+Eye 2's shadow-map pass is also still drawn in a view-instanced frame though pass 1's maps serve both eyes.
