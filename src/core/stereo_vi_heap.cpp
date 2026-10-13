@@ -37,6 +37,15 @@ constexpr UINT kSrvTableParam = 11;  // the game's root signatures: t0 space2, u
 
 std::mutex g_mutex;  // all below
 std::unordered_map<ID3D12Resource*, D3D12_SHADER_RESOURCE_VIEW_DESC> g_srv_desc;  // the game's views (the last per resource)
+struct GameView {
+    SIZE_T cpu = 0;
+    D3D12_SHADER_RESOURCE_VIEW_DESC d{};
+};
+std::unordered_map<ID3D12Resource*, std::vector<GameView>> g_views;  // each resource's views (where, as what; a few)
+// a depth-stencil format's stencil-only views (the depth's are plane 0)
+bool stencil_view(const D3D12_SHADER_RESOURCE_VIEW_DESC& d) {
+    return d.Format == DXGI_FORMAT_X24_TYPELESS_G8_UINT || d.Format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+}
 struct HeapInfo {
     UINT64 gpu = 0;
     SIZE_T cpu = 0;
@@ -63,6 +72,11 @@ void STDMETHODCALLTYPE hk_CreateSrv(ID3D12Device* dev, ID3D12Resource* r, const 
     if (r && d) {
         std::lock_guard lock(g_mutex);
         g_srv_desc[r] = *d;
+        auto& v = g_views[r];
+        bool have = false;
+        for (GameView& g : v)
+            if (g.cpu == h.ptr) g.d = *d, have = true;
+        if (!have && v.size() < 8) v.push_back(GameView{h.ptr, *d});
     }
 }
 
@@ -110,10 +124,17 @@ void write_pending(ID3D12DescriptorHeap* heap) {  // under g_mutex
         }
         D3D12_SHADER_RESOURCE_VIEW_DESC d{};
         auto it = g_srv_desc.find(p.game);
-        const bool own = it != g_srv_desc.end();
-        if (own) {
-            d = it->second;
-        } else {  // (not seen: a plain 2D view of the copy's format)
+        bool own = it != g_srv_desc.end();
+        if (own) d = it->second;
+        auto gv = g_views.find(p.game);  // (a depth image: its depth view, not its stencil's)
+        if (gv != g_views.end())
+            for (const GameView& g : gv->second)
+                if (!stencil_view(g.d)) {
+                    d = g.d;
+                    own = true;
+                    break;
+                }
+        if (!own) {  // (not seen: a plain 2D view of the copy's format)
             d.Format = p.e2->GetDesc().Format;
             d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -198,6 +219,24 @@ void eye2_texture(int slot, ID3D12Resource* e2, ID3D12Resource* game) {
     if (!found) g_pending.push_back(Pending{slot, e2, game, {}});
     for (auto& [heap, h] : g_heaps)
         if (h.base >= 0) write_pending(heap);
+}
+
+int64_t game_view_index(int slot) {
+    std::lock_guard lock(g_mutex);
+    ID3D12Resource* game = nullptr;
+    for (const Pending& p : g_pending)
+        if (p.slot == slot) game = p.game;
+    auto gv = game ? g_views.find(game) : g_views.end();
+    if (gv == g_views.end()) return -1;
+    const HeapInfo* best = nullptr;
+    for (auto& [heap, h] : g_heaps)
+        if (h.base >= 0 && (!best || h.binds > best->binds)) best = &h;
+    if (!best) return -1;
+    for (const GameView& g : gv->second) {
+        if (stencil_view(g.d) || g.cpu < best->cpu || g.cpu >= best->cpu + static_cast<SIZE_T>(best->count) * best->inc) continue;
+        return static_cast<int64_t>((g.cpu - best->cpu) / best->inc) - best->base;
+    }
+    return -1;
 }
 
 void install_device_hooks(ID3D12Device* dev) {

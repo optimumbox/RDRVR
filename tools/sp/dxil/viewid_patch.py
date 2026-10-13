@@ -48,6 +48,9 @@ PREV_WORLD = 'rage_prev_world'
 # where the core writes it (stereo_vi.cpp: the table's base from the game's own bind, the slots past what the game uses).
 SCREEN_SLOTS = {11, 13, 15}
 EYE2_SLOT_BASE = 14960
+# The scene depth itself, read by an index of the shader's own (a $Globals one): the game's depth view's index is in
+# rage_matrices row 30 .w (a uint's bits; stereo_vi.h kDepthBufferSlot), eye 2's copy at EYE2_SLOT_BASE + 16.
+DEPTH_BUFFER_SLOT, DEPTH_INDEX_ROW = 16, 30
 PREV_WORLD_ROWS = range(0, 4)
 DELTA_ROW = 21  # rage_matrices
 VIEWID_OPCODE = 138
@@ -420,6 +423,7 @@ def patch_index_remap(text, done):
     hg = cb_handles(text, rid['global_textures'])
     if not srv or not hg:
         return text, 0
+    hm = cb_handles(text, rid['rage_matrices']) if 'rage_matrices' in rid else []
     hre = re.compile(r'^  (%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 0, i32 ' + srv.group(1) + r', i32 (%\d+), i1')
     out, n = [], 0
     for ln in text.split(chr(10)):
@@ -438,6 +442,13 @@ def patch_index_remap(text, done):
             out.append(f'  {t}.b{slot} = and i1 {t}.q{slot}, %isv1.sp')
             out.append(f'  {t}.n{slot} = select i1 {t}.b{slot}, i32 {EYE2_SLOT_BASE + slot}, i32 {cur}')
             cur = f'{t}.n{slot}'
+        if hm:
+            dr = emit_row(out, f'{t}.dr', hm[0], DEPTH_INDEX_ROW, True)
+            out.append(f'  {t}.di = bitcast float {dr[3]} to i32')
+            out.append(f'  {t}.qd = icmp eq i32 {idx}, {t}.di')
+            out.append(f'  {t}.bd = and i1 {t}.qd, %isv1.sp')
+            out.append(f'  {t}.nd = select i1 {t}.bd, i32 {EYE2_SLOT_BASE + DEPTH_BUFFER_SLOT}, i32 {cur}')
+            cur = f'{t}.nd'
         out.append(ln.replace(f', i32 {idx}, i1', f', i32 {cur}, i1', 1))
     return chr(10).join(out), n
 

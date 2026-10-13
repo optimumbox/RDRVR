@@ -39,6 +39,12 @@ void on_query(ID3D12GraphicsCommandList* cl, int kind, D3D12_QUERY_TYPE type, UI
 // learnt from the game's own binds, + kEye2SlotBase + slot), as the game's own view of `game`.
 constexpr unsigned kEye2SlotBase = 14960;  // = tools/sp/dxil/viewid_patch.py EYE2_SLOT_BASE
 void eye2_texture(int slot, ID3D12Resource* e2, ID3D12Resource* game);
+// The scene depth itself (not its Depth Resolve copy): shaders read it by an index of their own, not a global_textures
+// slot; view 1 compares each index with the game's depth view's (rage_matrices row 30 .w, written by prepass_arrays.cpp)
+// and reads eye 2's copy at kEye2SlotBase + kDepthBufferSlot when equal.
+constexpr int kDepthBufferSlot = 16;  // = tools/sp/dxil/viewid_patch.py DEPTH_BUFFER_SLOT
+// The bindless table index of the game's own (depth, not stencil) view of the image registered for `slot`, -1 unknown.
+int64_t game_view_index(int slot);
 void install_device_hooks(ID3D12Device* dev);           // CreateShaderResourceView (the game's views, for eye 2's)
 void install_list_hooks(ID3D12GraphicsCommandList* cl);  // SetDescriptorHeaps, SetGraphicsRootDescriptorTable (the table)
 bool main_pass();  // [Stereo] ViMain

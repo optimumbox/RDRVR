@@ -28,8 +28,9 @@ namespace {
 enum Kind { kDepth, kCollector, kVelocity, kGrassColour, kGrassLight, kTree, kLight, kFsc, kReact, kRefr, kKinds };
 constexpr int kPrepassKinds = kLight;
 // The global_textures slot each kind is read through (the main pass's shaders: 11 LightBufferSampler, 13
-// ShadowCollectorSampler), -1 none. Eye 2's copy of such a kind is made for view 1's reads (stereo_vi.h).
-const int kSlot[kKinds] = {-1, 13, -1, -1, -1, -1, 11, -1, -1, -1};
+// ShadowCollectorSampler; the scene depth: its own index, vi::kDepthBufferSlot), -1 none. Eye 2's copy of such a kind
+// is made for view 1's reads (stereo_vi.h).
+const int kSlot[kKinds] = {vi::kDepthBufferSlot, 13, -1, -1, -1, -1, 11, -1, -1, -1};
 constexpr int kDepthSlot = 15;  // the scene depth's slot: the game's "Depth Resolve" copy
 const char* const kNames[kKinds] = {"Shadow Collector Depth Buffer", "Shadow Collector",        "Velocity RT",
                                     "Grass FS Colour",               "Grass FS Light Multiply", "Tree FS Colour Diffuse",
@@ -221,8 +222,9 @@ bool ensure(int k, ID3D12Resource* res, DXGI_FORMAT view_fmt) {
     log::info("[prepass] %s: a 2-slice array %llux%u (format %d, view %d, %u plane(s))", kNames[k], static_cast<unsigned long long>(d.Width),
               d.Height, static_cast<int>(d.Format), static_cast<int>(vf), a.planes);
     if (g_i2.load(std::memory_order_relaxed) && kSlot[k] >= 0) {  // eye 2's copy, read by view 1 through the slot
-        D3D12_RESOURCE_DESC ed = d;
-        ed.Flags &= ~(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        D3D12_RESOURCE_DESC ed = d;  // (a depth format keeps its depth-stencil flag)
+        ed.Flags &= ~(is_depth(k) ? D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE
+                                  : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
         ID3D12Resource* e2 = nullptr;
         if (SUCCEEDED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &ed, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&e2))) && e2) {
             std::swprintf(nm, 96, L"RDRVR eye 2 %S", kNames[k]);
@@ -585,6 +587,7 @@ bool still_grown(const Grown& g) {
 // rows hold it: row 29 (inv[0].xyz, inv[2].w), row 30 (inv[1].xyz, 0), row 31 inv[3]. The parts the packing drops are
 // checked: their largest, relative to the matrix's largest entry, is in "vi status".
 uint64_t g_inv_written = 0, g_inv_failed = 0;
+int64_t g_depth_index = -1;
 float g_inv_dropped = 0;
 void write_inv_wv2(const float* wv) {
     double a[16], inv[16];
@@ -601,6 +604,11 @@ void write_inv_wv2(const float* wv) {
     if (big > 0) g_inv_dropped = std::max(g_inv_dropped, static_cast<float>(dropped / big));
     const int map[12] = {0, 1, 2, 11, 4, 5, 6, -1, 12, 13, 14, 15};
     for (int i = 0; i < 12; ++i) rows[i] = map[i] < 0 ? 0.f : static_cast<float>(inv[map[i]]);
+    // row 30 .w: the game's scene-depth view index (as a uint), for view 1's index compare (vi::kDepthBufferSlot)
+    const int64_t di = vi::game_view_index(vi::kDepthBufferSlot);
+    const uint32_t du = di >= 0 && di < 0x7fffffff ? static_cast<uint32_t>(di) : 0xffffffffu;
+    std::memcpy(&rows[7], &du, 4);
+    g_depth_index = di;
     write_raw(g_b1.block + 0x1d0, rows, sizeof(rows));
     ++g_inv_written;
 }
@@ -1060,14 +1068,15 @@ std::string vi_status() {
     char b[900];
     std::snprintf(b, sizeof(b), "view-instanced regions: slice 0 %llu, slice 1 %llu | pass 2's rows as the pre-pass's: same %llu, differ %llu (max %.7f)"
                   " | motion vectors: D %s, checked %llu frames, largest relative difference %.2e (not checked: unread %llu, not vi %llu, no D %llu)"
-                  " | main pass %s: publishes %llu, depth copies %llu | eye 2's inverse gWorldView: %llu written, %llu not invertible, packing drops %.1e",
+                  " | main pass %s: publishes %llu, depth copies %llu | eye 2's inverse gWorldView: %llu written, %llu not invertible, packing drops %.1e | the depth's view index %lld",
                   static_cast<unsigned long long>(g_vi_regions[0].load()), static_cast<unsigned long long>(g_vi_regions[1].load()),
                   static_cast<unsigned long long>(g_vi_rows_same), static_cast<unsigned long long>(g_vi_rows_differ), g_vi_rows_max,
                   g_e2_delta_ok ? "from the updates" : "identity", static_cast<unsigned long long>(g_mv_checks), g_mv_err,
                   static_cast<unsigned long long>(g_mv_unread), static_cast<unsigned long long>(g_mv_not_vi),
                   static_cast<unsigned long long>(g_mv_no_delta), g_i2.load() ? "on" : "off",
                   static_cast<unsigned long long>(g_publishes.load()), static_cast<unsigned long long>(g_depth_copies.load()),
-                  static_cast<unsigned long long>(g_inv_written), static_cast<unsigned long long>(g_inv_failed), g_inv_dropped);
+                  static_cast<unsigned long long>(g_inv_written), static_cast<unsigned long long>(g_inv_failed), g_inv_dropped,
+                  static_cast<long long>(g_depth_index));
     return b;
 }
 
