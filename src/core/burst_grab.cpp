@@ -111,7 +111,9 @@ void bind_tap(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIP
         return;
     }
     if (!ui) {
-        if (++g_fxaa_binds == 2) record(cl, g_swap ? 2 : 1);  // the first pass's eye
+        // the first pass's eye: its post output is complete at the second bind; the scene colour and the motion
+        // vectors are its run's own at the first (the second run's at the second: the eyes' were the same, 2026-10-13)
+        if (++g_fxaa_binds == (g_source != 0 ? 1 : 2)) record(cl, g_swap ? 2 : 1);
         return;
     }
     if (g_fxaa_binds >= 2) {

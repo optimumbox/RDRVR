@@ -23,6 +23,7 @@
 #include "core/replay_ops.h"
 #include "core/state.h"
 #include "core/stereo_vi.h"
+#include "core/taa.h"
 
 namespace rdrvr::prepass {
 namespace {
@@ -31,9 +32,9 @@ namespace {
 enum Kind { kDepth, kCollector, kVelocity, kGrassColour, kGrassLight, kTree, kLight, kFsc, kReact, kRefr, kKinds };
 constexpr int kPrepassKinds = kLight;
 // The global_textures slot each kind is read through (the main pass's shaders: 11 LightBufferSampler, 13
-// ShadowCollectorSampler; the scene depth: its own index, vi::kDepthBufferSlot), -1 none. Eye 2's copy of such a kind
+// ShadowCollectorSampler, 12 GlobalWaterSampler0: the refraction copy glass and river water see through, 2026-10-13; the scene depth: its own index, vi::kDepthBufferSlot), -1 none. Eye 2's copy of such a kind
 // is made for view 1's reads (stereo_vi.h).
-const int kSlot[kKinds] = {vi::kDepthBufferSlot, 13, -1, -1, -1, -1, 11, -1, -1, -1};
+const int kSlot[kKinds] = {vi::kDepthBufferSlot, 13, -1, -1, -1, -1, 11, -1, -1, 12};
 constexpr int kDepthSlot = 15;  // the scene depth's slot: the game's "Depth Resolve" copy
 const char* const kNames[kKinds] = {"Shadow Collector Depth Buffer", "Shadow Collector",        "Velocity RT",
                                     "Grass FS Colour",               "Grass FS Light Multiply", "Tree FS Colour Diffuse",
@@ -463,6 +464,8 @@ std::string status(bool reset) {
 }
 }  // namespace gpu
 
+extern std::atomic<int> g_grab_phase;
+void grab_tap(ID3D12GraphicsCommandList* cl, int k, ID3D12Resource* arr);
 void end_region(ID3D12GraphicsCommandList* cl) {
     replay_ops::set_region2(false);
     g_active = false;
@@ -512,6 +515,7 @@ void end_region(ID3D12GraphicsCommandList* cl) {
             d3d::raw_copy_region(cl, &dst, &src);
         }
         g_copies.fetch_add(1, std::memory_order_relaxed);
+        if (g_grab_phase.load(std::memory_order_relaxed)) grab_tap(cl, k, a.arr);  // (the region's final state)
     }
     d3d::raw_barrier(cl, n, post);
     gpu::mark(cl, gpu::kCopyEnd);
@@ -713,6 +717,7 @@ bool g_e2_ok = false, g_e2_pvp_ok = false;
 float g_e2_off[3] = {0, 0, 0};  // eye 1's camera position less eye 2's (set_eye2_offset, before set_eye2)
 float g_e2_off_prev[3] = {0, 0, 0};  // the same, the previous frame's (D's move between the eyes' previous cameras)
 uint64_t g_e2_off_frame = 0;
+std::atomic<bool> g_d_move{true};  // test ("prepass dmove on|off"): D's move between the eyes
 bool g_e2_off_ok = false;
 float g_e1_pvp[16];       // eye 1's gPrevViewProj this frame (taa.cpp, before eye 2's update): D's first factor
 bool g_e1_pvp_ok = false;
@@ -933,6 +938,7 @@ Grown g_taa;
 int g_taa_state = 0;  // 0 not tried, 1 grown, -1 refused
 uint64_t g_ndc_written = 0, g_ndc_eye1 = 0;
 float g_ndc_last[16] = {};
+std::atomic<float> g_ndc_bias{0.0f};  // test ("prepass ndcbias <x>"): added to eye 2's NDCToPrevNDC [3][0]
 constexpr uint32_t kTaaGlobalsSize = 0xf0;  // (the 228 bytes rounded to a row)
 constexpr int kNdcSpare[12][2] = {{15, 0}, {15, 1}, {15, 2}, {15, 3}, {7, 1}, {7, 2}, {7, 3}, {14, 1}, {14, 2}, {14, 3}, {12, 2}, {12, 3}};
 void write_eye2(const float* wv, const float* vi, const float* pvp) {
@@ -971,7 +977,8 @@ void write_prev_delta(const float* p1, const float* p2) {
             // back to eye 1's camera-relative position, moved to eye 2's, projected with eye 2's (without the move,
             // eye 2's motion vectors were the eyes' disparity: 2026-10-13, VR plants smeared in the right eye).
             double t[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}, it[16];
-            for (int i = 0; i < 3; ++i) t[12 + i] = g_e2_off_prev[i];
+            if (g_d_move.load(std::memory_order_relaxed))
+                for (int i = 0; i < 3; ++i) t[12 + i] = g_e2_off_prev[i];
             for (int r = 0; r < 4; ++r)
                 for (int c = 0; c < 4; ++c) {
                     double s = 0;
@@ -1439,9 +1446,10 @@ void set_eye2_ndc(const void* eff, const float* ndc, bool eye2) {
                   static_cast<unsigned long long>(cb), kTaaGlobalsSize);
     }
     const int cols[3] = {0, 1, 3};
+    const float bias = g_ndc_bias.load(std::memory_order_relaxed);
     for (int j = 0; j < 4; ++j)
         for (int k = 0; k < 3; ++k) {
-            const float v = ndc[j * 4 + cols[k]];
+            const float v = ndc[j * 4 + cols[k]] + (j == 3 && k == 0 ? bias : 0.0f);
             write_raw(g_taa.block + kNdcSpare[j * 3 + k][0] * 16 + kNdcSpare[j * 3 + k][1] * 4, &v, 4);
         }
     uint32_t d[2] = {0, 0};
@@ -1452,6 +1460,8 @@ void set_eye2_ndc(const void* eff, const float* ndc, bool eye2) {
     ++(eye2 ? g_ndc_written : g_ndc_eye1);
     std::memcpy(g_ndc_last, ndc, sizeof(g_ndc_last));
 }
+void set_d_move(bool on) { g_d_move = on; }
+void set_ndc_bias(float x) { g_ndc_bias = x; }
 std::string mv_text() {  // test: the motion-vector matrices last written (row-major, 4 decimals)
     auto m = [](const char* n, const float* a) {
         char b[400];
@@ -1461,7 +1471,22 @@ std::string mv_text() {  // test: the motion-vector matrices last written (row-m
     };
     char o[120];
     std::snprintf(o, sizeof(o), " | eye offset (%.4f %.4f %.4f)", g_e2_off[0], g_e2_off[1], g_e2_off[2]);
-    return m("ndc2", g_ndc_last) + " | " + m("D", g_e2_delta) + " | " + m("prevVP1", g_e1_pvp) + " | " + m("prevVP2", g_e2_pvp) + o;
+    float row16[4] = {};  // gTAAJitter as the shaders read it (rage_matrices row 16; both views)
+    if (g_grow_state > 0) read_raw(g_b1.block + 0x100, row16, sizeof(row16));
+    char j[120];
+    std::snprintf(j, sizeof(j), " | gTAAJitter (%.5f %.5f %.5f %.5f) | ", row16[0], row16[1], row16[2], row16[3]);
+    std::string spare = " | TAA $Globals now:";
+    if (g_taa_state > 0) {
+        float blk[64] = {};
+        read_raw(g_taa.block, blk, sizeof(blk));
+        for (int r : {1, 7, 12, 14, 15}) {
+            char t[96];
+            std::snprintf(t, sizeof(t), " r%d(%.5f %.5f %.5f %.5f)", r, blk[r * 4], blk[r * 4 + 1], blk[r * 4 + 2], blk[r * 4 + 3]);
+            spare += t;
+        }
+    }
+    return spare + " | " + m("ndc2", g_ndc_last) + " | " + m("D", g_e2_delta) + " | " + m("prevVP1", g_e1_pvp) + " | " + m("prevVP2", g_e2_pvp) + o + j +
+           taa::jitter_text();
 }
 
 std::string vi_status() {

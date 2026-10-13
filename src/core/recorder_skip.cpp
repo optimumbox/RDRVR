@@ -42,7 +42,7 @@ int32_t rel(const uint8_t* next, const volatile void* target) {
 }  // namespace
 
 void install() {
-    if (g_installed || !config::get_bool("Stereo", "ViMain", false) || !config::get_bool("Stereo", "ViSkipRecord", true) ||
+    if (g_installed || !config::get_bool("Stereo", "ViMain", false) || !config::get_bool("Stereo", "ViSkipRecord", false) ||
         anchors::stand_down() || !anchors::present(anchors::Id::RecorderVtbl))
         return;
     void** vt = reinterpret_cast<void**>(anchors::addr(anchors::Id::RecorderVtbl));

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 #include "core/anchors.h"
 #include "core/camera_lever.h"
@@ -348,6 +349,7 @@ bool update_on(char* p, void* vp) {
 // gPrevViewProj; then eye 1's TAA state put back (the two blocks the update writes and the NDCToPrevNDC variable, as
 // the rain's call is put back). The snapshot itself is not touched.
 std::atomic<uint64_t> g_eye2_updates{0};
+float g_jit_seen[2][4] = {};  // test: the jitter (and its delta) after eye 1's update and eye 2's (taa::jitter_text)
 void eye2_update(char* p) {
     void* vp2 = camera_lever::eye2_viewport();
     Snap& s2 = g_snap[1];
@@ -360,6 +362,7 @@ void eye2_update(char* p) {
     at<int>(p, kJitterIndex) = t_index_base - 1;
     reinterpret_cast<Persp_t>(anchors::addr(Id::ViewportPerspective))(vp2);  // without jitter, as pass 2 starts it
     update_on(p, vp2);
+    std::memcpy(g_jit_seen[1], p + kJitter, sizeof(g_jit_seen[1]));
     prepass::set_eye1_prev(b + 0xc0);              // eye 1's gPrevViewProj (its update's, kept above)
     prepass::set_eye2(vp2, p + kPrevBlock + 0xc0);  // +0x4f0: gPrevViewProj
     prepass::set_eye2_ndc(at<void*>(p, kTaaEffect), reinterpret_cast<const float*>(p + kNdcToPrev), true);
@@ -401,6 +404,7 @@ void after_scene_wait(int pass) {
     std::memcpy(p + kPrevBlock, s.prev, sizeof(s.prev));
     at<int>(p, kJitterIndex) = t_index_base - 1;  // the function advances it first: the tick's sample again
     if (update_on(p, vp)) g_units_applied.fetch_add(1, std::memory_order_relaxed);
+    if (pass == 1) std::memcpy(g_jit_seen[0], p + kJitter, sizeof(g_jit_seen[0]));
     std::memcpy(s.jitter, p + kJitter, sizeof(s.jitter));
     std::memcpy(s.prev, p + kPrevBlock, sizeof(s.prev));
     std::memcpy(p + kJitterDelta, delta, sizeof(delta));
@@ -451,6 +455,13 @@ void cut_text(char* out, size_t len) {
                                                static_cast<unsigned long long>(c.src_toggle.load()), static_cast<unsigned long long>(c.r3b2.load()),
                                                static_cast<unsigned long long>(c.r558.load()), i < 2 ? " |" : ""));
     }
+}
+
+std::string jitter_text() {
+    char b[200];
+    std::snprintf(b, sizeof(b), "jitter eye 1 (%.5f %.5f) delta (%.5f %.5f) | eye 2 (%.5f %.5f) delta (%.5f %.5f)", g_jit_seen[0][0],
+                  g_jit_seen[0][1], g_jit_seen[0][2], g_jit_seen[0][3], g_jit_seen[1][0], g_jit_seen[1][1], g_jit_seen[1][2], g_jit_seen[1][3]);
+    return b;
 }
 
 void status_text(char* out, size_t len) {

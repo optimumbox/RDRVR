@@ -749,6 +749,14 @@ std::string execute(const std::vector<std::string>& t) {
         if (t.size() >= 4 && t[1] == "views" && t[2] == "size") prepass::views_size(t[3] == "on");
         if (t.size() >= 2 && t[1] == "views") return prepass::views_status();
         if (t.size() >= 2 && t[1] == "mv") return prepass::mv_text();
+        if (t.size() >= 3 && t[1] == "ndcbias") {
+            prepass::set_ndc_bias(std::strtof(t[2].c_str(), nullptr));
+            return "eye 2's NDCToPrevNDC [3][0] + " + t[2];
+        }
+        if (t.size() >= 3 && t[1] == "dmove") {
+            prepass::set_d_move(t[2] == "on");
+            return "D's move " + t[2];
+        }
         return prepass::status();
     }
     if (c == "pso") {

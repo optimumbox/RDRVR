@@ -12,7 +12,7 @@ param(
     [switch] $Stop,
     [switch] $Install,
     [string] $GameDir = 'G:\Games\Red Dead Redemption',
-    [string] $Shaders = 'C:\Games\RDRVR-src\research\stereo_all6',
+    [string] $Shaders = 'C:\Games\RDRVR-src\research\stereo_all7',
     [string] $ExtraIni = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -44,7 +44,7 @@ PrepassViews=2
 ViPrepass=1
 ViOn=1
 ViMain=1
-ViSkipRecord=1
+ViSkipRecord=0
 ViShaders=$Shaders
 $ExtraIni
 "@ | Set-Content (Join-Path $GameDir 'RDRVR.dev.ini') -Encoding ascii

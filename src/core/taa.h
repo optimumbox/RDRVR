@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace rdrvr::taa {
 
@@ -34,6 +35,7 @@ void set_shared(bool on);         // positive control: both eyes on one history 
 // as well at yaw presets other than 0).
 void set_mono_pass(bool on);
 void status_text(char* out, size_t len);
+std::string jitter_text();  // test ("prepass mv"): the jitter after each eye's update
 void cut_text(char* out, size_t len);
 void set_jitter_units(bool on);  // [Render] DlssJitterUnits at run time ("dlss units on|off")  // what discarded the upscaler's history (velocity clears, resets), per post run
 

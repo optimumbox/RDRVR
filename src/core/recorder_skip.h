@@ -16,7 +16,8 @@
 
 namespace rdrvr::recorder_skip {
 
-void install();               // with [Stereo] ViMain and ViSkipRecord (default 1): the vtable entries through the thunks; on
+void install();               // with [Stereo] ViMain and ViSkipRecord (default 0 since 2026-10-13: eye 2's motion vectors
+                              // need something the skipped scene records, its plants smeared): the vtable entries through the thunks
 bool installed();
 void begin();                 // the render thread: its recorder's draw and state methods return at once
 void end();

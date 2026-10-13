@@ -46,10 +46,10 @@ PREV_WORLD = 'rage_prev_world'
 # pixel shaders' unbounded SRV table, t0 space2): 11 LightBufferSampler, 13 ShadowCollectorSampler, 15 the scene depth
 # (DepthMapTexSampler / DepthTextureSampler0). In view 1 a shader reads eye 2's copy at table slot EYE2_SLOT_BASE + slot,
 # where the core writes it (stereo_vi.cpp: the table's base from the game's own bind, the slots past what the game uses).
-SCREEN_SLOTS = {11, 13, 15}
+SCREEN_SLOTS = {11, 12, 13, 15}
 # ... but a slot's image is the pass's: slot 15 is the sun's shadow map in the light pass (DepthTextureSampler0, read
 # with a comparison sampler): a slot is redirected only when this shader names it as one of the screen images
-SCREEN_SLOT_NAMES = {11: {'LightBufferSampler'}, 13: {'ShadowCollectorSampler'}, 15: {'DepthMapTexSampler', 'RMPTFX_DepthMapTexSampler'}}
+SCREEN_SLOT_NAMES = {11: {'LightBufferSampler'}, 12: {'GlobalWaterSampler0'}, 13: {'ShadowCollectorSampler'}, 15: {'DepthMapTexSampler', 'RMPTFX_DepthMapTexSampler'}}
 
 
 def slot_names(text):
