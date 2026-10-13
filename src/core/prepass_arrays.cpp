@@ -277,12 +277,24 @@ struct Rec {
     int n = 0;
     Tag tag[kMax];
     bool vi = false, resolved = false, complete = false;
+    double cpu = 0;  // the playback thread's time from region 0's start to region 1's end (ms)
 };
+double g_cpu_begin = 0;
+double qpc_ms() {
+    static const double f = [] {
+        LARGE_INTEGER q;
+        QueryPerformanceFrequency(&q);
+        return 1000.0 / static_cast<double>(q.QuadPart);
+    }();
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return static_cast<double>(c.QuadPart) * f;
+}
 Rec g_rec[kFrames];
 int g_slot = -1;
 struct Sum {
     uint64_t frames = 0;
-    double span = 0, r0 = 0, r1 = 0, copies = 0;
+    double span = 0, r0 = 0, r1 = 0, copies = 0, cpu = 0;
 };
 Sum g_sum[2];  // [vi]
 uint64_t g_marks = 0, g_resolves = 0, g_harvests = 0, g_unresolved = 0, g_bad = 0;
@@ -347,6 +359,7 @@ void harvest(int slot) {  // that slot's frame, resolved kFrames frames ago
     s.r0 += e0 - b0;
     s.r1 += e1 - b1;
     s.copies += copies;
+    s.cpu += rc.cpu;
 }
 void mark(ID3D12GraphicsCommandList* cl, Tag tag) {
     if (!g_on || !ensure()) return;
@@ -355,6 +368,7 @@ void mark(ID3D12GraphicsCommandList* cl, Tag tag) {
         harvest(g_slot);
         g_rec[g_slot] = Rec{};
         g_rec[g_slot].vi = g_r.vi;
+        g_cpu_begin = qpc_ms();
     }
     if (g_slot < 0) return;
     Rec& rc = g_rec[g_slot];
@@ -367,6 +381,7 @@ void mark(ID3D12GraphicsCommandList* cl, Tag tag) {
         cl->ResolveQueryData(g_heap, D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(g_slot * kMax), static_cast<UINT>(rc.n), g_rb,
                              static_cast<UINT64>(g_slot) * kMax * 8);
         rc.resolved = rc.complete = true;
+        rc.cpu = qpc_ms() - g_cpu_begin;
         ++g_resolves;
         g_slot = -1;
     }
@@ -377,9 +392,10 @@ std::string status(bool reset) {
     for (int v = 0; v < 2; ++v) {
         const Sum& s = g_sum[v];
         const double n = s.frames ? static_cast<double>(s.frames) : 1.0;
-        char b[200];
-        std::snprintf(b, sizeof(b), " | %s: %llu frames, both regions %.3f ms (eye 1's %.3f, eye 2's %.3f), copies in them %.3f",
-                      v ? "view-instanced" : "two passes", static_cast<unsigned long long>(s.frames), s.span / n, s.r0 / n, s.r1 / n, s.copies / n);
+        char b[260];
+        std::snprintf(b, sizeof(b), " | %s: %llu frames, GPU both regions %.3f ms (eye 1's %.3f, eye 2's %.3f), copies in them %.3f; playback CPU %.3f",
+                      v ? "view-instanced" : "two passes", static_cast<unsigned long long>(s.frames), s.span / n, s.r0 / n, s.r1 / n, s.copies / n,
+                      s.cpu / n);
         r += b;
     }
     char d[260];
