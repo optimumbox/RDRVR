@@ -59,7 +59,9 @@ struct Kept {
 };
 
 std::atomic<bool> g_configured{false}, g_on{true};
-std::atomic<bool> g_query_draws{true};  // slice 1's draws inside an occlusion query drawn ("vi qdraw on|off": the A/B)
+std::atomic<bool> g_query_draws{true};
+std::atomic<bool> g_skip{true};      // slice 1's twinned draws skipped ("vi skip off": eye 2 draws them itself, the A/B)
+std::atomic<bool> g_pred_off{false}; // pass 2's main pass ignores the game's predication ("vi pred off": the A/B)  // slice 1's draws inside an occlusion query drawn ("vi qdraw on|off": the A/B)
 ID3D12Device2* g_dev = nullptr;
 int g_tier = -1;
 std::string g_dir;
@@ -384,6 +386,10 @@ bool before_draw(ID3D12GraphicsCommandList* cl) {
     int region = 0;
     ID3D12PipelineState* twin = nullptr;
     ID3D12PipelineState* p = wanted_for(cl, s.game, &region, &twin);
+    if (region == 2 && twin && !g_skip.load(std::memory_order_relaxed)) {  // the A/B: eye 2 draws it itself
+        if (s.game) bind(cl, s, s.game);
+        return false;
+    }
     if (region == 2 && twin) {  // drawn for both eyes in slice 0's region
         // ... except inside an occlusion query (the probe, 2026-10-13: the pre-pass's queries are resolved and predicate
         // the main pass's draws in the same pass; skipped here, eye 2's queries saw nothing, its main pass skipped those
@@ -432,7 +438,13 @@ void on_query(ID3D12GraphicsCommandList* cl, int kind, D3D12_QUERY_TYPE type, UI
     on_query_impl(cl, kind, index, res, off, n);
 }
 
+bool drop_predication(ID3D12GraphicsCommandList* cl) {
+    if (!g_configured.load(std::memory_order_relaxed) || !g_pred_off.load(std::memory_order_relaxed)) return false;
+    return prepass::vi_region(cl, nullptr) == 0 && prepass::last_slice() == 1 && prepass::vi_frame_now();
+}
+
 bool skip_clear(ID3D12GraphicsCommandList* cl) {
+    if (!g_configured.load(std::memory_order_relaxed) || !g_skip.load(std::memory_order_relaxed)) return false;
     if (!g_configured.load(std::memory_order_relaxed) || prepass::vi_region(cl, nullptr) != 2) return false;
     g_clears_skipped.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -444,6 +456,14 @@ std::string command(const std::vector<std::string>& t) {
     if (sub == "on" || sub == "off") {
         g_on = sub == "on";
         return std::string("vi ") + sub + " (from the next pre-pass)";
+    }
+    if (sub == "skip" && t.size() >= 3) {
+        g_skip = t[2] == "on";
+        return std::string("slice 1's twinned draws ") + (g_skip.load() ? "skipped" : "drawn by eye 2 itself (A/B)");
+    }
+    if (sub == "pred" && t.size() >= 3) {
+        g_pred_off = t[2] == "off";
+        return std::string("pass 2's predication ") + (g_pred_off.load() ? "ignored (A/B)" : "as the game's");
     }
     if (sub == "qdraw" && t.size() >= 3) {
         g_query_draws = t[2] == "on";

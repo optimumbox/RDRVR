@@ -558,6 +558,7 @@ void STDMETHODCALLTYPE hk_BeginEvent(ID3D12GraphicsCommandList* cl, UINT meta, c
 }
 void STDMETHODCALLTYPE hk_SetPredication(ID3D12GraphicsCommandList* cl, ID3D12Resource* r, UINT64 off, D3D12_PREDICATION_OP op) {
     vi::on_query(cl, 3, static_cast<D3D12_QUERY_TYPE>(op), 0, r, off, 1);
+    if (r && vi::drop_predication(cl)) return o_SetPredication(cl, nullptr, 0, op);  // (the A/B: everything drawn)
     fg_count(cl, [](ListLog& l) { ++l.queries; });
     o_SetPredication(cl, r, off, op);
 }

@@ -41,6 +41,7 @@ bool latch_vi();
 std::string vi_status();
 // The playback thread: this frame's last pre-pass region's slice (0, 1), or -1 before any this frame.
 int last_slice();
+bool vi_frame_now();  // the playback thread: this frame's slice-0 region drew both eyes
 // [Stereo] PrepassViews (milestone 3, test only; stageVI-prepass.md): eye 2's per-view constants for pass 1.
 // Step 1, observe only (nothing written to the game): camera_lever builds a private eye-2 viewport in pass 1 and hands
 // its rows here; after each pass's walk the game's own rows are read from the constant buffers' storage, and pass 2's

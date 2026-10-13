@@ -857,6 +857,7 @@ bool latch_vi() {
     return want;
 }
 
+bool vi_frame_now() { return g_vi_frame == state::presents.load(); }
 int last_slice() { return g_frame_seen == state::presents.load() ? g_pass_in_frame - 1 : -1; }
 
 int vi_region(const ID3D12GraphicsCommandList* cl, bool* all_arrays) {
