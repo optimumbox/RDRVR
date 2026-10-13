@@ -72,6 +72,13 @@ DEPTH_BUFFER_SLOT, DEPTH_INDEX_ROW = 16, 30
 # gViewInverse row 2: its .w is read by no shader), eye 2's copy at EYE2_SLOT_BASE + 15 (2026-10-13, the headset:
 # view 1 lit eye 2's interior through a window with eye 1's depth, i.e. the outside wall's position: black)
 RESOLVE_SLOT, RESOLVE_INDEX_ROW = 15, 27
+# ... and the pre-pass images the full-screen resolves read by indices of their own (PS_Grass_Fullscreen's
+# GrassColourSampler/GrassUVSampler, PSAlphaFoliageResolveFS_Deferred's TreeColourSampler0), so that slice 0's region
+# draws them for both eyes (the recorder skip, ViSkipRecord, records no eye-2 draws): 14-bit fields (an index past the
+# table's base; 0x3fff none) in eye 2's gViewInverse rows 0 and 1 .w (as row 27's: read by no shader; the values are
+# denormal or tiny), (row, shift, eye 2's slot) = Grass FS Colour, Grass FS Light Multiply, Tree FS Colour Diffuse
+# (prepass_arrays.cpp kSlot).
+SCREEN_INDEX_FIELDS = ((25, 0, 17), (25, 14, 18), (26, 0, 19))
 PREV_WORLD_ROWS = range(0, 4)
 DELTA_ROW = 21  # rage_matrices
 VIEWID_OPCODE = 138
@@ -430,7 +437,8 @@ def patch_inverse(text, inverse):
 
 def patch_index_remap(text, done):
     """view 1's bindless 2D texture indices from any source (a material's own index too) equal to the game's scene-depth
-    view's (rage_matrices row 30 .w, written by the core) read eye 2's copy. (Not compared with global_textures' values:
+    view's (rage_matrices row 30 .w, written by the core; the depth resolve's, row 27 .w; SCREEN_INDEX_FIELDS') read
+    eye 2's copy. (Not compared with global_textures' values:
     a slot holds the pass's image, the sun's shadow map in the light pass.)"""
     rid = range_ids(text)
     srv = re.search(r'^!\d+ = !\{i32 (\d+), \[0 x %"class\.Texture2D<[^"]*>"\]\* undef, !"[^"]*", i32 \d+, i32 0, i32 -1, i32 2,', text, re.M)
@@ -457,6 +465,16 @@ def patch_index_remap(text, done):
         out.append(f'  {t}.br = and i1 {t}.qr, %isv1.sp')
         out.append(f'  {t}.nr = select i1 {t}.br, i32 {EYE2_SLOT_BASE + RESOLVE_SLOT}, i32 {t}.nd')
         cur = f'{t}.nr'
+        rows = {}
+        for k, (row, shift, slot) in enumerate(SCREEN_INDEX_FIELDS):
+            if row not in rows:
+                rows[row] = emit_row(out, f'{t}.f{row}', hm[0], row, True, kind='i32')[3]
+            out.append(f'  {t}.s{k} = lshr i32 {rows[row]}, {shift}')
+            out.append(f'  {t}.v{k} = and i32 {t}.s{k}, 16383')
+            out.append(f'  {t}.q{k} = icmp eq i32 {idx}, {t}.v{k}')
+            out.append(f'  {t}.b{k} = and i1 {t}.q{k}, %isv1.sp')
+            out.append(f'  {t}.n{k} = select i1 {t}.b{k}, i32 {EYE2_SLOT_BASE + slot}, i32 {cur}')
+            cur = f'{t}.n{k}'
         out.append(ln.replace(f', i32 {idx}, i1', f', i32 {cur}, i1', 1))
     return chr(10).join(out), n
 

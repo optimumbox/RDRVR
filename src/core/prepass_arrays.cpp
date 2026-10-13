@@ -39,7 +39,9 @@ constexpr int kPrepassKinds = kLight;
 // region, after slice 0's region drew the glass into eye 2's scene colour, so eye 2 saw the glass through the glass
 // (2026-10-13, the headset: a grey haze in the right eye's windows). FullScreenCopy is copied out (into eye 2's copy
 // too) as the refraction copy reads it, before the glass; the copy is a plain blit of it.
-const int kSlot[kKinds] = {vi::kDepthBufferSlot, 13, -1, -1, -1, -1, 11, 12, -1, -1};
+// Slots 17-19: the grass and tree images the full-screen resolves read by indices of their own (no global_textures
+// slot): their game views' indices go into rage_matrices (write_inv_wv2), viewid_patch.py SCREEN_INDEX_FIELDS.
+const int kSlot[kKinds] = {vi::kDepthBufferSlot, 13, -1, 17, 18, 19, 11, 12, -1, -1};
 constexpr int kDepthSlot = 15;  // the scene depth's slot: the game's "Depth Resolve" copy
 const char* const kNames[kKinds] = {"Shadow Collector Depth Buffer", "Shadow Collector",        "Velocity RT",
                                     "Grass FS Colour",               "Grass FS Light Multiply", "Tree FS Colour Diffuse",
@@ -480,8 +482,14 @@ void grab_tap(ID3D12GraphicsCommandList* cl, int k, ID3D12Resource* arr);
 // in slice 1 too, so its extents carry on.
 uint32_t g_ext_r[kKinds], g_ext_b[kKinds];  // 0: nothing drawn yet (all copied); ~0u: all
 std::atomic<bool> g_box_copies{true};        // test ("prepass gpu box on|off")
-std::atomic<uint64_t> g_boxed{0}, g_unboxed{0};
+std::atomic<uint64_t> g_boxed{0}, g_unboxed{0}, g_ext_novp{0};
+uint32_t g_ext_last[kKinds][4];  // ("box" status) each kind's extents at its last copy out, and its size
 bool copy_box(int k, ID3D12Resource* r, D3D12_BOX* b) {
+    {
+        const D3D12_RESOURCE_DESC d = r->GetDesc();
+        g_ext_last[k][0] = g_ext_r[k], g_ext_last[k][1] = g_ext_b[k];
+        g_ext_last[k][2] = static_cast<uint32_t>(d.Width), g_ext_last[k][3] = d.Height;
+    }
     if (!g_box_copies.load(std::memory_order_relaxed) || is_depth(k) || !g_ext_r[k] || g_ext_r[k] == ~0u) return false;
     const D3D12_RESOURCE_DESC d = r->GetDesc();
     if (g_ext_r[k] >= d.Width && g_ext_b[k] >= d.Height) return false;
@@ -946,6 +954,7 @@ bool still_grown(const Grown& g) {
 // checked: their largest, relative to the matrix's largest entry, is in "vi status".
 uint64_t g_inv_written = 0, g_inv_failed = 0;
 int64_t g_depth_index = -1;
+uint32_t g_screen_fields[2] = {~0u, ~0u};  // rows 25 and 26 .w as written (vi status)
 float g_inv_dropped = 0;
 void write_inv_wv2(const float* wv) {
     double a[16], inv[16];
@@ -973,6 +982,16 @@ void write_inv_wv2(const float* wv) {
     const int64_t ri = vi::game_view_index(kDepthSlot);
     const uint32_t ru = ri >= 0 && ri < 0x7fffffff ? static_cast<uint32_t>(ri) : 0xffffffffu;
     write_raw(g_b1.block + 0x1b0 + 12, &ru, 4);
+    // rows 25 and 26 .w (eye 2's gViewInverse rows 0 and 1): the grass and tree images' indices, 14 bits each (0x3fff
+    // none): row 25 Grass FS Colour | Grass FS Light Multiply << 14, row 26 Tree FS Colour Diffuse
+    auto field = [](int k) {
+        const int64_t i = vi::game_view_index(kSlot[k]);
+        return i >= 0 && i < 0x3fff ? static_cast<uint32_t>(i) : 0x3fffu;
+    };
+    const uint32_t f25 = field(kGrassColour) | field(kGrassLight) << 14, f26 = field(kTree) | 0x3fffu << 14;
+    write_raw(g_b1.block + 0x190 + 12, &f25, 4);
+    write_raw(g_b1.block + 0x1a0 + 12, &f26, 4);
+    g_screen_fields[0] = f25, g_screen_fields[1] = f26;
     ++g_inv_written;
 }
 // The velocity pass (rdr2_taa's PSGenerateVelocityBuffer, view-instanced: tools/sp/dxil/viewid_patch.py patch_ndc) reads
@@ -1008,7 +1027,7 @@ void write_eye2(const float* wv, const float* vi, const float* pvp) {
     wr<int>(g_pp.cb + 0x24, -1);
     std::memcpy(g_written_wv, wv, 64);
     std::memcpy(g_written_vi, vi, 64);
-    read_raw(g_b1.block + 0x190, g_written_vi, 64);  // (row 27 .w: the depth resolve's index, write_inv_wv2)
+    read_raw(g_b1.block + 0x190, g_written_vi, 64);  // (rows 25-27 .w: the screen images' indices, write_inv_wv2)
     std::memcpy(g_written_pp, pp, 64);
     ++g_written;
 }
@@ -1367,6 +1386,7 @@ void drawn(ID3D12GraphicsCommandList* cl) {
         if (g_ext_r[k] != ~0u) {
             if (!have_vp) {
                 g_ext_r[k] = g_ext_b[k] = ~0u;
+                g_ext_novp.fetch_add(1, std::memory_order_relaxed);
             } else {
                 g_ext_r[k] = std::max(g_ext_r[k], vr);
                 g_ext_b[k] = std::max(g_ext_b[k], vb);
@@ -1602,7 +1622,7 @@ std::string vi_status() {
     char b[1100];
     std::snprintf(b, sizeof(b), "view-instanced regions: slice 0 %llu, slice 1 %llu | pass 2's rows as the pre-pass's: same %llu, differ %llu (max %.7f)"
                   " | motion vectors: D %s, checked %llu frames, largest relative difference %.2e (not checked: unread %llu, not vi %llu, no D %llu)"
-                  " | main pass %s: publishes %llu, depth copies %llu | eye 2's inverse gWorldView: %llu written, %llu not invertible, packing drops %.1e | the depth's view index %lld"
+                  " | main pass %s: publishes %llu, depth copies %llu | eye 2's inverse gWorldView: %llu written, %llu not invertible, packing drops %.1e | the depth's view index %lld, grass/tree fields %#x %#x"
                   " | velocity pass: TAA $Globals %s, eye 2's NDCToPrevNDC written %llu, eye 1's (no eye-2 update) %llu",
                   static_cast<unsigned long long>(g_vi_regions[0].load()), static_cast<unsigned long long>(g_vi_regions[1].load()),
                   static_cast<unsigned long long>(g_vi_rows_same), static_cast<unsigned long long>(g_vi_rows_differ), g_vi_rows_max,
@@ -1611,7 +1631,7 @@ std::string vi_status() {
                   static_cast<unsigned long long>(g_mv_no_delta), g_i2.load() ? "on" : "off",
                   static_cast<unsigned long long>(g_publishes.load()), static_cast<unsigned long long>(g_depth_copies.load()),
                   static_cast<unsigned long long>(g_inv_written), static_cast<unsigned long long>(g_inv_failed), g_inv_dropped,
-                  static_cast<long long>(g_depth_index), g_taa_state > 0 ? "grown" : g_taa_state < 0 ? "refused" : "not yet",
+                  static_cast<long long>(g_depth_index), g_screen_fields[0], g_screen_fields[1], g_taa_state > 0 ? "grown" : g_taa_state < 0 ? "refused" : "not yet",
                   static_cast<unsigned long long>(g_ndc_written), static_cast<unsigned long long>(g_ndc_eye1));
     return b;
 }
@@ -1708,7 +1728,15 @@ std::string gpu_command(const std::string& arg) {
     if (arg == "box on" || arg == "box off") {
         g_box_copies = arg == "box on";
         return std::string("colour copies of the drawn rectangle only: ") + (g_box_copies.load() ? "on" : "off") + " (boxed " +
-               std::to_string(g_boxed.load()) + ", whole " + std::to_string(g_unboxed.load()) + ")";
+               std::to_string(g_boxed.load()) + ", whole " + std::to_string(g_unboxed.load()) + "; draws with no viewport known " +
+               std::to_string(g_ext_novp.load()) + ") | last extents:" + [] {
+                   std::string o;
+                   for (int k = 0; k < kKinds; ++k)
+                       o += " " + std::to_string(k) + ":" + std::to_string(static_cast<int>(g_ext_last[k][0])) + "x" +
+                            std::to_string(static_cast<int>(g_ext_last[k][1])) + "/" + std::to_string(g_ext_last[k][2]) + "x" +
+                            std::to_string(g_ext_last[k][3]);
+                   return o;
+               }();
     }
     if (arg == "lazy on" || arg == "lazy off") {
         g_lazy_depth = arg == "lazy on";

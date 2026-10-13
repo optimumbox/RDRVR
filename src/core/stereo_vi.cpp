@@ -9,6 +9,7 @@
 #include <deque>
 #include <memory>
 #include <algorithm>
+#include <map>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -512,6 +513,21 @@ void on_reset(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps) {
     s.have_vp = s.have_sc = false;  // (a Reset clears them)
 }
 
+// "vi drawn2 on|off|list": slice 1's region's draws that are made (no twin, a query's), by shader pair: what a skipped
+// second-scene recording (recorder_skip.h) would lose
+std::atomic<bool> g_drawn2_on{false};
+std::mutex g_drawn2_lock;
+std::map<std::pair<uint64_t, uint64_t>, uint64_t> g_drawn2;
+void note_drawn2(const ListState& s) {
+    AcquireSRWLockShared(&g_lock);
+    auto it = g_by_pso.find(s.game);
+    const Kept* k = it == g_by_pso.end() ? nullptr : it->second;
+    const std::pair<uint64_t, uint64_t> key{k ? k->vs_hash : 0, k ? k->ps_hash : 0};
+    ReleaseSRWLockShared(&g_lock);
+    std::lock_guard l(g_drawn2_lock);
+    ++g_drawn2[key];
+}
+
 bool before_draw(ID3D12GraphicsCommandList* cl) {
     if (!g_configured.load(std::memory_order_relaxed)) return false;
     ListState& s = list(cl);
@@ -546,6 +562,7 @@ bool before_draw(ID3D12GraphicsCommandList* cl) {
         g_draws_skipped.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
+    if (region == 2 && g_drawn2_on.load(std::memory_order_relaxed)) note_drawn2(s);
     if (s.game) bind(cl, s, p);  // (out of a region a twin left bound goes back to the game's)
     if (region == 1) (p != s.game ? g_draws_both : g_draws_plain).fetch_add(1, std::memory_order_relaxed);
     if (region == 1 && p == s.game) {
@@ -610,6 +627,30 @@ std::string command(const std::vector<std::string>& t) {
         return std::string("vi ") + sub + " (from the next pre-pass)";
     }
     if (sub == "heap") return heap_status();
+    if (sub == "drawn2" && t.size() >= 3) {
+        if (t[2] == "on" || t[2] == "off") {
+            if (t[2] == "on") {
+                std::lock_guard l(g_drawn2_lock);
+                g_drawn2.clear();
+            }
+            g_drawn2_on = t[2] == "on";
+            return std::string("slice 1's made draws counted: ") + t[2];
+        }
+        std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> v;
+        {
+            std::lock_guard l(g_drawn2_lock);
+            for (auto& [k, n] : g_drawn2) v.push_back({n, k});
+        }
+        std::sort(v.rbegin(), v.rend());
+        std::string o = "slice 1's made draws by vs/ps (" + std::to_string(v.size()) + " pairs):";
+        for (auto& [n, k] : v) {
+            char b[80];
+            std::snprintf(b, sizeof(b), " %016llx/%016llx %llu", static_cast<unsigned long long>(k.first), static_cast<unsigned long long>(k.second),
+                          static_cast<unsigned long long>(n));
+            o += b;
+        }
+        return o;
+    }
     if (sub == "pass2" && t.size() >= 3) {  // vi pass2 skip|draw: a view-instanced frame's second scene not walked / walked
         camera_lever::set_vi_skip2(t[2] == "skip");
         return std::string("second scenes of view-instanced frames: ") + (t[2] == "skip" ? "recorded without draws" : "recorded whole") +

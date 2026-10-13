@@ -1,4 +1,4 @@
-# RDRVR single-pass stereo: handoff (2026-10-13, updated 19:05 EDT)
+# RDRVR single-pass stereo: handoff (2026-10-13, updated 19:35 EDT)
 
 A session resuming this work starts here. Branch `single-pass-stereo`, repo `C:\Games\RDRVR-src`, game at
 `G:\Games\Red Dead Redemption`. Background: `docs/SINGLE_PASS_PLAN.md` (I2: the view-instanced main pass).
@@ -17,7 +17,8 @@ A session resuming this work starts here. Branch `single-pass-stereo`, repo `C:\
 
 ## State
 
-Installed for VR: the latest build, shaders `research\stereo_all12` (session.ps1's default now), `ViSkipRecord=0`.
+Installed for VR: the latest build, shaders `research\stereo_all13` (session.ps1's default now), `ViSkipRecord=0`.
+The user runs DLSS Quality (RDRVR.user.ini DlssQuality=5, RenderScale=100: render 1809x1790 per eye), not DLAA.
 The user's F7 menu render scale is at 200% (they tried it because 100% was blocked); 100% gives 4778x2688 (eyes
 2716x2688) once not blocked. Tell them to put it back to 100%.
 
@@ -50,6 +51,24 @@ Headset numbers now (DLAA, 539 frames): GPU ~9.6 ms (regions 7.4, copies 2.1); r
 4.9, pass 2 2.85: eye 2's scene recorded whole because ViSkipRecord=0); playback region 2 12.2 Mcycles; ~7.5 % late
 frames, so SteamVR holds 45 Hz. Next: the recorder skip narrowed so eye 2's needed draws (no-twin passes, the plants'
 motion vectors) are still recorded; that is ~2.85 ms render + ~2.5 ms playback.
+
+## 19:05-19:35: the recorder skip narrowed (headset, DLSS Quality)
+
+- The recorder skip (`ViSkipRecord=1`, then `vi pass2 skip|draw`) records no eye-2 draws at all, so eye 2 lost the
+  passes without twins. `vi drawn2 on|list` (new) counts slice 1's region's draws that are made, by shader pair: at
+  the desert scrub ~9 a frame: footprint colour/collector (3+3), PS_Grass_Fullscreen, PSAlphaFoliageResolveFS_Deferred,
+  PS_Blit (the refraction copy: unused by eye 2 since slot 12 reads eye 2's FullScreenCopy).
+- The grass and foliage resolves have twins again: eye 2 copies of Grass FS Colour / Light Multiply / Tree FS Colour
+  (slots 17-19), their game view indices in rage_matrices rows 25/26 .w (14-bit fields), compared in view 1 by every
+  converted shader (viewid_patch.py SCREEN_INDEX_FIELDS). Set `research\stereo_all13`. Headset: skip vs draw, the right
+  eye's grass and bushes the same (`research\grabr25`, cmp_draw_skip1_R.png).
+- Still lost in eye 2 under the skip (no rage_matrices in those shaders, so no index channel): footprints
+  (PSFootprintColor/Collector), light glows (PS_lightglow). PSMiragerSingle (heat haze) has rage_matrices and could take
+  a field for its RenderMapBilinearSampler image (FullScreenCopy? unverified: it never drew in the tested views).
+- Headset, DLSS Quality, the scrub by the station: skip 85.4 Hz (5.0 % late, GPU 9.6 ms, playback busy 9.5, scene 4.6)
+  vs draw 82.4 Hz (8.4 % late, GPU 10.1, playback 10.4, scene 5.4). Earlier, a heavier view: 81.5 vs 65 Hz. The motion
+  vectors under the skip were fine (ground and far within the headset's jitter). Not on by default: footprints/glows.
+- The box copies (`prepass gpu box`) do nothing: the game's targets are render-sized already ("last extents").
 
 ## Open problems (as of 15:25; 1 and 2 addressed above, re-check in the user's next session) (the user's screenshots: `research\grab\vr3\`, eye captures; `tools\sp\eyesbs.py` views them)
 
