@@ -20,6 +20,7 @@
 #include "core/hooks.h"
 #include "core/prepass_arrays.h"
 #include "core/stereo_vi.h"
+#include "core/replay_ops.h"
 #include "core/pso.h"
 #include "core/log.h"
 #include "core/ring_probe.h"
@@ -327,6 +328,7 @@ std::atomic<uint64_t> g_unsynced_presents{0};
 
 void STDMETHODCALLTYPE hk_OMSetRenderTargets(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts,
                                              BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* ds) {
+    replay_ops::note(replay_ops::kTargets);
     for (auto& slot : g_bind_tap)
         if (BindTapFn tap = slot.load(std::memory_order_relaxed)) tap(cl, n, rts, single, ds);
     if (g_fg_armed.load(std::memory_order_relaxed)) {
@@ -381,6 +383,7 @@ void fg_draw(ID3D12GraphicsCommandList* cl) {
 }
 
 void STDMETHODCALLTYPE hk_DrawInstanced(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, UINT d) {
+    replay_ops::note(replay_ops::kDraw);
     if (prepass::active()) prepass::before_draw(cl);
     if (vi::before_draw(cl)) return;  // view-instanced stereo: drawn for both eyes already
     if (prepass::active()) prepass::drawn(cl);
@@ -391,6 +394,7 @@ void STDMETHODCALLTYPE hk_DrawInstanced(ID3D12GraphicsCommandList* cl, UINT a, U
     o_DrawInstanced(cl, a, b, c, d);
 }
 void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, INT d, UINT e) {
+    replay_ops::note(replay_ops::kDraw);
     if (prepass::active()) prepass::before_draw(cl);
     if (vi::before_draw(cl)) return;
     if (prepass::active()) prepass::drawn(cl);
@@ -406,6 +410,7 @@ void STDMETHODCALLTYPE hk_Dispatch(ID3D12GraphicsCommandList* cl, UINT x, UINT y
 }
 void STDMETHODCALLTYPE hk_ExecuteIndirect(ID3D12GraphicsCommandList* cl, ID3D12CommandSignature* s, UINT n, ID3D12Resource* a,
                                           UINT64 b, ID3D12Resource* c, UINT64 d) {
+    replay_ops::note(replay_ops::kIndirect);
     fg_count(cl, [](ListLog& l) { ++l.indirect; });
     if (prepass::active()) prepass::before_draw(cl);
     if (vi::before_draw(cl)) return;
@@ -453,6 +458,7 @@ void watch_list_ends(ID3D12GraphicsCommandList* cl) {
 }
 
 void STDMETHODCALLTYPE hk_ResourceBarrier(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_RESOURCE_BARRIER* b) {
+    replay_ops::note(replay_ops::kBarrier);
     if (prepass::tracing()) prepass::trace_barrier(cl, n, b);
     if (prepass::active()) prepass::barrier(cl, n, b);  // (before the game's batch: the pre-pass copies)
     fg_count(cl, [n](ListLog& l) { l.barriers += n; });
@@ -469,21 +475,25 @@ HRESULT STDMETHODCALLTYPE hk_Reset(ID3D12GraphicsCommandList* cl, ID3D12CommandA
     return o_Reset(cl, a, ps);
 }
 void STDMETHODCALLTYPE hk_BeginQuery(ID3D12GraphicsCommandList* cl, ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) {
+    replay_ops::note(replay_ops::kQuery);
     vi::on_query(cl, 0, t, i, nullptr, 0, 1);
     o_BeginQuery(cl, h, t, i);
 }
 void STDMETHODCALLTYPE hk_ResolveQuery(ID3D12GraphicsCommandList* cl, ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT start, UINT n,
                                        ID3D12Resource* dst, UINT64 off) {
+    replay_ops::note(replay_ops::kQuery);
     vi::on_query(cl, 2, t, start, dst, off, n);
     o_ResolveQuery(cl, h, t, start, n, dst, off);
 }
 void STDMETHODCALLTYPE hk_EndQuery(ID3D12GraphicsCommandList* cl, ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) {
+    replay_ops::note(replay_ops::kQuery);
     vi::on_query(cl, 1, t, i, nullptr, 0, 1);
     ++t_queries;
     fg_count(cl, [](ListLog& l) { ++l.queries; });
     o_EndQuery(cl, h, t, i);
 }
 void STDMETHODCALLTYPE hk_CopyResource(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, ID3D12Resource* src) {
+    replay_ops::note(replay_ops::kCopy);
     if (g_fg_armed.load(std::memory_order_relaxed)) {
         char a[32], b[32];
         std::string d, s;
@@ -501,6 +511,7 @@ void STDMETHODCALLTYPE hk_CopyResource(ID3D12GraphicsCommandList* cl, ID3D12Reso
 }
 void STDMETHODCALLTYPE hk_CopyTextureRegion(ID3D12GraphicsCommandList* cl, const D3D12_TEXTURE_COPY_LOCATION* dst, UINT x, UINT y,
                                             UINT z, const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box) {
+    replay_ops::note(replay_ops::kCopy);
     if (g_fg_armed.load(std::memory_order_relaxed)) {
         char a[32], b[32];
         std::string d, s;
@@ -515,6 +526,7 @@ void STDMETHODCALLTYPE hk_CopyTextureRegion(ID3D12GraphicsCommandList* cl, const
 }
 void STDMETHODCALLTYPE hk_ClearRTV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE h, const FLOAT c[4], UINT n,
                                    const D3D12_RECT* r) {
+    replay_ops::note(replay_ops::kClear);
     if (g_fg_armed.load(std::memory_order_relaxed)) {
         char a[32];
         std::string name;
@@ -534,6 +546,7 @@ void STDMETHODCALLTYPE hk_ClearRTV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESC
 }
 void STDMETHODCALLTYPE hk_ClearDSV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE h, D3D12_CLEAR_FLAGS f, FLOAT d,
                                    UINT8 s, UINT n, const D3D12_RECT* r) {
+    replay_ops::note(replay_ops::kClear);
     if (g_fg_armed.load(std::memory_order_relaxed)) {
         char a[32];
         std::string name;
@@ -561,6 +574,7 @@ void STDMETHODCALLTYPE hk_BeginEvent(ID3D12GraphicsCommandList* cl, UINT meta, c
     o_BeginEvent(cl, meta, data, size);
 }
 void STDMETHODCALLTYPE hk_SetPredication(ID3D12GraphicsCommandList* cl, ID3D12Resource* r, UINT64 off, D3D12_PREDICATION_OP op) {
+    replay_ops::note(replay_ops::kPredication);
     vi::on_query(cl, 3, static_cast<D3D12_QUERY_TYPE>(op), 0, r, off, 1);
     if (r && vi::drop_predication(cl)) return o_SetPredication(cl, nullptr, 0, op);  // (the A/B: everything drawn)
     fg_count(cl, [](ListLog& l) { ++l.queries; });

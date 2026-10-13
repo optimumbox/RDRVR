@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "core/camera_lever.h"
+#include "core/recorder_skip.h"
 #include "core/config.h"
 #include "core/log.h"
 #include "core/prepass_arrays.h"
@@ -492,6 +493,11 @@ std::string command(const std::vector<std::string>& t) {
         return std::string("vi ") + sub + " (from the next pre-pass)";
     }
     if (sub == "heap") return heap_status();
+    if (sub == "pass2" && t.size() >= 3) {  // vi pass2 skip|draw: a view-instanced frame's second scene not walked / walked
+        camera_lever::set_vi_skip2(t[2] == "skip");
+        return std::string("second scenes of view-instanced frames: ") + (t[2] == "skip" ? "recorded without draws" : "recorded whole") +
+               " (" + std::to_string(camera_lever::vi_skipped2()) + " so far) | " + recorder_skip::status();
+    }
     if (sub == "plain") {  // vi plain [reset]: slice 0's region's eye-1-only draws, most first
         std::vector<std::pair<ID3D12PipelineState*, PlainStat>> v;
         {

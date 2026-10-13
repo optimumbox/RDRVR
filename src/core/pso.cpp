@@ -16,6 +16,7 @@
 #include "core/d3d_hooks.h"
 #include "core/hooks.h"
 #include "core/log.h"
+#include "core/replay_ops.h"
 #include "core/ring_probe.h"
 #include "core/stereo_vi.h"
 
@@ -309,6 +310,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateStream(ID3D12Device* dev, const D3D12_PIPELIN
 }
 
 void STDMETHODCALLTYPE hk_SetPipelineState(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* game) {
+    replay_ops::note(replay_ops::kPso);
     ID3D12PipelineState* ps = vi::on_set_pso(cl, game);  // the game's, or its view-instanced twin (stereo_vi.h)
     if (!g_census.load(std::memory_order_relaxed)) return o_SetPipelineState(cl, ps);
     uint64_t h = 0;

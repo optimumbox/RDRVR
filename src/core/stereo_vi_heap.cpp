@@ -23,6 +23,7 @@
 #include "core/config.h"
 #include "core/hooks.h"
 #include "core/log.h"
+#include "core/replay_ops.h"
 
 namespace rdrvr::vi {
 namespace {
@@ -154,6 +155,7 @@ void write_pending(ID3D12DescriptorHeap* heap) {  // under g_mutex
 
 void STDMETHODCALLTYPE hk_SetHeaps(ID3D12GraphicsCommandList* cl, UINT n, ID3D12DescriptorHeap* const* heaps) {
     o_SetHeaps(cl, n, heaps);
+    replay_ops::note(replay_ops::kHeaps);
     for (UINT i = 0; i < n && heaps; ++i) {
         const D3D12_DESCRIPTOR_HEAP_DESC d = heaps[i]->GetDesc();
         if (d.Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !(d.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) continue;
@@ -176,6 +178,7 @@ void STDMETHODCALLTYPE hk_SetHeaps(ID3D12GraphicsCommandList* cl, UINT n, ID3D12
 
 void STDMETHODCALLTYPE hk_SetTable(ID3D12GraphicsCommandList* cl, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE gh) {
     o_SetTable(cl, param, gh);
+    replay_ops::note(replay_ops::kTable);
     if (param != kSrvTableParam) return;
     g_table_binds.fetch_add(1, std::memory_order_relaxed);
     auto lh = t_list_heap.find(cl);

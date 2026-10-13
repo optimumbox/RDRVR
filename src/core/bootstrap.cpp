@@ -19,6 +19,8 @@
 #include "core/exit_guard.h"
 #include "core/burst_grab.h"
 #include "core/align_grab.h"
+#include "core/recorder_skip.h"
+#include "core/replay_ops.h"
 #include "core/ui_layer.h"
 #include "core/vr_mode.h"
 #include "core/hands.h"
@@ -180,6 +182,8 @@ DWORD WINAPI bootstrap_thread(void*) {
         dual_pass::install();
         frame_probe::install();  // after dual_pass: its wait sites
         playback::install();
+        replay_ops::install();
+        recorder_skip::install();
         prepass::install();
         eye_shape::install();
         body::install();

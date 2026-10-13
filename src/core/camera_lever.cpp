@@ -23,6 +23,7 @@
 #include "core/pose.h"
 #include "core/ring_probe.h"
 #include "core/prepass_arrays.h"
+#include "core/recorder_skip.h"
 #include "core/state.h"
 #include "core/xr.h"
 
@@ -367,6 +368,8 @@ std::atomic<uint64_t> g_vi_fixes{0}, g_vi_frames{0};
 // Pass 2 from eye 1's position (above): off by default since the eye captures of 2026-10-13 (at 0.5 m apart, eye 2 came out
 // as eye 1: the main pass does not take its transform from +0xc0). Kept as a switch ("vi camfix on|off") for the record.
 std::atomic<bool> g_vi_camfix{false};
+std::atomic<bool> g_vi_skip2{false};  // "vi pass2 skip": a view-instanced frame's second scene records no draws (recorder_skip.h)
+std::atomic<uint64_t> g_vi_skipped2{0};
 // "cam vilog": the next view-instanced frame's pass 2: every Regenerate, SetCamera and PushGlobals on the render thread,
 // with the viewport, its camera position (+0x140 row 3) and whether it is the scene's
 std::atomic<int> g_vi_log{0};  // 1 armed, 2 logging this pass 2
@@ -577,6 +580,18 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
             prepass::scene_end();
             if (g_vi_log.load() == 2) g_vi_log = 0;
             t_vi_fix = false;
+            ring_probe::matrix_expect(-2, nullptr, nullptr, nullptr);
+            t_scene_vp = outer;
+            return;
+        }
+        if (t_vi_frame && second && g_vi_skip2.load(std::memory_order_relaxed) && recorder_skip::installed()) {
+            // [Stereo] ViSkipRecord: slice 0's region drew both eyes; this scene runs for its own bookkeeping (its targets'
+            // clears and binds, its copies, the region's end) but records no draws and no draw state
+            recorder_skip::begin();
+            o_SceneRender(renderer, vp, copy, a4);
+            recorder_skip::end();
+            prepass::scene_end();
+            g_vi_skipped2.fetch_add(1, std::memory_order_relaxed);
             ring_probe::matrix_expect(-2, nullptr, nullptr, nullptr);
             t_scene_vp = outer;
             return;
@@ -973,6 +988,8 @@ void set(Mode mode, float dx, float dy, float dz) {
 void request_log() { g_log = true; }
 void request_vi_log() { g_vi_log = 1; }
 void set_vi_camfix(bool on) { g_vi_camfix = on; }
+void set_vi_skip2(bool on) { g_vi_skip2 = on; }
+uint64_t vi_skipped2() { return g_vi_skipped2.load(); }
 
 void set_eye_projection(int eye) {
     g_eye = (eye == 0 || eye == 1 || eye == 3) ? eye : -1;

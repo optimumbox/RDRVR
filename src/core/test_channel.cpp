@@ -39,6 +39,7 @@
 #include "core/log.h"
 #include "core/lum_check.h"
 #include "core/prepass_arrays.h"
+#include "core/replay_ops.h"
 #include "core/stereo_vi.h"
 #include "core/pso.h"
 #include "core/render_settings.h"
@@ -738,6 +739,7 @@ std::string execute(const std::vector<std::string>& t) {
         return "view-instanced every other " + t[2] + " frames (0: every frame)";
     }
     if (c == "vi") return vi::command(t);  // view-instanced stereo (stereo_vi.h)
+    if (c == "ops") return replay_ops::command(t);  // the playback packets by opcode (replay_ops.h)
     if (c == "prepass") {  // prepass [on|off]: [Stereo] PrepassArrays (test only, stageVI-prepass.md milestone 2)
         if (t.size() >= 2 && (t[1] == "on" || t[1] == "off")) prepass::set_on(t[1] == "on");
         if (t.size() >= 4 && t[1] == "grab") return prepass::grab(t[2], t[3]);

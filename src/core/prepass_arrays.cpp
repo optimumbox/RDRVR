@@ -20,6 +20,7 @@
 #include "core/d3d_hooks.h"
 #include "core/dual_pass.h"
 #include "core/log.h"
+#include "core/replay_ops.h"
 #include "core/state.h"
 #include "core/stereo_vi.h"
 
@@ -278,8 +279,14 @@ struct Rec {
     Tag tag[kMax];
     bool vi = false, resolved = false, complete = false;
     double cpu = 0;  // the playback thread's time from region 0's start to region 1's end (ms)
+    double frame_ms = 0, frame_cyc = 0;  // ... from this frame's region 0 start to the next frame's (ms; Mcycles)
+    bool has_frame = false;
+    double cycles = 0;  // ... and the cycles it ran in that time (QueryThreadCycleTime: waits excluded), millions
+    double cyc0 = 0, cyc1 = 0;  // in region 0, in region 1
 };
+ULONG64 g_cyc_mark = 0;
 double g_cpu_begin = 0;
+ULONG64 g_cyc_begin = 0;
 double qpc_ms() {
     static const double f = [] {
         LARGE_INTEGER q;
@@ -294,8 +301,13 @@ Rec g_rec[kFrames];
 int g_slot = -1;
 struct Sum {
     uint64_t frames = 0;
-    double span = 0, r0 = 0, r1 = 0, copies = 0, cpu = 0;
+    double span = 0, r0 = 0, r1 = 0, copies = 0, cpu = 0, cycles = 0, cyc0 = 0, cyc1 = 0;
+    uint64_t framed = 0;
+    double frame_ms = 0, frame_cyc = 0;
 };
+int g_prev = -1;
+double g_frame_t0 = 0;
+ULONG64 g_frame_c0 = 0;
 Sum g_sum[2];  // [vi]
 uint64_t g_marks = 0, g_resolves = 0, g_harvests = 0, g_unresolved = 0, g_bad = 0;
 double g_last[4] = {0, 0, 0, 0};
@@ -347,6 +359,7 @@ void harvest(int slot) {  // that slot's frame, resolved kFrames frames ago
                 break;
         }
     }
+    if (b1 < 0 && e1 < 0) b1 = e1 = e0;  // (a frame without a second region: ViSkipPass2)
     if (b0 < 0 || e0 < b0 || b1 < e0 || e1 < b1 || e1 - b0 > 200) {  // (an incomplete or wrapped frame)
         ++g_bad;
         g_last[0] = b0, g_last[1] = e0, g_last[2] = b1, g_last[3] = e1;
@@ -360,18 +373,55 @@ void harvest(int slot) {  // that slot's frame, resolved kFrames frames ago
     s.r1 += e1 - b1;
     s.copies += copies;
     s.cpu += rc.cpu;
+    s.cycles += rc.cycles;
+    s.cyc0 += rc.cyc0;
+    s.cyc1 += rc.cyc1;
+    if (rc.has_frame) {
+        ++s.framed;
+        s.frame_ms += rc.frame_ms;
+        s.frame_cyc += rc.frame_cyc;
+    }
 }
 void mark(ID3D12GraphicsCommandList* cl, Tag tag) {
     if (!g_on || !ensure()) return;
     if (tag == kBegin0) {
+        ULONG64 c = 0;
+        QueryThreadCycleTime(GetCurrentThread(), &c);
+        const double now = qpc_ms();
+        if (g_prev >= 0) {  // the previous frame, start to start; resolved here if it had no second region
+            Rec& p = g_rec[g_prev];
+            p.frame_ms = now - g_frame_t0;
+            p.frame_cyc = static_cast<double>(c - g_frame_c0) / 1e6;
+            p.has_frame = true;
+            if (!p.resolved && p.n > 0) {
+                cl->ResolveQueryData(g_heap, D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(g_prev * kMax), static_cast<UINT>(p.n), g_rb,
+                                     static_cast<UINT64>(g_prev) * kMax * 8);
+                p.resolved = p.complete = true;
+                p.cpu = now - g_cpu_begin;
+                p.cycles = static_cast<double>(c - g_cyc_begin) / 1e6;
+                ++g_resolves;
+            }
+        }
+        g_frame_t0 = now;
+        g_frame_c0 = c;
         g_slot = static_cast<int>(state::presents.load() % kFrames);
+        if (g_slot == g_prev) g_slot = (g_slot + 1) % kFrames;  // (two regions 0 in one present: keep the slot just filled)
+        g_prev = g_slot;
         harvest(g_slot);
         g_rec[g_slot] = Rec{};
         g_rec[g_slot].vi = g_r.vi;
         g_cpu_begin = qpc_ms();
+        QueryThreadCycleTime(GetCurrentThread(), &g_cyc_begin);
     }
     if (g_slot < 0) return;
     Rec& rc = g_rec[g_slot];
+    if (tag == kEnd0 || tag == kBegin1 || tag == kEnd1) {
+        ULONG64 c = 0;
+        QueryThreadCycleTime(GetCurrentThread(), &c);
+        if (tag == kEnd0) rc.cyc0 = static_cast<double>(c - g_cyc_begin) / 1e6;
+        if (tag == kBegin1) g_cyc_mark = c;
+        if (tag == kEnd1) rc.cyc1 = static_cast<double>(c - g_cyc_mark) / 1e6;
+    }
     if (rc.n >= kMax - 4 && (tag == kCopyBegin || tag == kCopyEnd)) return;  // (room kept for the regions' marks)
     if (rc.n >= kMax) return;
     cl->EndQuery(g_heap, D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(g_slot * kMax + rc.n));
@@ -382,6 +432,9 @@ void mark(ID3D12GraphicsCommandList* cl, Tag tag) {
                              static_cast<UINT64>(g_slot) * kMax * 8);
         rc.resolved = rc.complete = true;
         rc.cpu = qpc_ms() - g_cpu_begin;
+        ULONG64 c = 0;
+        QueryThreadCycleTime(GetCurrentThread(), &c);
+        rc.cycles = static_cast<double>(c - g_cyc_begin) / 1e6;
         ++g_resolves;
         g_slot = -1;
     }
@@ -392,10 +445,11 @@ std::string status(bool reset) {
     for (int v = 0; v < 2; ++v) {
         const Sum& s = g_sum[v];
         const double n = s.frames ? static_cast<double>(s.frames) : 1.0;
-        char b[260];
-        std::snprintf(b, sizeof(b), " | %s: %llu frames, GPU both regions %.3f ms (eye 1's %.3f, eye 2's %.3f), copies in them %.3f; playback CPU %.3f",
+        char b[400];
+        std::snprintf(b, sizeof(b), " | %s: %llu frames, GPU both regions %.3f ms (eye 1's %.3f, eye 2's %.3f), copies in them %.3f; playback %.3f ms, ran %.2f Mcycles (region 1 %.2f, region 2 %.2f); whole frame %.3f ms, %.2f Mcycles",
                       v ? "view-instanced" : "two passes", static_cast<unsigned long long>(s.frames), s.span / n, s.r0 / n, s.r1 / n, s.copies / n,
-                      s.cpu / n);
+                      s.cpu / n, s.cycles / n, s.cyc0 / n, s.cyc1 / n, s.framed ? s.frame_ms / static_cast<double>(s.framed) : 0.0,
+                      s.framed ? s.frame_cyc / static_cast<double>(s.framed) : 0.0);
         r += b;
     }
     char d[260];
@@ -410,6 +464,7 @@ std::string status(bool reset) {
 }  // namespace gpu
 
 void end_region(ID3D12GraphicsCommandList* cl) {
+    replay_ops::set_region2(false);
     g_active = false;
     g_end_pending = false;
     unsigned need = 0;
@@ -620,14 +675,24 @@ bool rd(uintptr_t a, T* out) {
     }
 }
 
-void walk_end_cb(void*) { g_end_pending.store(true, std::memory_order_release); }
+void walk_end_cb(void*) {
+    replay_ops::note(replay_ops::kMarker);
+    replay_ops::set_region2(false);  // (the packets after the scene's end are the next pass's: played)
+    g_end_pending.store(true, std::memory_order_release);
+}
 
 // View-instanced frames are decided on the render thread (pass 2's camera depends on it, camera_lever.cpp) and told to
 // the playback thread through the stream: a marker recorded before pass 1 sets the next slice-0 region's choice.
 std::atomic<int> g_next_vi{0};  // 1: the next slice-0 region draws both eyes
 thread_local bool t_latched_vi = false;  // the render thread's choice for its current frame (latch_vi)
-void vi_on_cb(void*) { g_next_vi.store(1, std::memory_order_release); }
-void vi_off_cb(void*) { g_next_vi.store(0, std::memory_order_release); }
+void vi_on_cb(void*) {
+    replay_ops::note(replay_ops::kMarker);
+    g_next_vi.store(1, std::memory_order_release);
+}
+void vi_off_cb(void*) {
+    replay_ops::note(replay_ops::kMarker);
+    g_next_vi.store(0, std::memory_order_release);
+}
 bool append_marker(void (*fn)(void*)) {
     uintptr_t dev = 0, hrec = 0, rec = 0, vt = 0;
     if (!rd(anchors::addr(anchors::Id::D3dDeviceSingleton), &dev) || !rd(dev + 0x58, &hrec) || !rd(hrec + 0x128, &rec) || !rd(rec, &vt) ||
@@ -1109,6 +1174,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_dsv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
     g_active = true;
     g_regions.fetch_add(1, std::memory_order_relaxed);
     gpu::mark(cl, slice == 0 ? gpu::kBegin0 : gpu::kBegin1);
+    if (slice == 1 && g_r.vi) replay_ops::set_region2(true);  // eye 2's region of a view-instanced frame (ViSkipPackets)
     if (g_last.cl == cl) {  // the targets bound before this clear: bound again, the six as the slices
         D3D12_CPU_DESCRIPTOR_HANDLE r2[8], d2{};
         if (bind(cl, g_last.n, g_last.rts, g_last.single, g_last.has_ds ? &g_last.ds : nullptr, r2, &d2))
@@ -1243,6 +1309,7 @@ void barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BAR
 void before_draw(ID3D12GraphicsCommandList* cl) {
     if (cl == g_r.cl && g_end_pending.load(std::memory_order_acquire)) end_region(cl);
 }
+
 
 std::atomic<unsigned> g_ab{0};  // "vi ab <n>": view-instanced every other n frames (0: every frame)
 bool latch_vi() {

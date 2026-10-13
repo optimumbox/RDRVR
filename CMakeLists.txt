@@ -56,6 +56,9 @@ add_library(rdrvr_core SHARED
     src/core/frame_probe.cpp
     src/core/playback.cpp
     src/core/playback_head.asm
+    src/core/recorder_skip.cpp
+    src/core/replay_ops.cpp
+    src/core/replay_ops.asm
     src/core/render_settings.cpp
     src/core/ring_probe.cpp
     src/core/diag.cpp
