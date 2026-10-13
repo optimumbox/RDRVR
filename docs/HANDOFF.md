@@ -1,4 +1,4 @@
-# RDRVR single-pass stereo: handoff (2026-10-13, 15:25 EDT)
+# RDRVR single-pass stereo: handoff (2026-10-13, updated 17:55 EDT)
 
 A session resuming this work starts here. Branch `single-pass-stereo`, repo `C:\Games\RDRVR-src`, game at
 `G:\Games\Red Dead Redemption`. Background: `docs/SINGLE_PASS_PLAN.md` (I2: the view-instanced main pass).
@@ -23,7 +23,16 @@ The user's F7 menu render scale is at 200% (they tried it because 100% was block
 
 Fixed and confirmed by the user in the headset (2026-10-13 15:15): plants (no more smearing), the resolution cause.
 
-## Open problems (the user's screenshots: `research\grab\vr3\`, eye captures; `tools\sp\eyesbs.py` views them)
+## Fixed 17:00-17:55 (VR-verified on the monitor captures; commit eca6b31)
+
+- Hazy right-eye glass: slot 12 now reads eye 2's copy of FullScreenCopy (taken before the glass), not eye 2's
+  refraction copy (made after the glass in eye 2's region). VR capture: the interior shows through the station window
+  in both eyes, as in two-pass.
+- Objects missing at the right eye's edge (a chest, a barrel): [Stereo] ViUnionCull: eye 1's viewport culls with
+  head-centred planes over both eyes. Likely also the user's shadow misalignment (the cascades fit the cull frustum):
+  the sun-shadow stripes now match two-pass in the right eye (residual within the left-eye time-noise control).
+
+## Open problems (as of 15:25; 1 and 2 addressed above, re-check in the user's next session) (the user's screenshots: `research\grab\vr3\`, eye captures; `tools\sp\eyesbs.py` views them)
 
 1. **Glass in the right eye is hazy/grey**: through a window the left eye sees the room clearly, the right eye a grey
    haze with the room barely visible (vr3 capture 151514, bottom row of `research\grab\vr3\a.png`). The refraction
