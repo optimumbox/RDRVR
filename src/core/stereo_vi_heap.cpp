@@ -323,6 +323,7 @@ void install_list_hooks(ID3D12GraphicsCommandList* cl) {
     if (!config::get_bool("Stereo", "ViMain", false) || o_SetHeaps) return;
     hooks::install("CL::SetDescriptorHeaps (ViMain)", hooks::vtable_entry(cl, 28), hk_SetHeaps, &o_SetHeaps);
     hooks::install("CL::SetGraphicsRootDescriptorTable (ViMain)", hooks::vtable_entry(cl, 32), hk_SetTable, &o_SetTable);
+    install_rs_hooks(cl);
 }
 
 bool heap_ready() {

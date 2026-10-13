@@ -927,6 +927,11 @@ void write_inv_wv2(const float* wv) {
     std::memcpy(&rows[7], &du, 4);
     g_depth_index = di;
     write_raw(g_b1.block + 0x1d0, rows, sizeof(rows));
+    // row 27 .w (eye 2's gViewInverse row 2, its .w read by no shader): the depth resolve's view index, for the same
+    // compare (viewid_patch.py RESOLVE_INDEX_ROW; the light passes read it)
+    const int64_t ri = vi::game_view_index(kDepthSlot);
+    const uint32_t ru = ri >= 0 && ri < 0x7fffffff ? static_cast<uint32_t>(ri) : 0xffffffffu;
+    write_raw(g_b1.block + 0x1b0 + 12, &ru, 4);
     ++g_inv_written;
 }
 // The velocity pass (rdr2_taa's PSGenerateVelocityBuffer, view-instanced: tools/sp/dxil/viewid_patch.py patch_ndc) reads
@@ -962,6 +967,7 @@ void write_eye2(const float* wv, const float* vi, const float* pvp) {
     wr<int>(g_pp.cb + 0x24, -1);
     std::memcpy(g_written_wv, wv, 64);
     std::memcpy(g_written_vi, vi, 64);
+    read_raw(g_b1.block + 0x190, g_written_vi, 64);  // (row 27 .w: the depth resolve's index, write_inv_wv2)
     std::memcpy(g_written_pp, pp, 64);
     ++g_written;
 }
@@ -1206,7 +1212,12 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_dsv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
     g_active = true;
     g_regions.fetch_add(1, std::memory_order_relaxed);
     gpu::mark(cl, slice == 0 ? gpu::kBegin0 : gpu::kBegin1);
-    if (slice == 1 && g_r.vi) replay_ops::set_region2(true);  // eye 2's region of a view-instanced frame (ViSkipPackets)
+    if (slice == 1 && g_r.vi) {
+        replay_ops::set_region2(true);  // eye 2's region of a view-instanced frame (ViSkipPackets)
+        // slice 0's region drew eye 2's slices: each kind is copied out at its first read here (the passes without a
+        // twin, drawn by this region as the game's, read eye 2's images: the refraction copy, the foliage resolve)
+        g_r.dirty = (1u << kKinds) - 1;
+    }
     if (g_last.cl == cl) {  // the targets bound before this clear: bound again, the six as the slices
         D3D12_CPU_DESCRIPTOR_HANDLE r2[8], d2{};
         if (bind(cl, g_last.n, g_last.rts, g_last.single, g_last.has_ds ? &g_last.ds : nullptr, r2, &d2))

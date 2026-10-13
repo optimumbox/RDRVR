@@ -25,10 +25,13 @@ function InWorld {
     if ($p -notmatch '^actor (\d+) value .* vec \(([-\d.]+) ([-\d.]+) ([-\d.]+)\)') { return "no actor ($p)" }
     if ([int64]$Matches[1] -le 0) { return "no actor ($p)" }
     if ([double]$Matches[2] -eq 0 -and [double]$Matches[3] -eq 0 -and [double]$Matches[4] -eq 0) { return 'actor at the origin' }
-    $paused = Ask 'native 57246C02'   # IS_GAME_PAUSED
-    if ($paused -notmatch '\(int 0,') { return "paused ($paused)" }
-    $faded = Ask 'native 4EFFFC06'    # HUD_IS_FADED
-    if ($faded -notmatch '\(int 0,') { return "faded ($faded)" }
+    # paused / faded / stalled / no scene as the core's mode watcher sees them (its natives polled on the script
+    # tick: "mode" ends "now: <flags>"). A direct "native" call read paused and faded 1 in the world in a headset
+    # session (2026-10-13) while the watcher, the HUD and the stereo view all said gameplay.
+    $mode = Ask 'mode'
+    if ($mode -notmatch '\| now: ') { return "no mode status ($mode)" }
+    $now = ($mode -split '\| now: ', 2)[1].Trim()
+    if ($now -ne '' -and $now -ne 'cutscene') { return "not in play ($now)" }
     $cut = Ask 'cutscene'             # CUTSCENE_MANAGER_IS_CUTSCENE_PLAYING as the core watches it (Enter skips one); never
     if ($cut -ne 'cutscene 0') { return "cutscene ($cut)" }  # through "native": that hash is not callable so (crashed)
     return ''

@@ -6,13 +6,15 @@
 .EXAMPLE
     tools\sp\session.ps1 -Start
     tools\sp\session.ps1 -Stop
+    tools\sp\session.ps1 -Vr       # the headset config, and the game started (SteamVR running)
 #>
 param(
     [switch] $Start,
     [switch] $Stop,
     [switch] $Install,
+    [switch] $Vr,
     [string] $GameDir = 'G:\Games\Red Dead Redemption',
-    [string] $Shaders = 'C:\Games\RDRVR-src\research\stereo_all9',
+    [string] $Shaders = 'C:\Games\RDRVR-src\research\stereo_all11',
     [string] $ExtraIni = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -32,7 +34,7 @@ if ($Stop) {
     'session ended: the release is back'
     return
 }
-if ($Install) {
+if ($Install -or $Vr) {
     # a headset session the player starts: this build, single-pass stereo on from the start (the view-instanced main pass,
     # the second scene recorded without draws), the OpenXR runtime as configured (no flat override); "-Stop" undoes it
     & (Join-Path $here 'deploy.ps1') -GameDir $GameDir
@@ -49,7 +51,17 @@ ViShaders=$Shaders
 $ExtraIni
 "@ | Set-Content (Join-Path $GameDir 'RDRVR.dev.ini') -Encoding ascii
     Remove-Item (Join-Path $GameDir 'RDRVR_xr_runtime.txt') -ErrorAction SilentlyContinue
-    'installed for a VR session: start the game yourself ("tools\sp\session.ps1 -Stop" puts the release back)'
+    if (-not $Vr) {
+        'installed for a VR session: start the game yourself ("tools\sp\session.ps1 -Stop" puts the release back)'
+        return
+    }
+    # -Vr: started here too (SteamVR running, the headset connected), back at the menu like -Start
+    $log = Join-Path $GameDir 'RDRVR.log'
+    $t0 = Get-Date
+    Start-Process (Join-Path $GameDir 'PlayRDR.exe') -WorkingDirectory $GameDir
+    do { Start-Sleep 2 } until ((Test-Path $log) -and (Get-Item $log).LastWriteTime -gt $t0 -and
+                                (Select-String -Path $log -Pattern '\[vi\] view instancing tier' -Quiet))
+    'game launched (VR): at the menu'
     return
 }
 if ($Start) {

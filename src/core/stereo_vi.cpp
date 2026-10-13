@@ -20,6 +20,7 @@
 #include "core/camera_lever.h"
 #include "core/recorder_skip.h"
 #include "core/config.h"
+#include "core/hooks.h"
 #include "core/log.h"
 #include "core/prepass_arrays.h"
 #include "core/pso.h"
@@ -165,7 +166,12 @@ struct Stream {
     Sub<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING, D3D12_VIEW_INSTANCING_DESC> views;
 };
 #pragma warning(pop)
-const D3D12_VIEW_INSTANCE_LOCATION kLocations[2] = {{0, 0}, {0, 1}};  // view i: viewport 0, render-target array slice i
+// view i: render-target array slice i; view 1 has its own viewport and scissor (index 1: the game's viewport, the scissor
+// widened to it). The game clips what it draws through a door or a window (an interior) to that opening's screen
+// rectangle, worked out for eye 1's camera; eye 2's opening is elsewhere on its screen, so eye 2 lost the interior
+// (2026-10-13, the headset: a wall through the station's window in the right eye only). Unclipped, it is hidden where
+// it should be by the depth test, like the rest of the scene.
+const D3D12_VIEW_INSTANCE_LOCATION kLocations[2] = {{0, 0}, {1, 1}};
 
 void make_twin(Kept* k) {
     k->state = -1;
@@ -282,6 +288,9 @@ struct ListState {
     ID3D12PipelineState* bound = nullptr;  // what is bound: the game's or its twin
     ID3D12GraphicsCommandList1* cl1 = nullptr;
     int queries_open = 0;  // occlusion queries begun and not ended on this list
+    D3D12_VIEWPORT vp{};   // the game's viewport 0 and scissor 0 since the list's Reset (kLocations: view 1's are index 1)
+    D3D12_RECT sc{};
+    bool have_vp = false, have_sc = false;
 };
 thread_local std::unordered_map<ID3D12GraphicsCommandList*, ListState> t_lists;
 
@@ -289,6 +298,38 @@ ListState& list(ID3D12GraphicsCommandList* cl) {
     ListState& s = t_lists[cl];
     if (!s.cl1) cl->QueryInterface(IID_PPV_ARGS(&s.cl1));  // (a reference kept for the list's life)
     return s;
+}
+
+using SetViewports_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_VIEWPORT*);
+using SetScissors_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RECT*);
+SetViewports_t o_SetViewports = nullptr;
+SetScissors_t o_SetScissors = nullptr;
+std::atomic<uint64_t> g_rs_dups{0};
+D3D12_RECT wide_of(const ListState& s) {
+    return D3D12_RECT{static_cast<LONG>(s.vp.TopLeftX), static_cast<LONG>(s.vp.TopLeftY), static_cast<LONG>(s.vp.TopLeftX + s.vp.Width),
+                      static_cast<LONG>(s.vp.TopLeftY + s.vp.Height)};
+}
+// A twin bound: viewport and scissor 1 for view 1 (the game's viewport; the scissor widened to it)
+void rs_for_twin(ID3D12GraphicsCommandList* cl, const ListState& s) {
+    if (!o_SetViewports || !o_SetScissors || !s.have_vp) return;
+    const D3D12_VIEWPORT v[2] = {s.vp, s.vp};
+    o_SetViewports(cl, 2, v);
+    const D3D12_RECT r[2] = {s.have_sc ? s.sc : wide_of(s), wide_of(s)};
+    o_SetScissors(cl, 2, r);
+    g_rs_dups.fetch_add(1, std::memory_order_relaxed);
+}
+ListState& list(ID3D12GraphicsCommandList* cl);
+void STDMETHODCALLTYPE hk_SetViewports(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_VIEWPORT* v) {
+    ListState& s = list(cl);
+    if (n >= 1 && v) s.vp = v[0], s.have_vp = true;
+    if (n == 1 && s.bound && s.bound != s.game) return rs_for_twin(cl, s);
+    o_SetViewports(cl, n, v);
+}
+void STDMETHODCALLTYPE hk_SetScissors(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_RECT* r) {
+    ListState& s = list(cl);
+    if (n >= 1 && r) s.sc = r[0], s.have_sc = true;
+    if (n == 1 && s.bound && s.bound != s.game && s.have_vp) return rs_for_twin(cl, s);
+    o_SetScissors(cl, n, r);
 }
 
 // What the draw needs bound: the twin in slice 0's region (all targets the arrays), else the game's.
@@ -303,11 +344,18 @@ void bind(ID3D12GraphicsCommandList* cl, ListState& s, ID3D12PipelineState* p) {
     if (p == s.bound) return;
     pso::raw_set_pipeline(cl, p);
     if (p != s.game && s.cl1) s.cl1->SetViewInstanceMask(3);
+    if (p != s.game) rs_for_twin(cl, s);
     s.bound = p;
     g_rebinds.fetch_add(1, std::memory_order_relaxed);
 }
 
 }  // namespace
+
+void install_rs_hooks(ID3D12GraphicsCommandList* cl) {
+    if (o_SetViewports) return;
+    hooks::install("CL::RSSetViewports (ViMain)", hooks::vtable_entry(cl, 21), hk_SetViewports, &o_SetViewports);
+    hooks::install("CL::RSSetScissorRects (ViMain)", hooks::vtable_entry(cl, 22), hk_SetScissors, &o_SetScissors);
+}
 
 void init() {
     if (!config::get_bool("Stereo", "ViPrepass", false)) return;
@@ -395,6 +443,7 @@ ID3D12PipelineState* on_set_pso(ID3D12GraphicsCommandList* cl, ID3D12PipelineSta
     ID3D12PipelineState* twin = nullptr;
     ID3D12PipelineState* p = wanted_for(cl, ps, &region, &twin);
     if (p != ps && s.cl1) s.cl1->SetViewInstanceMask(3);
+    if (p != ps && s.bound != p) rs_for_twin(cl, s);
     s.bound = p;
     return p;
 }
@@ -404,11 +453,23 @@ void on_reset(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps) {
     ListState& s = list(cl);
     s.game = s.bound = ps;
     s.queries_open = 0;
+    s.have_vp = s.have_sc = false;  // (a Reset clears them)
 }
 
 bool before_draw(ID3D12GraphicsCommandList* cl) {
     if (!g_configured.load(std::memory_order_relaxed)) return false;
     ListState& s = list(cl);
+    if (prepass::tracing() && s.game) {  // "prepass trace": each draw's shaders, beside the targets' binds
+        AcquireSRWLockShared(&g_lock);
+        auto it = g_by_pso.find(s.game);
+        const Kept* k = it == g_by_pso.end() ? nullptr : it->second;
+        const uint64_t vh = k ? k->vs_hash : 0, ph = k ? k->ps_hash : 0;
+        ReleaseSRWLockShared(&g_lock);
+        bool arrays = false;
+        const int region = prepass::vi_region(cl, &arrays);
+        log::info("[prepass] trace draw: vs %016llx ps %016llx region %d%s", static_cast<unsigned long long>(vh),
+                  static_cast<unsigned long long>(ph), region, arrays ? " (arrays)" : "");
+    }
     int region = 0;
     ID3D12PipelineState* twin = nullptr;
     ID3D12PipelineState* p = wanted_for(cl, s.game, &region, &twin);

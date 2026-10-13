@@ -65,6 +65,10 @@ EYE2_SLOT_BASE = 14960
 # The scene depth itself, read by an index of the shader's own (a $Globals one): the game's depth view's index is in
 # rage_matrices row 30 .w (a uint's bits; stereo_vi.h kDepthBufferSlot), eye 2's copy at EYE2_SLOT_BASE + 16.
 DEPTH_BUFFER_SLOT, DEPTH_INDEX_ROW = 16, 30
+# ... and the depth resolve's (the copy the light passes read: global_textures slot 15's image) in row 27 .w (eye 2's
+# gViewInverse row 2: its .w is read by no shader), eye 2's copy at EYE2_SLOT_BASE + 15 (2026-10-13, the headset:
+# view 1 lit eye 2's interior through a window with eye 1's depth, i.e. the outside wall's position: black)
+RESOLVE_SLOT, RESOLVE_INDEX_ROW = 15, 27
 PREV_WORLD_ROWS = range(0, 4)
 DELTA_ROW = 21  # rage_matrices
 VIEWID_OPCODE = 138
@@ -456,7 +460,12 @@ def patch_index_remap(text, done):
         out.append(f'  {t}.qd = icmp eq i32 {idx}, {t}.di')
         out.append(f'  {t}.bd = and i1 {t}.qd, %isv1.sp')
         out.append(f'  {t}.nd = select i1 {t}.bd, i32 {EYE2_SLOT_BASE + DEPTH_BUFFER_SLOT}, i32 {idx}')
-        cur = f'{t}.nd'
+        rr = emit_row(out, f'{t}.rr', hm[0], RESOLVE_INDEX_ROW, True)
+        out.append(f'  {t}.ri = bitcast float {rr[3]} to i32')
+        out.append(f'  {t}.qr = icmp eq i32 {idx}, {t}.ri')
+        out.append(f'  {t}.br = and i1 {t}.qr, %isv1.sp')
+        out.append(f'  {t}.nr = select i1 {t}.br, i32 {EYE2_SLOT_BASE + RESOLVE_SLOT}, i32 {t}.nd')
+        cur = f'{t}.nr'
         out.append(ln.replace(f', i32 {idx}, i1', f', i32 {cur}, i1', 1))
     return chr(10).join(out), n
 

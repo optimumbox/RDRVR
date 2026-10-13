@@ -49,6 +49,7 @@ void install_device_hooks(ID3D12Device* dev);           // CreateShaderResourceV
 // A resource just created (d3d_hooks): views recorded for an earlier resource at its address are dropped
 void forget_resource(ID3D12Resource* r);
 void install_list_hooks(ID3D12GraphicsCommandList* cl);  // SetDescriptorHeaps, SetGraphicsRootDescriptorTable (the table)
+void install_rs_hooks(ID3D12GraphicsCommandList* cl);   // RSSetViewports, RSSetScissorRects (view 1's own, index 1)
 bool main_pass();  // [Stereo] ViMain
 std::string heap_status();  // "vi heap": eye 2's views
 bool heap_ready();          // every screen image's eye-2 view written (view 1 reads them unconditionally)

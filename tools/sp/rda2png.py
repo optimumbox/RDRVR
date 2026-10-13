@@ -34,6 +34,14 @@ def to_rgb(w, fmt, a):
     if fmt in (10,):  # rgba16f
         px = a[:, :w * 8].view(np.float16).reshape(a.shape[0], w, 4).astype(np.float32)
         return np.clip(px[..., :3] * 255, 0, 255).astype(np.uint8), px
+    if fmt == 26:  # r11g11b10f: 6-bit mantissa + 5-bit exponent (r, g), 5 + 5 (b); shown clipped to [0, 1]
+        u = a[:, :w * 4].view(np.uint32).reshape(a.shape[0], w)
+        def small(v, mbits):
+            m = (v & ((1 << mbits) - 1)).astype(np.float32)
+            e = ((v >> mbits) & 31).astype(np.int32)
+            return np.where(e == 0, m / (1 << mbits) * 2.0 ** -14, (1 + m / (1 << mbits)) * 2.0 ** (e - 15))
+        px = np.stack([small(u & 0x7ff, 6), small((u >> 11) & 0x7ff, 6), small(u >> 22, 5)], -1).astype(np.float32)
+        return np.clip(px * 255, 0, 255).astype(np.uint8), px
     if fmt == 34:  # rg16f (velocity): x in red, y in green, around grey; scaled to the 99th percentile of |v|
         px = a[:, :w * 4].view(np.float16).reshape(a.shape[0], w, 2).astype(np.float32)
         s = max(float(np.nanpercentile(np.abs(px), 99)), 1e-6)

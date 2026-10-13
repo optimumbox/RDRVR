@@ -10,6 +10,7 @@ shader: ok, safe, refused with the reason, or failed with the stage).
 """
 import argparse
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,19 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import viewid_patch  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
+# Full-screen passes in the view-instanced region that read a screen image by an index of their own (a $Globals one,
+# not a global_textures slot view 1 can be redirected by): view 1 would read eye 1's image (2026-10-13, the headset:
+# the right eye saw eye 1's scene through windows and black bushes). No twin: each eye's region draws them itself.
+NO_TWIN_PS = {
+    'PS_Blit': 'the refraction copy reads FullScreenCopy through TextureSampler',
+    'PSAlphaFoliageResolveFS_Deferred': 'the foliage resolve reads the tree buffer through TextureSampler',
+    'PS_Grass_Fullscreen': 'the grass resolve reads GrassColourSampler and GrassUVSampler',
+    'PS_lightglow': 'the light glows test the scene depth through DepthBufferSampler (glows in eye 2 only)',
+    'PSFootprintCollector': 'reads the scene depth through DepthBufferSampler',
+    'PSFootprintColor': 'reads the scene depth through DepthBufferSampler',
+    'PSMiragerSingle': 'the heat haze reads the scene copy through RenderMapBilinearSampler',
+}
+# (found with tools/sp/dxil/read_samplers.py: the $Globals texture indices a pixel shader really uses)
 
 
 def run(args, cwd=None):
@@ -46,6 +60,13 @@ def main():
             if code:
                 report.append(f'{kind} {h} failed dumpbin: {text[:200]}')
                 counts['failed'] += 1
+                continue
+            entry = re.search(r'^define void @(\w+)\(', text, re.M)
+            if kind == 'ps' and entry and entry.group(1) in NO_TWIN_PS:
+                # neither converted nor listed safe: no twin, so each eye's region draws it as the game's, with its own
+                # pass's constants and images
+                report.append(f'ps {h} no twin ({entry.group(1)}: {NO_TWIN_PS[entry.group(1)]})')
+                counts['no twin'] = counts.get('no twin', 0) + 1
                 continue
             try:
                 patched, n, approx = viewid_patch.patch(text)
@@ -95,7 +116,7 @@ def main():
             counts['ok'] += 1
     (out / 'ps_safe.txt').write_text(''.join(x + '\n' for x in safe), encoding='utf-8')
     (out / 'report.txt').write_text('\n'.join(report) + '\n', encoding='utf-8')
-    print(f"ok {counts['ok']}, safe {counts['safe']}, refused {counts['refused']}, failed {counts['failed']} -> {out}")
+    print(f"ok {counts['ok']}, safe {counts['safe']}, no twin {counts.get('no twin', 0)}, refused {counts['refused']}, failed {counts['failed']} -> {out}")
     return 0
 
 
