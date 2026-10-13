@@ -18,6 +18,7 @@ struct ID3D12Resource;
 struct D3D12_CPU_DESCRIPTOR_HANDLE;
 struct D3D12_RESOURCE_BARRIER;
 struct D3D12_TEXTURE_COPY_LOCATION;
+struct D3D12_BOX;
 
 namespace rdrvr::d3d {
 
@@ -92,7 +93,8 @@ const void* view_resource(uintptr_t handle, int* format = nullptr);  // (format:
 void raw_barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BARRIER* b);
 void raw_bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int single,
               const D3D12_CPU_DESCRIPTOR_HANDLE* ds);
-void raw_copy_region(ID3D12GraphicsCommandList* cl, const D3D12_TEXTURE_COPY_LOCATION* dst, const D3D12_TEXTURE_COPY_LOCATION* src);
+void raw_copy_region(ID3D12GraphicsCommandList* cl, const D3D12_TEXTURE_COPY_LOCATION* dst, const D3D12_TEXTURE_COPY_LOCATION* src,
+                     const D3D12_BOX* box = nullptr);  // (box: the source's, copied to the destination's same place)
 // R5 pacing: while set, the game's Present runs with sync interval 0, so vsync does not hold the game to the desktop's
 // refresh and xrWaitFrame paces it (the game's own frame limiter still applies).
 void set_present_unsynced(bool on);

@@ -99,6 +99,8 @@ struct Region {
     unsigned published = 0;   // ViMain: kinds copied out since their last writing (bit k)
     unsigned bound = 0;       // kinds bound as the current targets (bit k)
     unsigned dirty = ~0u;     // ViMain: kinds written (a draw made, a clear) since their last copy out (bit k)
+    unsigned ds_dirty = 3;    // ... the depth's planes among them (bit 0 depth, bit 1 stencil): only those copied out
+    bool depth_pending = false;  // the depth turned to read and not copied out yet: at its first possible reader (lazy)
     unsigned touched = 0, known = 0;   // bit (kind * 2 + plane): that plane's state known
     D3D12_RESOURCE_STATES state[kKinds][2]{};  // per plane (the depth's two: the game moves them one at a time)
 } g_r;
@@ -471,6 +473,23 @@ std::string status(bool reset) {
 
 extern std::atomic<int> g_grab_phase;
 void grab_tap(ID3D12GraphicsCommandList* cl, int k, ID3D12Resource* arr);
+// A colour kind's copies out cover only what the frame's regions drew in it: the top-left rectangle of the viewports its
+// draws were made with (the render size, a quarter of the target under DLSS Quality at 4778x2688) and a margin (a
+// filter's taps past the edge), or all of it when not known. Its clears (the whole target) count as nothing drawn: past
+// the render size nothing reads it. Reset at slice 0's region's start; slice 1's region copies out what slice 0's drew
+// in slice 1 too, so its extents carry on.
+uint32_t g_ext_r[kKinds], g_ext_b[kKinds];  // 0: nothing drawn yet (all copied); ~0u: all
+std::atomic<bool> g_box_copies{true};        // test ("prepass gpu box on|off")
+std::atomic<uint64_t> g_boxed{0}, g_unboxed{0};
+bool copy_box(int k, ID3D12Resource* r, D3D12_BOX* b) {
+    if (!g_box_copies.load(std::memory_order_relaxed) || is_depth(k) || !g_ext_r[k] || g_ext_r[k] == ~0u) return false;
+    const D3D12_RESOURCE_DESC d = r->GetDesc();
+    if (g_ext_r[k] >= d.Width && g_ext_b[k] >= d.Height) return false;
+    constexpr uint32_t kMargin = 8;
+    *b = D3D12_BOX{0, 0, 0, std::min<UINT>(g_ext_r[k] + kMargin, static_cast<UINT>(d.Width)), std::min<UINT>(g_ext_b[k] + kMargin, d.Height), 1};
+    return true;
+}
+
 void end_region(ID3D12GraphicsCommandList* cl) {
     replay_ops::set_region2(false);
     g_active = false;
@@ -517,7 +536,10 @@ void end_region(ID3D12GraphicsCommandList* cl) {
             dst.SubresourceIndex = p;
             D3D12_TEXTURE_COPY_LOCATION src{a.arr, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
             src.SubresourceIndex = static_cast<UINT>(g_r.slice) + p * 2;  // mip + slice * mips + plane * mips * slices
-            d3d::raw_copy_region(cl, &dst, &src);
+            D3D12_BOX box;
+            const bool boxed = copy_box(k, a.game, &box);
+            (boxed ? g_boxed : g_unboxed).fetch_add(1, std::memory_order_relaxed);
+            d3d::raw_copy_region(cl, &dst, &src, boxed ? &box : nullptr);
         }
         g_copies.fetch_add(1, std::memory_order_relaxed);
         if (g_grab_phase.load(std::memory_order_relaxed)) grab_tap(cl, k, a.arr);  // (the region's final state)
@@ -616,8 +638,17 @@ void grab_frame_end(uint64_t) {
 }
 
 std::atomic<uint64_t> g_pub_kind[kKinds][2];  // publishes per kind, [view-instanced region]
+std::atomic<uint64_t> g_ds_one_plane{0};
+// The depth's copy out at its first possible reader (a draw whose shaders may read it, tools/sp/dxil/depth_readers.py; a
+// dispatch, a copy), not when the game turns it to read: about half of those are for draws that only depth-test it
+// (2026-10-13: PSShadowBlendAlphaRDR2's, PS_UnlitDepthOnly's, the main pass's after the depth pass).
+std::atomic<bool> g_lazy_depth{true};  // test ("prepass gpu lazy on|off")
+std::atomic<uint64_t> g_lazy_done{0}, g_lazy_dropped{0};
 void publish(ID3D12GraphicsCommandList* cl, int k, const D3D12_RESOURCE_STATES st[2]) {
     Arr& a = g_arr[k];
+    unsigned planes = (1u << a.planes) - 1;  // the planes copied: the depth's written ones (drawn)
+    if (k == kDepth && a.planes == 2 && (g_r.ds_dirty & 3)) planes = g_r.ds_dirty & 3;
+    if (planes != (1u << a.planes) - 1) g_ds_one_plane.fetch_add(1, std::memory_order_relaxed);
     g_pub_kind[k][g_r.vi ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
     if (!a.arr || !a.game) return;
     const bool e2 = a.e2 && g_r.vi && g_r.slice == 0;
@@ -627,6 +658,7 @@ void publish(ID3D12GraphicsCommandList* cl, int k, const D3D12_RESOURCE_STATES s
     post[n++] = transition(a.arr, D3D12_RESOURCE_STATE_COPY_SOURCE, write_state(k));
     for (UINT p = 0; p < a.planes && p < 2; ++p) {
         if (st[p] == D3D12_RESOURCE_STATE_COPY_DEST) return;  // (never seen: nothing to do safely)
+        if (!(planes & (1u << p))) continue;
         pre[n] = transition(a.game, st[p], D3D12_RESOURCE_STATE_COPY_DEST);
         post[n] = transition(a.game, D3D12_RESOURCE_STATE_COPY_DEST, st[p]);
         if (a.planes > 1) pre[n].Transition.Subresource = post[n].Transition.Subresource = p;
@@ -642,15 +674,19 @@ void publish(ID3D12GraphicsCommandList* cl, int k, const D3D12_RESOURCE_STATES s
     gpu::mark(cl, gpu::kCopyBegin);
     d3d::raw_barrier(cl, n, pre);
     for (UINT p = 0; p < a.planes; ++p) {
+        if (!(planes & (1u << p))) continue;
         D3D12_TEXTURE_COPY_LOCATION src{a.arr, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
         src.SubresourceIndex = static_cast<UINT>(g_r.slice) + p * 2;
         D3D12_TEXTURE_COPY_LOCATION dst{a.game, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
         dst.SubresourceIndex = p;
-        d3d::raw_copy_region(cl, &dst, &src);
+        D3D12_BOX box;
+        const bool boxed = copy_box(k, a.game, &box);
+        (boxed ? g_boxed : g_unboxed).fetch_add(1, std::memory_order_relaxed);
+        d3d::raw_copy_region(cl, &dst, &src, boxed ? &box : nullptr);
         if (e2) {
             src.SubresourceIndex = 1 + p * 2;
             dst.pResource = a.e2;
-            d3d::raw_copy_region(cl, &dst, &src);
+            d3d::raw_copy_region(cl, &dst, &src, boxed ? &box : nullptr);
         }
     }
     if (g_grab_phase.load(std::memory_order_relaxed)) grab_tap(cl, k, a.arr);
@@ -904,8 +940,8 @@ bool still_grown(const Grown& g) {
 }
 // pass 1, before the pre-pass: rows 17-20 (gWorldView) and 25-28 (gViewInverse) of b1, rows 4-7 of rage_prev_proj
 // Eye 2's gWorldView inverted (double precision), packed into rage_matrices rows 29-31 for the converted shaders that
-// read an inverse view-projection (tools/sp/dxil/viewid_patch.py patch_inverse: X2 = inv(gWorldView2) x T(camera2 -
-// camera1) x gWorldView1 x X1). A perspective's inverse has rows 0 and 1 ending in 0 and row 2 (0, 0, 0, k), so three
+// read an inverse view-projection (tools/sp/dxil/viewid_patch.py patch_inverse: X2 = inv(gWorldView2) x gWorldView1 x
+// X1). A perspective's inverse has rows 0 and 1 ending in 0 and row 2 (0, 0, 0, k), so three
 // rows hold it: row 29 (inv[0].xyz, inv[2].w), row 30 (inv[1].xyz, 0), row 31 inv[3]. The parts the packing drops are
 // checked: their largest, relative to the matrix's largest entry, is in "vi status".
 uint64_t g_inv_written = 0, g_inv_failed = 0;
@@ -1200,6 +1236,8 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_dsv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
     }
     if (!ensure(kDepth, res, fmt)) return h;
     g_r = Region{};
+    if (slice == 0)
+        for (int k = 0; k < kKinds; ++k) g_ext_r[k] = g_ext_b[k] = 0;
     g_r.cl = cl;
     g_r.slice = slice;
     // view-instanced stereo: slice 0's region draws both eyes when wanted; slice 1's region follows it in the same frame
@@ -1222,6 +1260,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_dsv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
         // slice 0's region drew eye 2's slices: each kind is copied out at its first read here (the passes without a
         // twin, drawn by this region as the game's, read eye 2's images: the refraction copy, the foliage resolve)
         g_r.dirty = (1u << kKinds) - 1;
+        g_r.ds_dirty = 3;
     }
     if (g_last.cl == cl) {  // the targets bound before this clear: bound again, the six as the slices
         D3D12_CPU_DESCRIPTOR_HANDLE r2[8], d2{};
@@ -1312,11 +1351,40 @@ bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_
     return any;
 }
 
-// A draw made (not skipped) in the region: its bound kinds in a writing state are written, to be copied out again.
+// A draw made (not skipped) in the region: its bound kinds in a writing state are written, to be copied out again. The
+// depth per plane, by what the pipeline can write: the game turns the depth to read and back about eleven times a
+// view-instanced region, mostly after stencil-only draws (the lights' masks), and each copy out of both planes is two
+// full-size depth copies (2026-10-13, the headset: most of the region's 2.9 ms of copies).
+std::atomic<bool> g_ds_exact{true};  // test ("prepass dsexact on|off")
+std::atomic<uint64_t> g_ds_kept_clean{0};
+std::atomic<uint64_t> g_ds_seen[4];  // depth-bound writing draws by the planes they write (0 none, 1 depth, 2 stencil, 3 both)
 void drawn(ID3D12GraphicsCommandList* cl) {
     if (cl != g_r.cl || !g_r.bound) return;
-    for (int k = 0; k < kKinds; ++k)
-        if ((g_r.bound & (1u << k)) && writing(k, g_r.state[k][0])) g_r.dirty |= 1u << k;
+    uint32_t vr = 0, vb = 0;
+    const bool have_vp = vi::viewport_extent(cl, &vr, &vb);
+    for (int k = 0; k < kKinds; ++k) {
+        if (!(g_r.bound & (1u << k)) || !writing(k, g_r.state[k][0])) continue;
+        if (g_ext_r[k] != ~0u) {
+            if (!have_vp) {
+                g_ext_r[k] = g_ext_b[k] = ~0u;
+            } else {
+                g_ext_r[k] = std::max(g_ext_r[k], vr);
+                g_ext_b[k] = std::max(g_ext_b[k], vb);
+            }
+        }
+        if (k == kDepth) {
+            int w = g_ds_exact.load(std::memory_order_relaxed) ? vi::writes_depth(cl) : 3;
+            if (w < 0) w = 3;
+            g_ds_seen[w].fetch_add(1, std::memory_order_relaxed);
+            if (w == 0) {
+                g_ds_kept_clean.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (!(g_r.dirty & (1u << k))) g_r.ds_dirty = 0;  // (the planes since the last copy out)
+            g_r.ds_dirty |= static_cast<unsigned>(w);
+        }
+        g_r.dirty |= 1u << k;
+    }
 }
 
 void barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BARRIER* b) {
@@ -1344,18 +1412,43 @@ void barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BAR
         if (g_i2.load(std::memory_order_relaxed) && (g_r.touched & (1u << k)) && writing(k, b[i].Transition.StateBefore) &&
             !writing(k, after) && after != D3D12_RESOURCE_STATE_COPY_DEST && (g_r.dirty & (1u << k)) &&
             (g_r.known & plane_bits(k)) == plane_bits(k)) {
-            const D3D12_RESOURCE_STATES st[2] = {g_r.state[k][0], g_r.state[k][1]};
-            publish(cl, k, st);
-            g_r.dirty &= ~(1u << k);
-            g_r.published |= 1u << k;
+            if (k == kDepth && g_lazy_depth.load(std::memory_order_relaxed)) {
+                g_r.depth_pending = true;  // (copied at the first draw that may read it: flush_reads)
+            } else {
+                const D3D12_RESOURCE_STATES st[2] = {g_r.state[k][0], g_r.state[k][1]};
+                publish(cl, k, st);
+                g_r.dirty &= ~(1u << k);
+                g_r.published |= 1u << k;
+            }
         }
-        if (writing(k, after)) g_r.published &= ~(1u << k);
+        if (writing(k, after)) {
+            g_r.published &= ~(1u << k);
+            if (k == kDepth && g_r.depth_pending) {  // written again before anything read it: that copy never needed
+                g_r.depth_pending = false;
+                g_lazy_dropped.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         set_state(k, plane, after);
     }
 }
 
+void flush_reads(ID3D12GraphicsCommandList* cl) {
+    if (cl != g_r.cl || !g_r.depth_pending) return;
+    g_r.depth_pending = false;
+    const D3D12_RESOURCE_STATES st[2] = {g_r.state[kDepth][0], g_r.state[kDepth][1]};
+    publish(cl, kDepth, st);
+    g_r.dirty &= ~(1u << kDepth);
+    g_r.published |= 1u << kDepth;
+    g_lazy_done.fetch_add(1, std::memory_order_relaxed);
+}
+
 void before_draw(ID3D12GraphicsCommandList* cl) {
-    if (cl == g_r.cl && g_end_pending.load(std::memory_order_acquire)) end_region(cl);
+    if (cl != g_r.cl) return;
+    if (g_end_pending.load(std::memory_order_acquire)) {
+        end_region(cl);
+        return;
+    }
+    if (g_r.depth_pending && vi::may_read_depth(cl)) flush_reads(cl);
 }
 
 
@@ -1612,6 +1705,23 @@ void trace_clear(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE h, b
 
 void set_ab(unsigned frames) { g_ab = frames; }
 std::string gpu_command(const std::string& arg) {
+    if (arg == "box on" || arg == "box off") {
+        g_box_copies = arg == "box on";
+        return std::string("colour copies of the drawn rectangle only: ") + (g_box_copies.load() ? "on" : "off") + " (boxed " +
+               std::to_string(g_boxed.load()) + ", whole " + std::to_string(g_unboxed.load()) + ")";
+    }
+    if (arg == "lazy on" || arg == "lazy off") {
+        g_lazy_depth = arg == "lazy on";
+        return std::string("the depth copied out at its first reader: ") + (g_lazy_depth.load() ? "on" : "off") + " (copied " +
+               std::to_string(g_lazy_done.load()) + ", never needed " + std::to_string(g_lazy_dropped.load()) + ")";
+    }
+    if (arg == "dsexact on" || arg == "dsexact off") {
+        g_ds_exact = arg == "dsexact on";
+        return std::string("depth dirtied only by depth/stencil writers: ") + (g_ds_exact.load() ? "on" : "off") + " (" +
+               std::to_string(g_ds_kept_clean.load()) + " draws kept it clean so far; draws writing none " + std::to_string(g_ds_seen[0].load()) +
+               ", depth " + std::to_string(g_ds_seen[1].load()) + ", stencil " + std::to_string(g_ds_seen[2].load()) + ", both " +
+               std::to_string(g_ds_seen[3].load()) + "; depth publishes of one plane " + std::to_string(g_ds_one_plane.load()) + ")";
+    }
     if (arg == "on" || arg == "off") gpu::g_on = arg == "on";  // (the playback thread reads it: a flag, set between frames)
     if (arg == "pubs") {  // publishes per kind (view-instanced regions, others) and per region since the start
         std::string r = "publishes per region:";

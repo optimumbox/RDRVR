@@ -47,6 +47,7 @@ struct Kept {
     UINT sample_mask = 0;
     D3D12_RASTERIZER_DESC rast{};
     D3D12_DEPTH_STENCIL_DESC depth{};
+    int ds_writes = 3;  // the depth's planes it can write: 1 depth, 2 stencil (prepass::drawn: only those copied out)
     std::vector<D3D12_INPUT_ELEMENT_DESC> layout;
     std::vector<std::string> semantics;
     D3D12_INDEX_BUFFER_STRIP_CUT_VALUE cut{};
@@ -80,6 +81,7 @@ std::vector<std::unique_ptr<Kept>> g_kept;
 std::unordered_map<ID3D12PipelineState*, Kept*> g_by_pso;
 std::unordered_map<uint64_t, std::vector<uint8_t>> g_vs_conv, g_ps_conv;
 std::unordered_set<uint64_t> g_ps_safe;
+std::unordered_set<uint64_t> g_no_depth;  // <ViShaders>\no_depth.txt (tools/sp/dxil/depth_readers.py): cannot read the depth
 
 std::mutex g_q_mutex;
 std::condition_variable g_q_cv;
@@ -124,6 +126,13 @@ void load_shaders(const std::string& dir) {
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
+    std::unordered_set<uint64_t> no_depth;
+    if (FILE* f = nullptr; fopen_s(&f, (dir + "\\no_depth.txt").c_str(), "r") == 0 && f) {
+        char line[64];
+        while (std::fgets(line, sizeof(line), f))  // vs_<hash> or ps_<hash>
+            if (const uint64_t x = std::strlen(line) > 3 ? std::strtoull(line + 3, nullptr, 16) : 0) no_depth.insert(x);
+        std::fclose(f);
+    }
     if (FILE* f = nullptr; fopen_s(&f, (dir + "\\ps_safe.txt").c_str(), "r") == 0 && f) {
         char line[64];
         while (std::fgets(line, sizeof(line), f))
@@ -134,9 +143,11 @@ void load_shaders(const std::string& dir) {
     g_vs_conv.swap(vs);
     g_ps_conv.swap(ps);
     g_ps_safe.swap(safe);
-    const size_t nv = g_vs_conv.size(), np = g_ps_conv.size(), ns = g_ps_safe.size();
+    g_no_depth.swap(no_depth);
+    const size_t nv = g_vs_conv.size(), np = g_ps_conv.size(), ns = g_ps_safe.size(), nd = g_no_depth.size();
     ReleaseSRWLockExclusive(&g_lock);
-    log::info("[vi] shaders from %s: %zu vertex, %zu pixel converted, %zu pixel listed safe", dir.c_str(), nv, np, ns);
+    log::info("[vi] shaders from %s: %zu vertex, %zu pixel converted, %zu pixel listed safe, %zu that cannot read the depth", dir.c_str(),
+              nv, np, ns, nd);
 }
 
 // ---- the twin: the game's desc as a pipeline stream, the converted shaders and a 2-view instancing subobject
@@ -258,6 +269,15 @@ void enqueue(Kept* k) {
 }
 
 // The twin to draw with now (made in an earlier frame, so both regions of a frame agree), or null.
+int ds_writes_of(ID3D12PipelineState* game) {
+    if (!game) return -1;
+    AcquireSRWLockShared(&g_lock);
+    auto it = g_by_pso.find(game);
+    const int r = it == g_by_pso.end() ? -1 : it->second->ds_writes;
+    ReleaseSRWLockShared(&g_lock);
+    return r;
+}
+
 ID3D12PipelineState* twin_of(ID3D12PipelineState* game) {
     if (!game) return nullptr;
     AcquireSRWLockShared(&g_lock);
@@ -403,6 +423,14 @@ void on_pipeline(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d,
     k->sample_mask = d->SampleMask;
     k->rast = d->RasterizerState;
     k->depth = d->DepthStencilState;
+    {
+        const D3D12_DEPTH_STENCIL_DESC& z = d->DepthStencilState;
+        auto ops = [](const D3D12_DEPTH_STENCILOP_DESC& o) {
+            return o.StencilFailOp != D3D12_STENCIL_OP_KEEP || o.StencilDepthFailOp != D3D12_STENCIL_OP_KEEP || o.StencilPassOp != D3D12_STENCIL_OP_KEEP;
+        };
+        k->ds_writes = (z.DepthEnable && z.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL ? 1 : 0) |
+                       (z.StencilEnable && z.StencilWriteMask && (ops(z.FrontFace) || ops(z.BackFace)) ? 2 : 0);
+    }
     if (d->InputLayout.pInputElementDescs) {
         k->layout.assign(d->InputLayout.pInputElementDescs, d->InputLayout.pInputElementDescs + d->InputLayout.NumElements);
         k->semantics.reserve(k->layout.size());
@@ -429,6 +457,34 @@ void on_pipeline(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d,
 }
 
 bool configured() { return g_configured.load(std::memory_order_relaxed); }
+
+bool viewport_extent(ID3D12GraphicsCommandList* cl, uint32_t* right, uint32_t* bottom) {
+    if (!g_configured.load(std::memory_order_relaxed)) return false;
+    auto it = t_lists.find(cl);
+    if (it == t_lists.end() || !it->second.have_vp) return false;
+    const D3D12_VIEWPORT& v = it->second.vp;
+    if (v.TopLeftX < 0 || v.TopLeftY < 0 || v.Width <= 0 || v.Height <= 0) return false;
+    *right = static_cast<uint32_t>(std::ceil(v.TopLeftX + v.Width));
+    *bottom = static_cast<uint32_t>(std::ceil(v.TopLeftY + v.Height));
+    return true;
+}
+
+bool may_read_depth(ID3D12GraphicsCommandList* cl) {
+    if (!g_configured.load(std::memory_order_relaxed)) return true;
+    auto it = t_lists.find(cl);
+    if (it == t_lists.end() || !it->second.game) return true;
+    AcquireSRWLockShared(&g_lock);
+    auto k = g_by_pso.find(it->second.game);
+    const bool r = k == g_by_pso.end() || !g_no_depth.count(k->second->vs_hash) || (k->second->ps_hash && !g_no_depth.count(k->second->ps_hash));
+    ReleaseSRWLockShared(&g_lock);
+    return r;
+}
+
+int writes_depth(ID3D12GraphicsCommandList* cl) {
+    if (!g_configured.load(std::memory_order_relaxed)) return -1;
+    auto it = t_lists.find(cl);
+    return it == t_lists.end() ? -2 : ds_writes_of(it->second.game);
+}
 
 bool wanted() {
     return g_configured.load(std::memory_order_relaxed) && g_on.load(std::memory_order_relaxed) && g_made.load() > 0 &&

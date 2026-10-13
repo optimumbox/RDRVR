@@ -321,7 +321,8 @@ What it took, beyond the commit log:
 - the region ends with every scene (a single pass's region never ended and the arrays stood down at load);
 - gWorldViewProj (rage_matrices rows 8-11, per draw) built in view 1 from the draw's gWorldSingle, eye 2's camera and
   eye 2's gWorldView; inverse view-projections ($Globals WorldViewProjInverse...) as
-  inv(gWorldView2) x T(c2 - c1) x gWorldView1 x X1, inv(gWorldView2) packed in rows 29-31 (rage_matrices grown to 0x200);
+  inv(gWorldView2) x gWorldView1 x X1 (relative to eye 2's camera: the shaders add gViewInverse row 3), inv(gWorldView2)
+  packed in rows 29-31 (rage_matrices grown to 0x200);
 - rage_shadowmap_common is shared (pass 1's shadow maps serve both eyes); distance scalars named "Camera" are shared;
 - the scene depth itself gets an eye-2 copy (slot 16): the light passes read it by an index of their own; view 1
   compares each texture index with the game's depth view's (row 30 .w);

@@ -406,6 +406,7 @@ void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D12GraphicsCommandList* cl, UI
 }
 void STDMETHODCALLTYPE hk_Dispatch(ID3D12GraphicsCommandList* cl, UINT x, UINT y, UINT z) {
     fg_count(cl, [](ListLog& l) { ++l.dispatches; });
+    if (prepass::active()) prepass::flush_reads(cl);
     o_Dispatch(cl, x, y, z);
 }
 void STDMETHODCALLTYPE hk_ExecuteIndirect(ID3D12GraphicsCommandList* cl, ID3D12CommandSignature* s, UINT n, ID3D12Resource* a,
@@ -504,6 +505,7 @@ void STDMETHODCALLTYPE hk_CopyResource(ID3D12GraphicsCommandList* cl, ID3D12Reso
         }
         fg_event(cl, "CopyResource %s <- %s", d.c_str(), s.c_str());
     }
+    if (prepass::active()) prepass::flush_reads(cl);
     if (prepass::copy_resource(cl, dst, src)) return;  // [Stereo] ViMain: the depth from the region's arrays
     o_CopyResource(cl, dst, src);
     for (auto& t : g_copy_tap)
@@ -522,6 +524,7 @@ void STDMETHODCALLTYPE hk_CopyTextureRegion(ID3D12GraphicsCommandList* cl, const
         }
         fg_event(cl, "CopyTextureRegion %s <- %s", d.c_str(), s.c_str());
     }
+    if (prepass::active()) prepass::flush_reads(cl);
     o_CopyTextureRegion(cl, dst, x, y, z, src, box);
 }
 void STDMETHODCALLTYPE hk_ClearRTV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE h, const FLOAT c[4], UINT n,
@@ -1226,9 +1229,11 @@ void raw_barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE
     else cl->ResourceBarrier(n, b);
 }
 
-void raw_copy_region(ID3D12GraphicsCommandList* cl, const D3D12_TEXTURE_COPY_LOCATION* dst, const D3D12_TEXTURE_COPY_LOCATION* src) {
-    if (o_CopyTextureRegion) o_CopyTextureRegion(cl, dst, 0, 0, 0, src, nullptr);
-    else cl->CopyTextureRegion(dst, 0, 0, 0, src, nullptr);
+void raw_copy_region(ID3D12GraphicsCommandList* cl, const D3D12_TEXTURE_COPY_LOCATION* dst, const D3D12_TEXTURE_COPY_LOCATION* src,
+                     const D3D12_BOX* box) {
+    const UINT x = box ? box->left : 0, y = box ? box->top : 0;
+    if (o_CopyTextureRegion) o_CopyTextureRegion(cl, dst, x, y, 0, src, box);
+    else cl->CopyTextureRegion(dst, x, y, 0, src, box);
 }
 
 const char* resource_name(const void* resource) {

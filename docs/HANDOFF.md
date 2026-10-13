@@ -1,4 +1,4 @@
-# RDRVR single-pass stereo: handoff (2026-10-13, updated 17:55 EDT)
+# RDRVR single-pass stereo: handoff (2026-10-13, updated 19:05 EDT)
 
 A session resuming this work starts here. Branch `single-pass-stereo`, repo `C:\Games\RDRVR-src`, game at
 `G:\Games\Red Dead Redemption`. Background: `docs/SINGLE_PASS_PLAN.md` (I2: the view-instanced main pass).
@@ -15,9 +15,9 @@ A session resuming this work starts here. Branch `single-pass-stereo`, repo `C:\
 - Quit the game when done. When asking the user a question, stop and wait for the answer.
 - When the work is done, leave the build installed for VR: `tools\sp\session.ps1 -Install` (not -Stop).
 
-## State (commit 0a5d659 + uncommitted: session.ps1 sentinel wait, docs/HANDOFF.md)
+## State
 
-Installed for VR: the latest build, shaders `research\stereo_all11`, `ViSkipRecord=0`.
+Installed for VR: the latest build, shaders `research\stereo_all12` (session.ps1's default now), `ViSkipRecord=0`.
 The user's F7 menu render scale is at 200% (they tried it because 100% was blocked); 100% gives 4778x2688 (eyes
 2716x2688) once not blocked. Tell them to put it back to 100%.
 
@@ -32,6 +32,25 @@ Fixed and confirmed by the user in the headset (2026-10-13 15:15): plants (no mo
   head-centred planes over both eyes. Likely also the user's shadow misalignment (the cascades fit the cull frustum):
   the sun-shadow stripes now match two-pass in the right eye (residual within the left-eye time-noise control).
 
+## Fixed 18:00-19:05 (VR-measured)
+
+- **Eye 2's sun shadows (and the light passes) an eye distance off** (the user: "the shadows sat in a different place
+  slightly for each eye"). Every converted shader that reads an inverse view-projection adds gViewInverse row 3 (eye
+  2's camera in view 1) to its result, but view 1's inverse also had T(camera2 - camera1) in it: positions relative to
+  eye 1's camera, plus eye 2's camera. Removed (viewid_patch.py patch_inverse; set `research\stereo_all12`). Measured
+  on the porch wall's sun stripes (`research\grab\vr23`, scratch scripts disp2.py/eyeshift.py: patch disparity by
+  NCC): two-pass stripes -591.3 px = the wall's window -591.3; old I2 stripes -597.4 (eye 2's moved 6 px, eye 1's
+  0.1); stereo_all12 -591.4. Two-pass and the shared shadow maps were never wrong (shared vs per-eye maps: no shift).
+- **GPU copies**: the depth's copy out deferred to its first possible reader (`prepass gpu lazy on|off`; the shaders
+  that cannot read it: `tools\sp\dxil\depth_readers.py` -> `<set>\no_depth.txt`), only the depth planes
+  written (`dsexact`), colour copies boxed to the drawn viewports (`box`; only helps under DLSS Quality etc., the user runs
+  DLAA: DlssQuality=0). Headset, starting spot: the lazy depth copy took a 45 Hz lock to 65-72 Hz; copies 2.9 -> 2.1 ms.
+
+Headset numbers now (DLAA, 539 frames): GPU ~9.6 ms (regions 7.4, copies 2.1); render thread scene 8.1 ms (pass 1
+4.9, pass 2 2.85: eye 2's scene recorded whole because ViSkipRecord=0); playback region 2 12.2 Mcycles; ~7.5 % late
+frames, so SteamVR holds 45 Hz. Next: the recorder skip narrowed so eye 2's needed draws (no-twin passes, the plants'
+motion vectors) are still recorded; that is ~2.85 ms render + ~2.5 ms playback.
+
 ## Open problems (as of 15:25; 1 and 2 addressed above, re-check in the user's next session) (the user's screenshots: `research\grab\vr3\`, eye captures; `tools\sp\eyesbs.py` views them)
 
 1. **Glass in the right eye is hazy/grey**: through a window the left eye sees the room clearly, the right eye a grey
@@ -41,9 +60,7 @@ Fixed and confirmed by the user in the headset (2026-10-13 15:15): plants (no mo
    buffer). Next: which glass pixel shader draws these windows (the trace: "prepass trace 1" logs each draw's vs/ps
    hash; find the draws bound with the scene colour after the refraction blit), and what it reads per view (a $Globals
    index: tools\sp\dxil\read_samplers.py; a view-dependent term such as the camera position or a Fresnel/reflection).
-2. **Shadows misaligned between the eyes** (the user's report, captures 151448/151457: the rider's shadow). Compare
-   both eyes at full resolution; suspects: the shadow/light pass reading eye 1's depth (index not remapped), the
-   cascade selection by eye 1's camera.
+2. ~~Shadows misaligned between the eyes~~: fixed 19:00 (above); the user to confirm in the headset.
 3. **Light glows on the train in the right eye only** (vr10 captures): PS_lightglow now has no twin and they remain;
    find the drawing pass (trace).
 4. Later: narrow the recorder skip (ViSkipRecord) to the region so it saves CPU without biasing eye 2's motion

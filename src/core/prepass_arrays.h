@@ -27,6 +27,7 @@ bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_
 void drawn(ID3D12GraphicsCommandList* cl);  // a draw made (not skipped by view instancing): its targets written
 void barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BARRIER* b);  // before the game's batch
 void before_draw(ID3D12GraphicsCommandList* cl);  // a draw in a region: the walk's end copied first
+void flush_reads(ID3D12GraphicsCommandList* cl);  // a dispatch or a copy in a region: the depth's deferred copy out made
 // Every game bind while on and outside a region: the game binds the pre-pass's targets before it clears them, so the
 // region's start binds them again with the slices.
 void note_bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int single,

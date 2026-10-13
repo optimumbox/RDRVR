@@ -29,7 +29,10 @@ WV2_ROW, CAM2_ROW = 17, 28  # rage_matrices: eye 2's gWorldView, eye 2's camera 
 # row 29 (inv[0].xyz, inv[2].w), row 30 (inv[1].xyz, 0), row 31 inv[3] (prepass_arrays.cpp write_inv_wv2)
 INV2_ROW = 29
 # Variables that are the inverse of (a world x) the camera's view-projection: view 1 reads
-#   X2 = inverse(gWorldView2) x T(camera2 - camera1) x gWorldView1 x X1  (patch_inverse)
+#   X2 = inverse(gWorldView2) x gWorldView1 x X1  (patch_inverse)
+# Its result is relative to eye 2's camera: every shader that reads one adds gViewInverse row 3, eye 2's camera in view
+# 1 (2026-10-13, the headset: with T(camera2 - camera1) between them as before, eye 2's sun shadows and lights sat an
+# eye distance off, the porch's shadow stripes 6 px of disparity off the wall they fall on)
 INVERSE_VARS = {'WorldViewProjInverse', 'WorldViewProjInverseTrees', 'InverseViewProj'}
 # Blocks the same for both eyes in a view-instanced frame: the shadow camera (both eyes use pass 1's shadow maps)
 SHARED_BLOCKS = {'rage_shadowmap_common'}
@@ -390,7 +393,7 @@ def patch_wvp(text):
 
 def patch_inverse(text, inverse):
     """view 1's reads of an inverse view-projection X (INVERSE_VARS, rows f..f+3 of its block) become eye 2's:
-    X2 row i = (P row i + its w x (camera2 - camera1)) x gWorldView1 x X1, P = inverse(gWorldView2) (packed, INV2_ROW)"""
+    X2 row i = P row i x gWorldView1 x X1, P = inverse(gWorldView2) (packed, INV2_ROW)"""
     rid = range_ids(text)
     if 'rage_matrices' not in rid:
         raise Refused('reads an inverse view-projection without rage_matrices')
@@ -413,24 +416,12 @@ def patch_inverse(text, inverse):
         L, t, i = m.group(1), f'%inv{n}.sp', row - first
         x1 = [emit_row(out, f'{t}.x{j}', m.group(2), first + j) for j in range(4)]
         wv1 = [emit_row(out, f'{t}.wv{j}', hm, 4 + j) for j in range(4)]
-        if i in (0, 1):  # P row i = (inv[i].xyz, 0): no translation
+        if i in (0, 1):  # P row i = (inv[i].xyz, 0)
             pr = emit_row(out, f'{t}.p', hm, INV2_ROW + i, True)
             v = [pr[0], pr[1], pr[2], None]
         else:  # row 2 (0, 0, 0, inv[2].w: row 29's w), row 3 (row 31)
             pr = emit_row(out, f'{t}.p', hm, INV2_ROW if i == 2 else INV2_ROW + 2, True)
-            pxyz = [None] * 3 if i == 2 else pr[:3]
-            c1 = emit_row(out, f'{t}.c1', hm, 15)
-            c2 = emit_row(out, f'{t}.c2', hm, CAM2_ROW, True)
-            v = []
-            for k in range(3):
-                out.append(f'  {t}.d{k} = fsub float {c2[k]}, {c1[k]}')
-                out.append(f'  {t}.dw{k} = fmul float {pr[3]}, {t}.d{k}')
-                if pxyz[k] is None:
-                    v.append(f'{t}.dw{k}')
-                else:
-                    out.append(f'  {t}.v{k} = fadd float {pxyz[k]}, {t}.dw{k}')
-                    v.append(f'{t}.v{k}')
-            v.append(pr[3])
+            v = [None, None, None, pr[3]] if i == 2 else list(pr)
         q = emit_vec_mat(out, f'{t}.q', v, wv1)
         select_rows(out, t, L, emit_vec_mat(out, f'{t}.y', q, x1))
         rename[L] = t

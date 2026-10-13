@@ -55,6 +55,13 @@ std::string heap_status();  // "vi heap": eye 2's views
 bool heap_ready();          // every screen image's eye-2 view written (view 1 reads them unconditionally)
 bool wanted();      // this frame's pre-pass may draw both eyes (configured, switched on, twins made)
 bool configured();  // [Stereo] ViPrepass on and its prerequisites met
+// The depth's planes the list's game pipeline (this thread's lists) can write: bit 0 depth, bit 1 stencil; -1 not
+// known (-2: no list state)
+int writes_depth(ID3D12GraphicsCommandList* cl);
+// The list's game pipeline (this thread's lists) may read the scene depth: not both its shaders in <ViShaders>\no_depth.txt
+bool may_read_depth(ID3D12GraphicsCommandList* cl);
+// The list's viewport 0 as the game set it since its Reset (this thread's lists): its right and bottom edges, in pixels
+bool viewport_extent(ID3D12GraphicsCommandList* cl, uint32_t* right, uint32_t* bottom);
 std::string command(const std::vector<std::string>& t);
 
 }  // namespace rdrvr::vi
