@@ -42,6 +42,11 @@ VIEW_NAME_OK = {'gViewport', 'gBiasToCamera', 'gCameraDistanceAtMaxDisplacement'
 # to rage_matrices rows 21-24, eye 2's unused gWorldViewProj slot): eye 2's own previous-frame position, as the game's
 # second pass computes it (KF2VR's lesson: each eye's own previous-to-current transform).
 PREV_WORLD = 'rage_prev_world'
+# rage_instancemtxprev's gInstancedMtxPrev[256]: each instance's previous world-view-projection (its rows read by a
+# computed index), eye 1's previous camera baked in as in gPrevWorldViewProjSingle: every row it reads is a matrix row,
+# multiplied by D in view 1 like rage_prev_world's (2026-10-13: the instanced foliage's motion vectors were eye 1's in
+# eye 2, its plants smeared under DLSS)
+PREV_INSTANCED = 'rage_instancemtxprev'
 # The screen-space images the main pass reads through global_textures (a uint slot each: the bindless index into the
 # pixel shaders' unbounded SRV table, t0 space2): 11 LightBufferSampler, 13 ShadowCollectorSampler, 15 the scene depth
 # (DepthMapTexSampler / DepthTextureSampler0). In view 1 a shader reads eye 2's copy at table slot EYE2_SLOT_BASE + slot,
@@ -117,6 +122,9 @@ def check_reads(text, allow_prev_world, found=None):
             continue
         if block in SHARED_BLOCKS:
             continue
+        if block == PREV_INSTANCED:
+            prev_world = True  # handled: patch_prev_world
+            continue
         names = [(a, n) for a, b, n in lay.get(block, []) if m.group(2).startswith('%') or a <= int(m.group(2)) <= b]
         for a, n in names:
             if n in INVERSE_VARS:
@@ -184,6 +192,8 @@ def patch(text, allow_prev_world=True):  # (allow_prev_world: kept for callers; 
     text, n_inv = patch_inverse(text, found['inverse']) if found['inverse'] else (text, 0)
     text, n_remap = patch_index_remap(text, set(screen))
     text, n_ndc = patch_ndc(text)
+    text, n_sky = patch_sky_prev(text)
+    n_ndc += n_sky
     if n_redirect + n_screen + n_wvp + n_inv + n_remap + n_ndc == 0:
         raise Refused('no view-dependent block')
     n_redirect += n_screen + n_wvp + n_inv + n_remap + n_ndc
@@ -536,27 +546,124 @@ def patch_ndc(text):
     return chr(10).join(out), n + n_depth
 
 
+# The sky's vertex shader (vs_main: rage_matrices and rage_prev_proj, no rage_prev_world): its position is (world - the
+# camera, rage_matrices row 15) x gWorldView, its previous one the dome's rotation alone x gPrevViewProj (the dome is
+# centred on the camera). In a view-instanced frame the dome is centred on eye 1's camera, so view 1's position has the
+# eyes' offset in it and its previous one not: eye 2's sky moved by the dome's parallax every frame (0.88 px, 2026-10-13).
+# View 1's previous position gets the same offset: + (row 15 - eye 2's camera, row 28; view 0 reads row 15: + 0).
+CAM2_ROW = 28
+
+
+def patch_sky_prev(text):
+    """view 1's previous position, as multiplied by gPrevViewProj in a shader that reads rage_prev_proj and not
+    rage_prev_world, moved by eye 1's camera less eye 2's"""
+    rid = range_ids(text)
+    if 'rage_prev_proj' not in rid or 'rage_matrices' not in rid or PREV_WORLD in rid or PREV_INSTANCED in rid:
+        return text, 0
+    hpp = cb_handles(text, rid['rage_prev_proj'])
+    hm = cb_handles(text, rid['rage_matrices'])
+    if not hpp or not hm:
+        return text, 0
+    lines = text.split(chr(10))
+    # gPrevViewProj's row 0, component 0 (its first multiply's other operand is the previous position's x)
+    # (its row indices are view 1's by now: "%rowN.sp = add i32 %rowN.sp.k, <row>")
+    base = {m.group(1): m.group(2) for m in re.finditer(r'^  (%row\d+\.sp) = add i32 %row\d+\.sp\.k, (\d+)$', text, re.M)}
+    load = re.compile(r'^  (%\d+) = call %dx\.types\.CBufRet\.f32 @dx\.op\.cbufferLoadLegacy\.f32\(i32 59, %dx\.types\.Handle (%\d+), i32 ([%\w.]+)\)')
+    row0 = None
+    for ln in lines:
+        m = load.match(ln)
+        if m and m.group(2) in hpp and base.get(m.group(3), m.group(3)) == '0':
+            row0 = m.group(1)
+            break
+    if not row0:
+        return text, 0
+    c0 = None
+    for ln in lines:
+        m = re.match(r'^  (%\d+) = extractvalue %dx\.types\.CBufRet\.f32 ' + re.escape(row0) + r', 0$', ln)
+        if m:
+            c0 = m.group(1)
+            break
+    if not c0:
+        return text, 0
+    # the x component: "fmul fast float %x, %c0"; y and z: the FMads that follow with rows 1 and 2 (their first operands)
+    xi = None
+    for i, ln in enumerate(lines):
+        m = re.match(r'^  (%\d+) = fmul fast float (%\d+), ' + re.escape(c0) + r'$', ln)
+        if m:
+            xi, px = i, m.group(2)
+            break
+    if xi is None:
+        return text, 0
+    fm = re.compile(r'^  (%\d+) = call float @dx\.op\.tertiary\.f32\(i32 46, float (%\d+), float (%\d+), float (%\d+)\)')
+    m1, m2 = fm.match(lines[xi + 1]), fm.match(lines[xi + 2])
+    if not m1 or not m2:
+        return text, 0
+    py, pz = m1.group(2), m2.group(2)
+    # not when the previous position is already relative to the (view's) camera: "fsub %a, <rage_matrices row 15 .x>"
+    defs = {m.group(1): m.group(2) for m in re.finditer(r'^  (%\d+) = (.*)$', text, re.M)}
+    ext = re.match(r'fsub (?:fast )?float %\d+, (%\d+)$', defs.get(px, ''))
+    if ext:
+        src = re.match(r'extractvalue %dx\.types\.CBufRet\.f32 (%\d+), 0$', defs.get(ext.group(1), ''))
+        ld = src and load.match(f'  {src.group(1)} = ' + defs.get(src.group(1), ''))
+        if ld and ld.group(2) in hm and base.get(ld.group(3), ld.group(3)) == '15':
+            return text, 0
+    # the multiply's lines: from the x fmul to the 4th column's last add (16 lines: 4 x (fmul, 2 FMad, fadd))
+    block = range(xi, min(xi + 16, len(lines)))
+    t = '%sky.sp'
+    pre = []
+    c1 = emit_row(pre, f'{t}.c1', hm[0], 15)
+    # (row 28 is past the block's declared end: a dynamic index, view 0 reading row 15 again, so its offset is 0)
+    pre.append(f'  {t}.c2.i = select i1 %isv1.sp, i32 {CAM2_ROW}, i32 15')
+    pre.append(f'  {t}.c2 = call %dx.types.CBufRet.f32 @dx.op.cbufferLoadLegacy.f32(i32 59, %dx.types.Handle {hm[0]}, i32 {t}.c2.i)')
+    for k in range(4):
+        pre.append(f'  {t}.c2.c{k} = extractvalue %dx.types.CBufRet.f32 {t}.c2, {k}')
+    c2 = [f'{t}.c2.c{k}' for k in range(4)]
+    newv = {}
+    for k, v in enumerate((px, py, pz)):
+        pre.append(f'  {t}.d{k} = fsub float {c1[k]}, {c2[k]}')
+        pre.append(f'  {t}.p{k} = fadd float {v}, {t}.d{k}')
+        newv[v] = f'{t}.p{k}'
+    tok = re.compile(r'%\d+(?![\w.])')
+    out = lines[:xi] + pre
+    for i in block:
+        out.append(tok.sub(lambda q: newv.get(q.group(0), q.group(0)), lines[i]))
+    out += lines[block.stop:]
+    return chr(10).join(out), 1
+
+
 def patch_prev_world(text):
-    """view 1's reads of rage_prev_world rows 0-3 become row x D (D: rage_matrices rows 21-24); view 0's unchanged"""
+    """view 1's reads of rage_prev_world rows 0-3, and of any rage_instancemtxprev row, become row x D (D: rage_matrices
+    rows 21-24); view 0's unchanged"""
     rid = {}
     for m in re.finditer(r'^!\d+ = !\{i32 (\d+), %"?(?:hostlayout\.)?([^"*]+)"?\* undef, !"[^"]*", i32 \d+, i32 \d+, i32 \d+, i32 \d+, null\}',
                          text, re.M):
         rid[m.group(2)] = m.group(1)
-    if 'rage_matrices' not in rid or PREV_WORLD not in rid:
-        raise Refused('reads rage_prev_world without rage_matrices')
-    hm = re.search(r'(%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 2, i32 ' + rid['rage_matrices'] + r',', text)
-    hp = {m.group(1) for m in re.finditer(r'(%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 2, i32 '
-                                          + rid[PREV_WORLD] + r',', text)}
-    if not hm or not hp:
-        raise Refused('rage_prev_world or rage_matrices handle not found')
-    hm = hm.group(1)
+    if 'rage_matrices' not in rid or (PREV_WORLD not in rid and PREV_INSTANCED not in rid):
+        raise Refused('reads rage_prev_world or rage_instancemtxprev without rage_matrices')
+    def handles_of(block):
+        if block not in rid:
+            return set()
+        return {m.group(1) for m in re.finditer(r'(%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 2, i32 '
+                                                + rid[block] + r',', text)}
+    hp, hi = handles_of(PREV_WORLD), handles_of(PREV_INSTANCED)
+    if not (hp or hi):
+        raise Refused('rage_prev_world / rage_instancemtxprev handle not found')
+    hms = sorted(handles_of('rage_matrices'), key=lambda h: int(h[1:]))
+    if not hms:
+        raise Refused('rage_matrices handle not found')
+    hm, d_row = hms[0], DELTA_ROW
     lines = text.split(chr(10))
-    load = re.compile(r'^  (%\d+) = call %dx\.types\.CBufRet\.f32 @dx\.op\.cbufferLoadLegacy\.f32\(i32 59, %dx\.types\.Handle (%\d+), i32 (\d+)\)')
+    load = re.compile(r'^  (%\d+) = call %dx\.types\.CBufRet\.f32 @dx\.op\.cbufferLoadLegacy\.f32\(i32 59, %dx\.types\.Handle (%\d+), i32 ([%\w.]+)\)')
     out, rename, n = [], {}, 0
     for i, ln in enumerate(lines):
         m = load.match(ln)
         out.append(ln)
-        if not m or m.group(2) not in hp or int(m.group(3)) not in PREV_WORLD_ROWS:
+        if not m:
+            continue
+        if m.group(2) in hp:
+            if m.group(3).startswith('%') or int(m.group(3)) not in PREV_WORLD_ROWS:
+                continue
+        elif m.group(2) not in hi:
             continue
         n += 1
         L, t = m.group(1), f'%pw{n}.sp'
@@ -565,7 +672,7 @@ def patch_prev_world(text):
             out.append(f'  {e[k]} = extractvalue %dx.types.CBufRet.f32 {L}, {k}')
         for j in range(4):
             # (a constant row past the block's declared end fails validation: view 0 reads row j instead, unused)
-            out.append(f'  {t}.r{j} = select i1 %isv1.sp, i32 {DELTA_ROW + j}, i32 {j}')
+            out.append(f'  {t}.r{j} = select i1 %isv1.sp, i32 {d_row + j}, i32 {j}')
             out.append(f'  {t}.d{j} = call %dx.types.CBufRet.f32 @dx.op.cbufferLoadLegacy.f32(i32 59, %dx.types.Handle {hm}, i32 {t}.r{j})')
             for k in range(4):
                 out.append(f'  {t}.d{j}c{k} = extractvalue %dx.types.CBufRet.f32 {t}.d{j}, {k}')

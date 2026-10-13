@@ -91,7 +91,22 @@ bool level_camera(const float* c, float* out) {
 }
 
 void vi_log_pass2(const char* what, void* vp);  // (below: only inside pass 2 of a view-instanced frame)
+// "pushlog": every PushGlobals of the next double frame (both passes) on the render thread: the viewport, its
+// rotation-only view-projection (+0xc0: columns z and w, the projection's near/far terms) and the caller; to find a
+// projection the game pushes mid-pass (eye 2's rows are written once a frame)
+std::atomic<int> g_push_log{0};  // 1 armed, 2 logging this frame
+thread_local int t_push_pass = 0;
+void* g_push_scene_vp = nullptr;
+void push_log(void* vp, char vi) {
+    if (g_push_log.load(std::memory_order_relaxed) != 2 || !vp) return;
+    const float* m = reinterpret_cast<const float*>(static_cast<char*>(vp) + 0xc0);
+    const float* pos = reinterpret_cast<const float*>(static_cast<char*>(vp) + 0x140 + 48);
+    log::info("[cam] pushlog pass %d vp %p%s%s | zcol (%.6f %.6f %.6f %.6f) wcol (%.6f %.6f %.6f %.6f) x0 %.6f | pos (%.3f %.3f %.3f) ret %p",
+              t_push_pass, vp, vp == g_push_scene_vp ? " (scene)" : "", vi ? " +vi" : "", m[2], m[6], m[10], m[14], m[3], m[7], m[11], m[15],
+              m[0], pos[0], pos[1], pos[2], _ReturnAddress());
+}
 void hk_PushGlobals(void* vp, char push_view_inverse) {
+    push_log(vp, push_view_inverse);
     vi_log_pass2(push_view_inverse ? "PushGlobals+vi" : "PushGlobals", vp);
     if (push_view_inverse && vp && g_vi_level.load(std::memory_order_relaxed) && vp == g_scene_vp.load(std::memory_order_relaxed)) {
         float* vi = reinterpret_cast<float*>(static_cast<char*>(vp) + 0x140);
@@ -431,6 +446,12 @@ void hk_SceneRender(void* renderer, void* vp, const float* cam_game, void* a4) {
         g_union_ok = dual_pass::shadows_wanted() && g_xr_pose.load(std::memory_order_relaxed) && build_union_vp(vp, cam);
         dual_pass::begin_frame(renderer);
         t_vi_frame = prepass::latch_vi();
+        if (t_vi_frame && g_push_log.load() == 1) {
+            g_push_scene_vp = vp;
+            g_push_log = 2;
+            log::info("[cam] pushlog: a view-instanced double frame, scene viewport %p", vp);
+        }
+        t_push_pass = 1;
         if (t_vi_frame) g_vi_frames.fetch_add(1, std::memory_order_relaxed);
         const double t1 = probe ? log::now_ms() : 0;
         if (probe) frame_probe::set_phase(frame_probe::kPhasePass1);
@@ -438,11 +459,14 @@ void hk_SceneRender(void* renderer, void* vp, const float* cam_game, void* a4) {
         const double t2 = probe ? log::now_ms() : 0;
         if (probe) frame_probe::set_phase(frame_probe::kBetween);
         dual_pass::between_passes(renderer, first);
+        t_push_pass = 2;
         const double t3 = probe ? log::now_ms() : 0;
         if (probe) frame_probe::set_phase(frame_probe::kPhasePass2);
         std::memcpy(vp, g_saved_vp, kViewportSize);
         scene_once(renderer, vp, cam, a4, 1 - first);
         t_vi_frame = false;
+        t_push_pass = 0;
+        if (g_push_log.load() == 2) g_push_log = 0;
         dual_pass::end_frame(1 - first);
         g_double_frames.fetch_add(1, std::memory_order_relaxed);
         if (probe) {
@@ -987,6 +1011,7 @@ void set(Mode mode, float dx, float dy, float dz) {
 
 void request_log() { g_log = true; }
 void request_vi_log() { g_vi_log = 1; }
+void request_push_log() { g_push_log = 1; }
 void set_vi_camfix(bool on) { g_vi_camfix = on; }
 void set_vi_skip2(bool on) { g_vi_skip2 = on; }
 uint64_t vi_skipped2() { return g_vi_skipped2.load(); }
