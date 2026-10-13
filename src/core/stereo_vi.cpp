@@ -57,6 +57,7 @@ struct Kept {
     std::atomic<ID3D12PipelineState*> twin{nullptr};
     std::atomic<uint64_t> made_frame{~0ull};  // the frame the twin was made in: usable from the next frame
     int state = 0;                            // 0 queued, 1 made, -1 not made (why below), the worker's only
+    std::atomic<bool> remake{false};          // "vi load <dir> all": made again from the newly loaded shaders
     const char* why = "";
 };
 
@@ -235,7 +236,7 @@ void worker() {
             k = g_queue.front();
             g_queue.pop_front();
         }
-        if (!k->twin.load()) make_twin(k);
+        if (!k->twin.load() || k->remake.exchange(false)) make_twin(k);  // (a replaced twin is leaked: frames in flight use it)
     }
 }
 
@@ -539,8 +540,12 @@ std::string command(const std::vector<std::string>& t) {
         size_t n = 0;
         AcquireSRWLockShared(&g_lock);
         std::vector<Kept*> again;
+        const bool all = t.size() >= 4 && t[3] == "all";
         for (auto& k : g_kept)
-            if (!k->twin.load()) again.push_back(k.get());
+            if (!k->twin.load() || all) {
+                if (all) k->remake = true;
+                again.push_back(k.get());
+            }
         ReleaseSRWLockShared(&g_lock);
         for (Kept* k : again) {
             enqueue(k);

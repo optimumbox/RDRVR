@@ -34,9 +34,9 @@ def to_rgb(w, fmt, a):
     if fmt in (10,):  # rgba16f
         px = a[:, :w * 8].view(np.float16).reshape(a.shape[0], w, 4).astype(np.float32)
         return np.clip(px[..., :3] * 255, 0, 255).astype(np.uint8), px
-    if fmt in (40, 41, 45, 46, 19, 20):  # 32-bit: depth-ish, shown as normalised grey
+    if fmt in (39, 40, 41, 45, 46, 19, 20):  # 32-bit: depth-ish, shown as normalised grey
         px = a[:, :w * 4].view(np.uint32).reshape(a.shape[0], w)
-        v = (px & 0xffffff).astype(np.float64) if fmt in (45, 46) else px.view(np.float32).astype(np.float64)
+        v = (px & 0xffffff).astype(np.float64) if fmt in (39, 45, 46) else px.view(np.float32).astype(np.float64)
         lo, hi = np.percentile(v, 1), np.percentile(v, 99)
         g = np.clip((v - lo) / max(hi - lo, 1e-12) * 255, 0, 255).astype(np.uint8)
         return np.stack([g] * 3, -1), v[..., None]

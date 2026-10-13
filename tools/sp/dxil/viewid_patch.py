@@ -47,6 +47,15 @@ PREV_WORLD = 'rage_prev_world'
 # (DepthMapTexSampler / DepthTextureSampler0). In view 1 a shader reads eye 2's copy at table slot EYE2_SLOT_BASE + slot,
 # where the core writes it (stereo_vi.cpp: the table's base from the game's own bind, the slots past what the game uses).
 SCREEN_SLOTS = {11, 13, 15}
+# ... but a slot's image is the pass's: slot 15 is the sun's shadow map in the light pass (DepthTextureSampler0, read
+# with a comparison sampler): a slot is redirected only when this shader names it as one of the screen images
+SCREEN_SLOT_NAMES = {11: {'LightBufferSampler'}, 13: {'ShadowCollectorSampler'}, 15: {'DepthMapTexSampler', 'RMPTFX_DepthMapTexSampler'}}
+
+
+def slot_names(text):
+    """{global_textures slot: the shader's name for it}"""
+    m = re.search(r'^; cbuffer global_textures$(.*?)^;\s+\} global_textures;', text, re.M | re.S)
+    return {int(o) // 4: n for n, o in re.findall(r'uint (\w+);\s+; Offset:\s+(\d+)', m.group(1))} if m else {}
 EYE2_SLOT_BASE = 14960
 # The scene depth itself, read by an index of the shader's own (a $Globals one): the game's depth view's index is in
 # rage_matrices row 30 .w (a uint's bits; stereo_vi.h kDepthBufferSlot), eye 2's copy at EYE2_SLOT_BASE + 16.
@@ -223,11 +232,11 @@ def screen_slot_reads(text):
     for m in re.finditer(r'(%\d+) = call %dx\.types\.CBufRet\.i32 @dx\.op\.cbufferLoadLegacy\.i32\(i32 59, %dx\.types\.Handle (%\d+), i32 (\d+)\)', text):
         if m.group(2) in hs:
             loads[m.group(1)] = int(m.group(3))
-    slot_of = {}
+    slot_of, names = {}, slot_names(text)
     for m in re.finditer(r'(%\d+) = extractvalue %dx\.types\.CBufRet\.i32 (%\d+), (\d)', text):
         if m.group(2) in loads:
             slot = loads[m.group(2)] * 4 + int(m.group(3))
-            if slot in SCREEN_SLOTS:
+            if slot in SCREEN_SLOTS and names.get(slot) in SCREEN_SLOT_NAMES[slot]:
                 slot_of[m.group(1)] = slot
     if not slot_of:
         return {}
@@ -414,16 +423,14 @@ def patch_inverse(text, inverse):
 
 
 def patch_index_remap(text, done):
-    """view 1's bindless 2D texture indices from any source (a material's own index too) that name a screen image the
-    game also put in a global_textures screen slot read eye 2's copy: idx == slot's value ? EYE2_SLOT_BASE + slot : idx"""
+    """view 1's bindless 2D texture indices from any source (a material's own index too) equal to the game's scene-depth
+    view's (rage_matrices row 30 .w, written by the core) read eye 2's copy. (Not compared with global_textures' values:
+    a slot holds the pass's image, the sun's shadow map in the light pass.)"""
     rid = range_ids(text)
-    if 'global_textures' not in rid:
-        return text, 0
     srv = re.search(r'^!\d+ = !\{i32 (\d+), \[0 x %"class\.Texture2D<[^"]*>"\]\* undef, !"[^"]*", i32 \d+, i32 0, i32 -1, i32 2,', text, re.M)
-    hg = cb_handles(text, rid['global_textures'])
-    if not srv or not hg:
-        return text, 0
     hm = cb_handles(text, rid['rage_matrices']) if 'rage_matrices' in rid else []
+    if not srv or not hm:
+        return text, 0
     hre = re.compile(r'^  (%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 0, i32 ' + srv.group(1) + r', i32 (%\d+), i1')
     out, n = [], 0
     for ln in text.split(chr(10)):
@@ -433,22 +440,12 @@ def patch_index_remap(text, done):
             continue
         n += 1
         t, idx = f'%rmp{n}.sp', m.group(2)
-        rows, cur = {}, idx
-        for slot in sorted(SCREEN_SLOTS):
-            r = slot // 4
-            if r not in rows:
-                rows[r] = emit_row(out, f'{t}.g{r}', hg[0], r, kind='i32')
-            out.append(f'  {t}.q{slot} = icmp eq i32 {idx}, {rows[r][slot % 4]}')
-            out.append(f'  {t}.b{slot} = and i1 {t}.q{slot}, %isv1.sp')
-            out.append(f'  {t}.n{slot} = select i1 {t}.b{slot}, i32 {EYE2_SLOT_BASE + slot}, i32 {cur}')
-            cur = f'{t}.n{slot}'
-        if hm:
-            dr = emit_row(out, f'{t}.dr', hm[0], DEPTH_INDEX_ROW, True)
-            out.append(f'  {t}.di = bitcast float {dr[3]} to i32')
-            out.append(f'  {t}.qd = icmp eq i32 {idx}, {t}.di')
-            out.append(f'  {t}.bd = and i1 {t}.qd, %isv1.sp')
-            out.append(f'  {t}.nd = select i1 {t}.bd, i32 {EYE2_SLOT_BASE + DEPTH_BUFFER_SLOT}, i32 {cur}')
-            cur = f'{t}.nd'
+        dr = emit_row(out, f'{t}.dr', hm[0], DEPTH_INDEX_ROW, True)
+        out.append(f'  {t}.di = bitcast float {dr[3]} to i32')
+        out.append(f'  {t}.qd = icmp eq i32 {idx}, {t}.di')
+        out.append(f'  {t}.bd = and i1 {t}.qd, %isv1.sp')
+        out.append(f'  {t}.nd = select i1 {t}.bd, i32 {EYE2_SLOT_BASE + DEPTH_BUFFER_SLOT}, i32 {idx}')
+        cur = f'{t}.nd'
         out.append(ln.replace(f', i32 {idx}, i1', f', i32 {cur}, i1', 1))
     return chr(10).join(out), n
 
