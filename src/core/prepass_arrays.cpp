@@ -411,7 +411,7 @@ char g_grow_why[160] = "";
 uint64_t g_written = 0, g_kept = 0, g_lost = 0;
 uint64_t g_vi_rows_same = 0, g_vi_rows_differ = 0;  // view-instanced frames: pass 2's gWorldView/position as the pre-pass's
 float g_vi_rows_max = 0;
-uint64_t g_mv_checks = 0;  // view-instanced frames whose motion-vector transform was checked against pass 2
+uint64_t g_mv_checks = 0, g_mv_unread = 0, g_mv_not_vi = 0, g_mv_no_delta = 0;  // (why a frame was not checked)  // view-instanced frames whose motion-vector transform was checked against pass 2
 float g_mv_err = 0;        // the largest relative difference
 float g_written_wv[16], g_written_vi[16], g_written_pp[16];
 
@@ -569,6 +569,9 @@ void observe_after_walk() {
         static bool pw1_ok = false;
         float pw[16];
         const bool got = global_rows(anchors::Id::HandlePrevWorldVP, pw, 64);
+        if (!got) ++g_mv_unread;
+        if (pass == 1 && !t_latched_vi) ++g_mv_not_vi;
+        if (pass == 1 && !g_e2_delta_ok) ++g_mv_no_delta;
         if (pass == 1) {
             pw1_ok = got && t_latched_vi && g_e2_delta_ok;
             if (pw1_ok) std::memcpy(pw1, pw, sizeof(pw1));
@@ -860,12 +863,14 @@ int vi_region(const ID3D12GraphicsCommandList* cl, bool* all_arrays) {
     return g_r.slice + 1;
 }
 std::string vi_status() {
-    char b[400];
+    char b[520];
     std::snprintf(b, sizeof(b), "view-instanced regions: slice 0 %llu, slice 1 %llu | pass 2's rows as the pre-pass's: same %llu, differ %llu (max %.7f)"
-                  " | motion vectors: D %s, checked %llu frames, largest relative difference %.2e",
+                  " | motion vectors: D %s, checked %llu frames, largest relative difference %.2e (not checked: unread %llu, not vi %llu, no D %llu)",
                   static_cast<unsigned long long>(g_vi_regions[0].load()), static_cast<unsigned long long>(g_vi_regions[1].load()),
                   static_cast<unsigned long long>(g_vi_rows_same), static_cast<unsigned long long>(g_vi_rows_differ), g_vi_rows_max,
-                  g_e2_delta_ok ? "from the updates" : "identity", static_cast<unsigned long long>(g_mv_checks), g_mv_err);
+                  g_e2_delta_ok ? "from the updates" : "identity", static_cast<unsigned long long>(g_mv_checks), g_mv_err,
+                  static_cast<unsigned long long>(g_mv_unread), static_cast<unsigned long long>(g_mv_not_vi),
+                  static_cast<unsigned long long>(g_mv_no_delta));
     return b;
 }
 
