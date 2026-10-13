@@ -23,6 +23,7 @@
 #include "core/frame_probe.h"
 #include "core/playback.h"
 #include "core/eye_grab.h"
+#include "core/eye_capture.h"
 #include "core/eye_shape.h"
 #include "core/frame_grab.h"
 #include "core/game_hooks.h"
@@ -277,6 +278,7 @@ std::string execute(const std::vector<std::string>& t) {
         return st;
     }
     if (c == "grabeyes" && t.size() >= 2) return eye_grab::grab(t[1]);
+    if (c == "eyecap") return eye_capture::command(t);  // both eyes every N s or now (eye_capture.h)
     if (c == "renderres") return render_res::command(c);  // renderres: [Render] RenderResolution's state this start
     if (c == "eyeshape") {  // eyeshape [on|off|scale <x>|status|rts]: the eyes in the headset's own shape (EyeShape; the session)
         std::string line;

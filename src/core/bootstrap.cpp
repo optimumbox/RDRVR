@@ -26,6 +26,7 @@
 #include "core/pose.h"
 #include "core/menu.h"
 #include "core/eye_grab.h"
+#include "core/eye_capture.h"
 #include "core/eye_shape.h"
 #include "core/lum_check.h"
 #include "core/taa.h"
@@ -140,6 +141,7 @@ DWORD WINAPI bootstrap_thread(void*) {
     exit_guard::install();
     frame_grab::init();
     eye_grab::init();
+    eye_capture::init();
     lum_check::init();
     burst_grab::init();
     align_grab::init();

@@ -42,6 +42,7 @@ add_library(rdrvr_core SHARED
     src/core/draw_masks.asm
     src/core/exec_gate_thunk.asm
     src/core/eye_grab.cpp
+    src/core/eye_capture.cpp
     src/core/eye_shape.cpp
     src/core/render_res.cpp
     src/core/lum_check.cpp
