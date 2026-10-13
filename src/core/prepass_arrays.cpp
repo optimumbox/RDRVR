@@ -90,6 +90,8 @@ struct Region {
     bool vi = false;          // view-instanced (stereo_vi.h): slice 0's region draws both slices, slice 1's skips those draws
     bool all_arrays = true;   // every target of the current bind is one of the six (a view-instanced draw may run)
     unsigned published = 0;   // ViMain: kinds copied out since their last writing (bit k)
+    unsigned bound = 0;       // kinds bound as the current targets (bit k)
+    unsigned dirty = ~0u;     // ViMain: kinds written (a draw made, a clear) since their last copy out (bit k)
     unsigned touched = 0, known = 0;   // bit (kind * 2 + plane): that plane's state known
     D3D12_RESOURCE_STATES state[kKinds][2]{};  // per plane (the depth's two: the game moves them one at a time)
 } g_r;
@@ -265,7 +267,7 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* r, D3D12_RESOURCE_STATES from,
 // the copies inside it (publishes, the depth resolve, the region end's). Frames sorted by view-instanced or not, so
 // "vi ab <n>" (view instancing every other n frames) compares both in the same view. Read back kFrames frames later.
 namespace gpu {
-constexpr int kFrames = 4, kMax = 256;
+constexpr int kFrames = 4, kMax = 4096;
 enum Tag : uint8_t { kBegin0, kEnd0, kBegin1, kEnd1, kCopyBegin, kCopyEnd };
 ID3D12QueryHeap* g_heap = nullptr;
 ID3D12Resource* g_rb = nullptr;
@@ -283,6 +285,8 @@ struct Sum {
     double span = 0, r0 = 0, r1 = 0, copies = 0;
 };
 Sum g_sum[2];  // [vi]
+uint64_t g_marks = 0, g_resolves = 0, g_harvests = 0, g_unresolved = 0, g_bad = 0;
+double g_last[4] = {0, 0, 0, 0};
 std::mutex g_mutex;
 double g_tick_ms = 0;
 bool ensure() {
@@ -310,7 +314,11 @@ bool ensure() {
 }
 void harvest(int slot) {  // that slot's frame, resolved kFrames frames ago
     Rec& rc = g_rec[slot];
-    if (!rc.resolved || !rc.complete) return;
+    ++g_harvests;
+    if (!rc.resolved || !rc.complete) {
+        ++g_unresolved;
+        return;
+    }
     const uint64_t* t = g_mapped + slot * kMax;
     double b0 = -1, e0 = -1, b1 = -1, e1 = -1, copies = 0, cb = -1;
     for (int i = 0; i < rc.n; ++i) {
@@ -327,7 +335,11 @@ void harvest(int slot) {  // that slot's frame, resolved kFrames frames ago
                 break;
         }
     }
-    if (b0 < 0 || e0 < b0 || b1 < e0 || e1 < b1 || e1 - b0 > 200) return;  // (an incomplete or wrapped frame)
+    if (b0 < 0 || e0 < b0 || b1 < e0 || e1 < b1 || e1 - b0 > 200) {  // (an incomplete or wrapped frame)
+        ++g_bad;
+        g_last[0] = b0, g_last[1] = e0, g_last[2] = b1, g_last[3] = e1;
+        return;
+    }
     std::lock_guard lock(g_mutex);
     Sum& s = g_sum[rc.vi ? 1 : 0];
     ++s.frames;
@@ -346,13 +358,16 @@ void mark(ID3D12GraphicsCommandList* cl, Tag tag) {
     }
     if (g_slot < 0) return;
     Rec& rc = g_rec[g_slot];
+    if (rc.n >= kMax - 4 && (tag == kCopyBegin || tag == kCopyEnd)) return;  // (room kept for the regions' marks)
     if (rc.n >= kMax) return;
     cl->EndQuery(g_heap, D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(g_slot * kMax + rc.n));
+    ++g_marks;
     rc.tag[rc.n++] = tag;
     if (tag == kEnd1) {
         cl->ResolveQueryData(g_heap, D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(g_slot * kMax), static_cast<UINT>(rc.n), g_rb,
                              static_cast<UINT64>(g_slot) * kMax * 8);
         rc.resolved = rc.complete = true;
+        ++g_resolves;
         g_slot = -1;
     }
 }
@@ -367,6 +382,12 @@ std::string status(bool reset) {
                       v ? "view-instanced" : "two passes", static_cast<unsigned long long>(s.frames), s.span / n, s.r0 / n, s.r1 / n, s.copies / n);
         r += b;
     }
+    char d[260];
+    std::snprintf(d, sizeof(d), " | marks %llu, resolves %llu, harvests %llu (unresolved %llu, out of order %llu: last %.3f %.3f %.3f %.3f)",
+                  static_cast<unsigned long long>(g_marks), static_cast<unsigned long long>(g_resolves), static_cast<unsigned long long>(g_harvests),
+                  static_cast<unsigned long long>(g_unresolved), static_cast<unsigned long long>(g_bad), g_last[0] - g_last[0], g_last[1] - g_last[0],
+                  g_last[2] - g_last[0], g_last[3] - g_last[0]);
+    r += d;
     if (reset) g_sum[0] = g_sum[1] = Sum{};
     return r;
 }
@@ -514,8 +535,10 @@ void grab_frame_end(uint64_t) {
     }
 }
 
+std::atomic<uint64_t> g_pub_kind[kKinds][2];  // publishes per kind, [view-instanced region]
 void publish(ID3D12GraphicsCommandList* cl, int k, const D3D12_RESOURCE_STATES st[2]) {
     Arr& a = g_arr[k];
+    g_pub_kind[k][g_r.vi ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
     if (!a.arr || !a.game) return;
     const bool e2 = a.e2 && g_r.vi && g_r.slice == 0;
     D3D12_RESOURCE_BARRIER pre[4], post[4];
@@ -1103,6 +1126,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_rtv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
     }
     if (k <= kDepth || !ensure(k, res, fmt)) return h;
     g_r.touched |= 1u << k;
+    g_r.dirty |= 1u << k;
     set_state(k, -1, D3D12_RESOURCE_STATE_RENDER_TARGET);  // (a clear needs it)
     return g_arr[k].view[region_view_index()];
 }
@@ -1115,6 +1139,7 @@ bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_
         return false;
     }
     bool any = false;
+    g_r.bound = 0;
     g_r.all_arrays = true;  // until a target that is not one of the six
     if (single && n >= 1 && rts) {  // a contiguous range: one handle for all n (not substituted one by one)
         ID3D12Resource* res = nullptr;
@@ -1137,6 +1162,7 @@ bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_
         }
         if (!(g_r.known & (1u << (k * 2)))) set_state(k, -1, D3D12_RESOURCE_STATE_RENDER_TARGET);  // (its barrier before the region)
         g_r.touched |= 1u << k;
+        g_r.bound |= 1u << k;
         out_rts[i] = g_arr[k].view[region_view_index()];
         any = true;
     }
@@ -1146,6 +1172,7 @@ bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_
         DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
         if (kind_of(*ds, &res, &fmt) == kDepth && res == g_arr[kDepth].game) {
             *out_ds = g_arr[kDepth].view[region_view_index()];
+            g_r.bound |= 1u << kDepth;
             any = true;
         } else {
             g_r.all_arrays = false;
@@ -1153,6 +1180,13 @@ bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_
     }
     if (any) g_redirects.fetch_add(1, std::memory_order_relaxed);
     return any;
+}
+
+// A draw made (not skipped) in the region: its bound kinds in a writing state are written, to be copied out again.
+void drawn(ID3D12GraphicsCommandList* cl) {
+    if (cl != g_r.cl || !g_r.bound) return;
+    for (int k = 0; k < kKinds; ++k)
+        if ((g_r.bound & (1u << k)) && writing(k, g_r.state[k][0])) g_r.dirty |= 1u << k;
 }
 
 void barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BARRIER* b) {
@@ -1178,10 +1212,11 @@ void barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BAR
         // [Stereo] ViMain: written in the region and now to be read: its slices copied out first (once per writing)
         const D3D12_RESOURCE_STATES after = b[i].Transition.StateAfter;
         if (g_i2.load(std::memory_order_relaxed) && (g_r.touched & (1u << k)) && writing(k, b[i].Transition.StateBefore) &&
-            !writing(k, after) && after != D3D12_RESOURCE_STATE_COPY_DEST && !(g_r.published & (1u << k)) &&
+            !writing(k, after) && after != D3D12_RESOURCE_STATE_COPY_DEST && (g_r.dirty & (1u << k)) &&
             (g_r.known & plane_bits(k)) == plane_bits(k)) {
             const D3D12_RESOURCE_STATES st[2] = {g_r.state[k][0], g_r.state[k][1]};
             publish(cl, k, st);
+            g_r.dirty &= ~(1u << k);
             g_r.published |= 1u << k;
         }
         if (writing(k, after)) g_r.published &= ~(1u << k);
@@ -1376,6 +1411,18 @@ void trace_clear(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE h, b
 void set_ab(unsigned frames) { g_ab = frames; }
 std::string gpu_command(const std::string& arg) {
     if (arg == "on" || arg == "off") gpu::g_on = arg == "on";  // (the playback thread reads it: a flag, set between frames)
+    if (arg == "pubs") {  // publishes per kind (view-instanced regions, others) and per region since the start
+        std::string r = "publishes per region:";
+        const double rv = std::max<double>(1.0, static_cast<double>(g_vi_regions[0].load() + g_vi_regions[1].load()));
+        const double ro = std::max<double>(1.0, static_cast<double>(g_regions.load()) - rv);
+        for (int k = 0; k < kKinds; ++k) {
+            char b[120];
+            std::snprintf(b, sizeof(b), " %s %.1f/%.1f;", kNames[k], static_cast<double>(g_pub_kind[k][1].load()) / rv,
+                          static_cast<double>(g_pub_kind[k][0].load()) / ro);
+            r += b;
+        }
+        return r;
+    }
     return gpu::status(arg == "reset");
 }
 

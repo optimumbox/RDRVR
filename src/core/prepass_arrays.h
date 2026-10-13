@@ -24,6 +24,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_rtv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
 // The game's bind in a region: true with the substituted handles (out_rts[0..n), *out_ds when ds was given).
 bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int single,
           const D3D12_CPU_DESCRIPTOR_HANDLE* ds, D3D12_CPU_DESCRIPTOR_HANDLE* out_rts, D3D12_CPU_DESCRIPTOR_HANDLE* out_ds);
+void drawn(ID3D12GraphicsCommandList* cl);  // a draw made (not skipped by view instancing): its targets written
 void barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BARRIER* b);  // before the game's batch
 void before_draw(ID3D12GraphicsCommandList* cl);  // a draw in a region: the walk's end copied first
 // Every game bind while on and outside a region: the game binds the pre-pass's targets before it clears them, so the

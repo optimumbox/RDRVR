@@ -383,6 +383,7 @@ void fg_draw(ID3D12GraphicsCommandList* cl) {
 void STDMETHODCALLTYPE hk_DrawInstanced(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, UINT d) {
     if (prepass::active()) prepass::before_draw(cl);
     if (vi::before_draw(cl)) return;  // view-instanced stereo: drawn for both eyes already
+    if (prepass::active()) prepass::drawn(cl);
     if (pso::on_draw(cl)) return;
     ++t_draws;
     fg_draw(cl);
@@ -392,6 +393,7 @@ void STDMETHODCALLTYPE hk_DrawInstanced(ID3D12GraphicsCommandList* cl, UINT a, U
 void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, INT d, UINT e) {
     if (prepass::active()) prepass::before_draw(cl);
     if (vi::before_draw(cl)) return;
+    if (prepass::active()) prepass::drawn(cl);
     if (pso::on_draw(cl)) return;
     ++t_draws;
     fg_draw(cl);
@@ -407,6 +409,7 @@ void STDMETHODCALLTYPE hk_ExecuteIndirect(ID3D12GraphicsCommandList* cl, ID3D12C
     fg_count(cl, [](ListLog& l) { ++l.indirect; });
     if (prepass::active()) prepass::before_draw(cl);
     if (vi::before_draw(cl)) return;
+    if (prepass::active()) prepass::drawn(cl);
     o_ExecuteIndirect(cl, s, n, a, b, c, d);
 }
 // ---- barrier watch (d3d::watch_add)
