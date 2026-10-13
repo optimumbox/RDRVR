@@ -24,6 +24,16 @@ $test = 'RDRVR.dev.ini', 'RDRVR_xr_runtime.txt', 'RDRVR_cmd.txt'
 if ($Stop) {
     $p = Get-Process RDR -ErrorAction SilentlyContinue
     if ($p) {
+        # the render-size boot sentinel: a start at the chosen size that ends within two minutes (this close is not a
+        # quit) blocks that size for the player's next start (2026-10-13: twice, the headset ran at 2560x1440). Wait for
+        # it to clear (two minutes at the size) before closing.
+        $rc = Join-Path $here 'rdrcmd.ps1'
+        for ($i = 0; $i -lt 40; $i++) {
+            $st = try { [string](& $rc 'renderres' 2>$null) } catch { '' }
+            if ($st -notmatch 'sentinel pending') { break }
+            if ($i -eq 0) { 'waiting for the render-size sentinel to clear (two minutes at the size) before closing' }
+            Start-Sleep 5
+        }
         $p.CloseMainWindow() | Out-Null
         if (-not $p.WaitForExit(15000)) { Stop-Process -Id $p.Id -Force }
     }
