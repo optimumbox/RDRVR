@@ -177,6 +177,51 @@ Frame probe over 7-10 s windows. In "one pass", `double off` drew one scene pass
 - Lowering the playback thread's cost needs fewer D3D12 calls: one instanced draw for both eyes
   (view instancing). That also gives the single walk.
 
+## Direction after M0: view-instanced stereo (chosen 2026-10-12)
+
+One walk and one draw for both eyes, with D3D12 view instancing. The GPU supports tier 3 and
+SM 6.7 (`[d3d] view instancing tier 3` in the log). The replay design above is set aside.
+
+Proven offline so far:
+
+- **The game's shaders are DXIL with full reflection.** Cbuffer struct names and entry-point
+  names survive; only the resource names are stripped. A `pso dump` in Armadillo gave 145
+  vertex shaders.
+- **Which rows the vertex shaders read** (`tools/sp/dxil/cbrows.py`):
+  - `rage_matrices`: constant rows only, never a dynamic index. Nearly all shaders read rows
+    0-3 (gWorldSingle, camera-relative, per draw), 4-7 (gWorldView, the per-pass rotation-only
+    view-projection) and 12-15 (gViewInverse).
+  - Only `VS_TransformUnlit` (3 shaders) reads gWorldViewProj, rows 8-11.
+  - Eye 2 therefore needs one extra set of per-pass rows. That is the layout
+    `[Stereo] PrepassViews=2` already writes: rows 17-20 and 25-28, and rage_prev_proj rows
+    4-7.
+- **The shader patch** (`tools/sp/dxil/viewid_patch.py`, `stereo_vs.py`):
+  1. Read `SV_ViewID`; in view 1, add 13 to the row of those reads (4 for rage_prev_proj).
+  2. Raise the shader model to 6.1 and set the ViewID flag.
+  3. Assemble with `dxa`, recompute the ViewID dependency tables with `dxopt -viewid-state`,
+     then run the retail `dxv` validator.
+  - Result: **133 of 145 validate.** The other 12 read no view block (full-screen and UI).
+  - The toolchain is DXC v1.9.2609 built from source in `research\dxc-build` (needs VS's ATL
+    component).
+
+Next, in the game:
+
+1. **I1, the pre-pass.** The depth pre-pass and its five companion targets are drawn once,
+   view-instanced, into upstream's 2-slice arrays (`prepass_arrays.cpp`, milestone 2), then each
+   slice is copied to its eye.
+   - The core loads the converted shaders by hash and makes a twin PSO per game PSO
+     (`ID3D12Device2::CreatePipelineState` with a 2-view `VIEW_INSTANCING` subobject, view i ->
+     render-target array slice i).
+   - In the region it sets the twin PSO and `SetViewInstanceMask(3)`; pass 2's pre-pass draws
+     are skipped.
+   - Check: eye 2's pre-pass slice against the real pass 2's targets (the dual pass is the
+     reference).
+2. **I2, the opaque scene.** The same for the main forward pass. Pixel shaders that read the
+   camera (fog, specular) get the same patch. Full-screen passes inside the scene run per view
+   on the array slices (their textures read as arrays: the patch's second form).
+3. **I3:** the remaining passes, with the walk itself once (`SceneRender` once, both eyes'
+   post runs after it), then the headset.
+
 ## Risks
 
 - The recorded packets may point into per-pass transient memory that is recycled before the
