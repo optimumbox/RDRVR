@@ -61,7 +61,7 @@ motion vectors) are still recorded; that is ~2.85 ms render + ~2.5 ms playback.
 - The grass and foliage resolves have twins again: eye 2 copies of Grass FS Colour / Light Multiply / Tree FS Colour
   (slots 17-19), their game view indices in rage_matrices rows 25/26 .w (14-bit fields), compared in view 1 by every
   converted shader (viewid_patch.py SCREEN_INDEX_FIELDS). Set `research\stereo_all13`. Headset: skip vs draw, the right
-  eye's grass and bushes the same (`research\grabr25`, cmp_draw_skip1_R.png).
+  eye's grass and bushes the same (`research\grab\vr25`, cmp_draw_skip1_R.png).
 - Still lost in eye 2 under the skip (no rage_matrices in those shaders, so no index channel): footprints
   (PSFootprintColor/Collector), light glows (PS_lightglow). PSMiragerSingle (heat haze) has rage_matrices and could take
   a field for its RenderMapBilinearSampler image (FullScreenCopy? unverified: it never drew in the tested views).
