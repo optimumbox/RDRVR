@@ -31,6 +31,8 @@ void before_draw(ID3D12GraphicsCommandList* cl);  // a draw in a region: the wal
 void note_bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int single,
                const D3D12_CPU_DESCRIPTOR_HANDLE* ds);
 std::string status();
+// "prepass grab <kind> <path>": both slices of a kind's array at the next view-instanced frame's publishes (RDA1 file)
+std::string grab(const std::string& kind, const std::string& path);
 // View-instanced stereo (stereo_vi.h): in a region of a view-instanced frame on this list, 1 (slice 0's: the draws go to
 // both slices) or 2 (slice 1's: the draws made in slice 0's are skipped), else 0. *all_arrays: every target bound now is
 // one of the six (only then can a view-instanced pipeline draw).

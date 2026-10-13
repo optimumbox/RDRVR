@@ -311,6 +311,88 @@ void end_region(ID3D12GraphicsCommandList* cl) {
 // game's barrier: the region's slice into the game's target (from `st`, its states per plane before the barrier), and,
 // in a view-instanced slice-0 region, slice 1 into eye 2's copy (left readable by the pixel shaders).
 constexpr D3D12_RESOURCE_STATES kReadable = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+// ---- "prepass grab <kind> <path>": both slices of a kind's array as the next view-instanced frame's slice-0 region
+// publishes them (plane 0; each publish in that region copies again, the last one's in the file): "RDA1", width,
+// height, footprint format, row bytes, then slice 0's rows and slice 1's (slice 1: what eye 2's copy got).
+std::atomic<int> g_grab_phase{0};  // 0 idle, 1 armed (kind g_grab_kind), 2 copied this frame, 3 to finish
+int g_grab_kind = -1;
+uint64_t g_grab_frame = 0;
+ID3D12Resource* g_grab_rb = nullptr;
+D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_grab_fp[2]{};
+UINT64 g_grab_row = 0;
+uint32_t g_grab_h = 0;
+std::string g_grab_path, g_grab_result;
+HANDLE g_grab_done = nullptr;
+void grab_tap(ID3D12GraphicsCommandList* cl, int k, ID3D12Resource* arr) {  // arr in COPY_SOURCE
+    const int ph = g_grab_phase.load(std::memory_order_acquire);
+    if (k != g_grab_kind || !(ph == 1 || (ph == 2 && g_grab_frame == state::presents.load())) || !g_r.vi || g_r.slice != 0) return;
+    D3D12_RESOURCE_DESC d = arr->GetDesc();
+    UINT rows[2];
+    UINT64 rb[2], total = 0;
+    const UINT first = 0;  // plane 0: subresources 0 and 1 (mip 0, slices 0 and 1)
+    g_dev->GetCopyableFootprints(&d, first, 2, 0, g_grab_fp, rows, rb, &total);
+    if (!g_grab_rb) {
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC r{};
+        r.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        r.Width = total;
+        r.Height = r.DepthOrArraySize = r.MipLevels = 1;
+        r.SampleDesc.Count = 1;
+        r.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &r, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_grab_rb))))
+            return;
+    }
+    for (UINT s = 0; s < 2; ++s) {
+        D3D12_TEXTURE_COPY_LOCATION dl{g_grab_rb, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+        dl.PlacedFootprint = g_grab_fp[s];
+        D3D12_TEXTURE_COPY_LOCATION sl{arr, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+        sl.SubresourceIndex = s;
+        d3d::raw_copy_region(cl, &dl, &sl);
+    }
+    g_grab_row = rb[0];
+    g_grab_h = rows[0];
+    g_grab_frame = state::presents.load();
+    g_grab_phase.store(2, std::memory_order_release);
+}
+std::string grab_finish() {
+    ID3D12CommandQueue* q = state::present_queue.load();
+    ID3D12Fence* fence = nullptr;
+    if (!q || FAILED(g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) return "ERROR no queue or fence";
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    q->Signal(fence, 1);
+    fence->SetEventOnCompletion(1, ev);
+    const bool done = WaitForSingleObject(ev, 2000) == WAIT_OBJECT_0;
+    CloseHandle(ev);
+    fence->Release();
+    if (!done) return "ERROR the copy timed out";
+    uint8_t* p = nullptr;
+    if (FAILED(g_grab_rb->Map(0, nullptr, reinterpret_cast<void**>(&p))) || !p) return "ERROR Map failed";
+    std::string result;
+    FILE* f = nullptr;
+    if (fopen_s(&f, g_grab_path.c_str(), "wb") != 0 || !f) {
+        result = "ERROR cannot open " + g_grab_path;
+    } else {
+        const uint32_t hdr[5] = {0x31414452u /* RDA1 */, g_grab_fp[0].Footprint.Width, g_grab_h, static_cast<uint32_t>(g_grab_fp[0].Footprint.Format),
+                                 static_cast<uint32_t>(g_grab_row)};
+        fwrite(hdr, 1, sizeof(hdr), f);
+        for (int s = 0; s < 2; ++s)
+            for (uint32_t y = 0; y < g_grab_h; ++y)
+                fwrite(p + g_grab_fp[s].Offset + static_cast<uint64_t>(y) * g_grab_fp[s].Footprint.RowPitch, 1, static_cast<size_t>(g_grab_row), f);
+        fclose(f);
+        result = "wrote " + g_grab_path + " (" + kNames[g_grab_kind] + ", both slices)";
+    }
+    D3D12_RANGE none{0, 0};
+    g_grab_rb->Unmap(0, &none);
+    return result;
+}
+void grab_frame_end(uint64_t) {
+    if (g_grab_phase.load(std::memory_order_acquire) == 2 && state::presents.load() > g_grab_frame + 1) {
+        g_grab_result = grab_finish();
+        g_grab_phase = 0;
+        SetEvent(g_grab_done);
+    }
+}
+
 void publish(ID3D12GraphicsCommandList* cl, int k, const D3D12_RESOURCE_STATES st[2]) {
     Arr& a = g_arr[k];
     if (!a.arr || !a.game) return;
@@ -346,6 +428,7 @@ void publish(ID3D12GraphicsCommandList* cl, int k, const D3D12_RESOURCE_STATES s
             d3d::raw_copy_region(cl, &dst, &src);
         }
     }
+    if (g_grab_phase.load(std::memory_order_relaxed)) grab_tap(cl, k, a.arr);
     d3d::raw_barrier(cl, n, post);
     g_publishes.fetch_add(1, std::memory_order_relaxed);
 }
@@ -1159,6 +1242,34 @@ void trace_clear(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE h, b
     log::info("[prepass] trace frame %llu draws %llu: clear %s %s%s", static_cast<unsigned long long>(state::presents.load()),
               static_cast<unsigned long long>(d3d::thread_draws()), depth ? "DSV" : "RTV", nm, g_active.load() ? " in a region" : "");
     (void)cl;
+}
+
+std::string grab(const std::string& kind, const std::string& path) {
+    static const char* const keys[kKinds] = {"depth", "collector", "velocity", "grasscolour", "grasslight", "tree", "light", "fsc", "react", "refr"};
+    int k = -1;
+    for (int i = 0; i < kKinds; ++i)
+        if (kind == keys[i]) k = i;
+    if (k < 0) return "ERROR kinds: depth collector velocity grasscolour grasslight tree light fsc react refr";
+    if (!g_dev || !g_arr[k].arr) return "ERROR that kind's array not made yet";
+    if (!g_grab_done) {
+        g_grab_done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        d3d::add_frame_end_listener(grab_frame_end);
+    }
+    if (g_grab_phase.load()) return "ERROR a grab is under way";
+    if (g_grab_rb && g_grab_kind != k) {
+        g_grab_rb->Release();
+        g_grab_rb = nullptr;
+    }
+    g_grab_kind = k;
+    g_grab_path = path;
+    ResetEvent(g_grab_done);
+    g_grab_phase.store(1, std::memory_order_release);
+    if (WaitForSingleObject(g_grab_done, 5000) != WAIT_OBJECT_0) {
+        int expected = 1;
+        g_grab_phase.compare_exchange_strong(expected, 0);
+        return "ERROR no view-instanced publish of that kind within 5 s";
+    }
+    return g_grab_result;
 }
 
 std::string status() {
