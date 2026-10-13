@@ -43,6 +43,12 @@ struct GameView {
     D3D12_SHADER_RESOURCE_VIEW_DESC d{};
 };
 std::unordered_map<ID3D12Resource*, std::vector<GameView>> g_views;  // each resource's views (where, as what; a few)
+// Which resource each recorded descriptor holds now: a descriptor the game writes again leaves its old resource's list.
+// Records are by address, so a resource created at a released one's address starts with none (forget_resource): a
+// stale view (2026-10-13, a BC3 texture's view taken for the depth buffer that took its address after DLSS's resize)
+// made an invalid descriptor for eye 2's depth and the device was removed.
+std::unordered_map<SIZE_T, ID3D12Resource*> g_cpu_owner;
+std::atomic<uint64_t> g_forgotten{0}, g_mismatched{0};
 // a depth-stencil format's stencil-only views (the depth's are plane 0)
 bool stencil_view(const D3D12_SHADER_RESOURCE_VIEW_DESC& d) {
     return d.Format == DXGI_FORMAT_X24_TYPELESS_G8_UINT || d.Format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
@@ -72,6 +78,17 @@ void STDMETHODCALLTYPE hk_CreateSrv(ID3D12Device* dev, ID3D12Resource* r, const 
     o_CreateSrv(dev, r, d, h);
     if (r && d) {
         std::lock_guard lock(g_mutex);
+        auto o = g_cpu_owner.find(h.ptr);
+        if (o != g_cpu_owner.end() && o->second != r) {
+            auto ov = g_views.find(o->second);
+            if (ov != g_views.end()) {
+                auto& l = ov->second;
+                for (size_t i = 0; i < l.size();)
+                    if (l[i].cpu == h.ptr) l.erase(l.begin() + static_cast<ptrdiff_t>(i));
+                    else ++i;
+            }
+        }
+        g_cpu_owner[h.ptr] = r;
         g_srv_desc[r] = *d;
         auto& v = g_views[r];
         bool have = false;
@@ -104,6 +121,43 @@ bool slot_free(int64_t index, const HeapInfo& h, char* why, size_t len) {
     return true;
 }
 
+// A view format the resource's format can take: the same, or of its typeless family (the depth formats' and the 8-bit
+// colour ones'; the game's screen images are of these)
+DXGI_FORMAT family(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        case DXGI_FORMAT_X24_TYPELESS_G8_UINT: return DXGI_FORMAT_R24G8_TYPELESS;
+        case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_D32_FLOAT: case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R32_UINT:
+        case DXGI_FORMAT_R32_SINT: return DXGI_FORMAT_R32_TYPELESS;
+        case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+        case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: return DXGI_FORMAT_R32G8X24_TYPELESS;
+        case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_FLOAT:
+            return DXGI_FORMAT_R16_TYPELESS;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+            return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+            return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        default: return f;
+    }
+}
+bool view_fits(const D3D12_SHADER_RESOURCE_VIEW_DESC& d, ID3D12Resource* r) {
+    const D3D12_RESOURCE_DESC rd = r->GetDesc();
+    return d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+           family(d.Format) == family(rd.Format);
+}
+// The plain view of an image's format: a depth format's depth plane
+DXGI_FORMAT plain_view_format(DXGI_FORMAT f) {
+    switch (family(f)) {
+        case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;
+        case DXGI_FORMAT_R32G8X24_TYPELESS: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_R16_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: return f == DXGI_FORMAT_B8G8R8A8_TYPELESS ? DXGI_FORMAT_B8G8R8A8_UNORM : f;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: return f == DXGI_FORMAT_R8G8B8A8_TYPELESS ? DXGI_FORMAT_R8G8B8A8_UNORM : f;
+        default: return f;
+    }
+}
+
 void write_pending(ID3D12DescriptorHeap* heap) {  // under g_mutex
     auto hi = g_heaps.find(heap);
     if (hi == g_heaps.end() || hi->second.base < 0) return;
@@ -125,18 +179,20 @@ void write_pending(ID3D12DescriptorHeap* heap) {  // under g_mutex
         }
         D3D12_SHADER_RESOURCE_VIEW_DESC d{};
         auto it = g_srv_desc.find(p.game);
-        bool own = it != g_srv_desc.end();
+        bool own = it != g_srv_desc.end() && !stencil_view(it->second) && view_fits(it->second, p.e2);
         if (own) d = it->second;
         auto gv = g_views.find(p.game);  // (a depth image: its depth view, not its stencil's)
         if (gv != g_views.end())
             for (const GameView& g : gv->second)
-                if (!stencil_view(g.d)) {
+                if (!stencil_view(g.d) && view_fits(g.d, p.e2)) {
                     d = g.d;
                     own = true;
                     break;
                 }
-        if (!own) {  // (not seen: a plain 2D view of the copy's format)
-            d.Format = p.e2->GetDesc().Format;
+        if (!own) {  // (not seen, or no view that fits the copy: a plain 2D view of the copy's format)
+            if (it != g_srv_desc.end() || gv != g_views.end()) g_mismatched.fetch_add(1, std::memory_order_relaxed);
+            d = D3D12_SHADER_RESOURCE_VIEW_DESC{};
+            d.Format = plain_view_format(p.e2->GetDesc().Format);
             d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             d.Texture2D.MipLevels = 1;
@@ -211,6 +267,22 @@ void STDMETHODCALLTYPE hk_SetTable(ID3D12GraphicsCommandList* cl, UINT param, D3
 
 }  // namespace
 
+void forget_resource(ID3D12Resource* r) {
+    if (!r) return;
+    std::lock_guard lock(g_mutex);
+    auto v = g_views.find(r);
+    const bool had = v != g_views.end() || g_srv_desc.count(r);
+    if (v != g_views.end()) {
+        for (const GameView& g : v->second) {
+            auto o = g_cpu_owner.find(g.cpu);
+            if (o != g_cpu_owner.end() && o->second == r) g_cpu_owner.erase(o);
+        }
+        g_views.erase(v);
+    }
+    g_srv_desc.erase(r);
+    if (had) g_forgotten.fetch_add(1, std::memory_order_relaxed);
+}
+
 void eye2_texture(int slot, ID3D12Resource* e2, ID3D12Resource* game) {
     std::lock_guard lock(g_mutex);
     bool found = false;
@@ -270,9 +342,10 @@ bool heap_ready() {
 
 std::string heap_status() {
     std::lock_guard lock(g_mutex);
-    char b[300];
-    std::snprintf(b, sizeof(b), "eye 2's views: %llu written, %llu refused, %zu images | table binds %llu (outside their heap %llu) | %s",
-                  static_cast<unsigned long long>(g_written.load()), static_cast<unsigned long long>(g_refused.load()), g_pending.size(),
+    char b[400];
+    std::snprintf(b, sizeof(b), "eye 2's views: %llu written, %llu refused, %llu plain (no fitting game view), %zu images, %llu records dropped (new resources) | table binds %llu (outside their heap %llu) | %s",
+                  static_cast<unsigned long long>(g_written.load()), static_cast<unsigned long long>(g_refused.load()),
+                  static_cast<unsigned long long>(g_mismatched.load()), g_pending.size(), static_cast<unsigned long long>(g_forgotten.load()),
                   static_cast<unsigned long long>(g_table_binds.load()), static_cast<unsigned long long>(g_outside.load()), g_why);
     std::string out = b;
     for (auto& [heap, h] : g_heaps) {

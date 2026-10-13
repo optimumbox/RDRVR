@@ -46,6 +46,8 @@ constexpr int kDepthBufferSlot = 16;  // = tools/sp/dxil/viewid_patch.py DEPTH_B
 // The bindless table index of the game's own (depth, not stencil) view of the image registered for `slot`, -1 unknown.
 int64_t game_view_index(int slot);
 void install_device_hooks(ID3D12Device* dev);           // CreateShaderResourceView (the game's views, for eye 2's)
+// A resource just created (d3d_hooks): views recorded for an earlier resource at its address are dropped
+void forget_resource(ID3D12Resource* r);
 void install_list_hooks(ID3D12GraphicsCommandList* cl);  // SetDescriptorHeaps, SetGraphicsRootDescriptorTable (the table)
 bool main_pass();  // [Stereo] ViMain
 std::string heap_status();  // "vi heap": eye 2's views

@@ -634,6 +634,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateCommittedResource(ID3D12Device* dev, const D3
                                                      const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st,
                                                      const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
     HRESULT hr = o_CreateCommittedResource(dev, hp, hf, d, st, cv, riid, out);
+    if (SUCCEEDED(hr) && out && *out && riid == __uuidof(ID3D12Resource)) vi::forget_resource(static_cast<ID3D12Resource*>(*out));
     if (SUCCEEDED(hr) && out && *out && hp && hp->Type == D3D12_HEAP_TYPE_UPLOAD && ring_probe::enabled()) {
         ID3D12Resource* r = nullptr;
         if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&r))) && r) {
@@ -652,6 +653,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateCommittedResource(ID3D12Device* dev, const D3
 HRESULT STDMETHODCALLTYPE hk_CreatePlacedResource(ID3D12Device* dev, ID3D12Heap* heap, UINT64 off, const D3D12_RESOURCE_DESC* d,
                                                   D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
     HRESULT hr = o_CreatePlacedResource(dev, heap, off, d, st, cv, riid, out);
+    if (SUCCEEDED(hr) && out && *out && riid == __uuidof(ID3D12Resource)) vi::forget_resource(static_cast<ID3D12Resource*>(*out));
     if (SUCCEEDED(hr) && out && *out && heap && ring_probe::enabled() && heap->GetDesc().Properties.Type == D3D12_HEAP_TYPE_UPLOAD) {
         ID3D12Resource* r = nullptr;
         if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&r))) && r) {
