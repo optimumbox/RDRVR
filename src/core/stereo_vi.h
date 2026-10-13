@@ -30,7 +30,8 @@ ID3D12PipelineState* on_set_pso(ID3D12GraphicsCommandList* cl, ID3D12PipelineSta
 void on_reset(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps);
 bool before_draw(ID3D12GraphicsCommandList* cl);
 bool skip_clear(ID3D12GraphicsCommandList* cl);
-bool wanted();  // this frame's pre-pass may draw both eyes (configured, switched on, twins made)
+bool wanted();      // this frame's pre-pass may draw both eyes (configured, switched on, twins made)
+bool configured();  // [Stereo] ViPrepass on and its prerequisites met
 std::string command(const std::vector<std::string>& t);
 
 }  // namespace rdrvr::vi

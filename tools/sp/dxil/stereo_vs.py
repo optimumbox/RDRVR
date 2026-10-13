@@ -58,15 +58,16 @@ def main():
                     report.append(f'{kind} {h} refused: {e}')
                     counts['refused'] += 1
                 continue
-            ll, c1, bc, bc2, fin = (t / f'{kind}{h}{s}' for s in ('.ll', '.1.dxbc', '.bc', '.2.bc', '.dxil'))
+            ll, c1, bc, bc2, unsigned, fin = (t / f'{kind}{h}{s}' for s in ('.ll', '.1.dxbc', '.bc', '.2.bc', '.u.dxil', '.dxil'))
             ll.write_text(patched, encoding='utf-8', newline='\n')
             steps = [
                 ('dxa', [dxa, ll, '-o', c1], None),
                 ('extract', [dxa, c1, '-extractpart=module', '-o', bc], None),
                 # dxopt loads dxcompiler.dll from its own folder: run it there, with absolute paths
                 ('viewid-state', [dxopt, f'-o={bc2}', bc, '-hlsl-dxilload', '-viewid-state', '-hlsl-dxilemit'], bin_dir),
-                ('dxa 2', [dxa, bc2, '-o', fin], None),
-                ('dxv', [a.dxv, fin], None),
+                ('dxa 2', [dxa, bc2, '-o', unsigned], None),
+                # the retail validator validates and signs (the runtime refuses an unsigned container: E_INVALIDARG)
+                ('dxv', [a.dxv, unsigned, f'-o={fin}'], None),
             ]
             failed = None
             for name, cmd, cwd in steps:
@@ -78,7 +79,12 @@ def main():
                 report.append(f'{kind} {h} failed {failed}')
                 counts['failed'] += 1
                 continue
-            (out / f'{kind}_{h}.dxil').write_bytes(fin.read_bytes())
+            signed = fin.read_bytes() if fin.exists() else b''
+            if len(signed) < 20 or signed[4:20] == bytes(16):
+                report.append(f'{kind} {h} failed sign: the container digest is empty')
+                counts['failed'] += 1
+                continue
+            (out / f'{kind}_{h}.dxil').write_bytes(signed)
             report.append(f'{kind} {h} ok ({n} row reads{"; eye 1 motion vectors" if approx else ""})')
             counts['ok'] += 1
     (out / 'ps_safe.txt').write_text(''.join(x + '\n' for x in safe), encoding='utf-8')

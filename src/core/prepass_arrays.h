@@ -44,6 +44,8 @@ bool views_wanted();
 // the render thread, pass 1: vp2's +0xc0 (rotation-only VP) and +0x140 (view inverse); prev_vp: eye 2's gPrevViewProj
 // (the TAA update's +0x4f0) or nullptr (no jitter)
 void set_eye2(const void* vp2, const void* prev_vp);
+// Before set_eye2: the two eyes' camera positions (world), for the view-instanced pre-pass's eye-2 rows
+void set_eye2_offset(const float* eye1, const float* eye2);
 std::string views_status();
 void views_size(bool grown);  // the test's: the two declared sizes grown or as the game's (from the next pass 1)
 // A trace of the frames after "prepass on" (or "prepass trace"): every bind, clear and barrier of the six targets

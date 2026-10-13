@@ -292,6 +292,8 @@ struct Rows {
 Rows g_seen[2];          // after the walk, pass 1 and pass 2 (the game's own)
 float g_e2_wv[16], g_e2_vi[16], g_e2_pvp[16];  // pass 1's prediction of eye 2's
 bool g_e2_ok = false, g_e2_pvp_ok = false;
+float g_e2_off[3] = {0, 0, 0};  // eye 1's camera position less eye 2's (set_eye2_offset, before set_eye2)
+bool g_e2_off_ok = false;
 uint64_t g_e2_frame = ~0ull;
 struct Stats {
     uint64_t frames = 0, refused = 0;
@@ -758,7 +760,21 @@ void set_eye2(const void* vp2, const void* prev_vp) {
     g_e2_ok = read_raw(reinterpret_cast<uintptr_t>(v + 0xc0), g_e2_wv, 64) && read_raw(reinterpret_cast<uintptr_t>(v + 0x140), g_e2_vi, 64);
     g_e2_pvp_ok = prev_vp && read_raw(reinterpret_cast<uintptr_t>(prev_vp), g_e2_pvp, 64);
     g_e2_frame = state::presents.load();
-    if (g_e2_ok && g_views_write.load(std::memory_order_relaxed) && g_grow_state >= 0) write_eye2(g_e2_wv, g_e2_vi, g_e2_pvp_ok ? g_e2_pvp : nullptr);
+    if (g_e2_ok && g_views_write.load(std::memory_order_relaxed) && g_grow_state >= 0) {
+        // View-instanced draws (stereo_vi.h) share pass 1's per-draw rows, whose world matrices are relative to eye 1's
+        // camera: eye 2's gWorldView then also moves by eye 1 - eye 2 (row-vector p (T M): row 3 += d x M's rows 0-2).
+        // The comparison with the game's pass 2 (observe_after_walk) keeps the untranslated prediction.
+        float wv[16];
+        std::memcpy(wv, g_e2_wv, sizeof(wv));
+        if (g_e2_off_ok && vi::configured())
+            for (int c = 0; c < 4; ++c) wv[12 + c] += g_e2_off[0] * wv[c] + g_e2_off[1] * wv[4 + c] + g_e2_off[2] * wv[8 + c];
+        write_eye2(wv, g_e2_vi, g_e2_pvp_ok ? g_e2_pvp : nullptr);
+    }
+    g_e2_off_ok = false;
+}
+void set_eye2_offset(const float* eye1, const float* eye2) {
+    for (int i = 0; i < 3; ++i) g_e2_off[i] = eye1[i] - eye2[i];
+    g_e2_off_ok = true;
 }
 void views_size(bool grown) { g_size_want = grown ? 1 : 0; }
 std::string views_status() {

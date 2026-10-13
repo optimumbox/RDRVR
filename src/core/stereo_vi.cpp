@@ -353,6 +353,8 @@ void on_pipeline(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d,
     enqueue(raw);
 }
 
+bool configured() { return g_configured.load(std::memory_order_relaxed); }
+
 bool wanted() { return g_configured.load(std::memory_order_relaxed) && g_on.load(std::memory_order_relaxed) && g_made.load() > 0; }
 
 ID3D12PipelineState* on_set_pso(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps) {
