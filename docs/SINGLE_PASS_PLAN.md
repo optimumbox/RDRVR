@@ -309,3 +309,30 @@ under DLSS.
   `ring_probe` measures it.
 - Upstream moves fast (several releases a day). Keep the fork's changes in new files with thin
   hooks into `camera_lever.cpp` so rebases stay small.
+
+## I2 (the view-instanced main pass): first running build, 2026-10-13
+
+Flat test, Armadillo, `double on 0.5`, [Stereo] ViMain=1, shaders `research/stereo_all4` (271 converted, 180 safe,
+0 refused). Every draw of the shared region is made once for both eyes (`vi plain`: 0 pipelines left); the right eye's
+geometry, lighting and sun shadows match a two-pass frame (eyecap on6 vs off6; `prepass grab light`: the light
+buffers' means 44.7 / 41.0, unlit 68 % / 71 %).
+
+What it took, beyond the commit log:
+- the region ends with every scene (a single pass's region never ended and the arrays stood down at load);
+- gWorldViewProj (rage_matrices rows 8-11, per draw) built in view 1 from the draw's gWorldSingle, eye 2's camera and
+  eye 2's gWorldView; inverse view-projections ($Globals WorldViewProjInverse...) as
+  inv(gWorldView2) x T(c2 - c1) x gWorldView1 x X1, inv(gWorldView2) packed in rows 29-31 (rage_matrices grown to 0x200);
+- rage_shadowmap_common is shared (pass 1's shadow maps serve both eyes); distance scalars named "Camera" are shared;
+- the scene depth itself gets an eye-2 copy (slot 16): the light passes read it by an index of their own; view 1
+  compares each texture index with the game's depth view's (row 30 .w);
+- **a global_textures slot is the pass's image, not a fixed one**: slot 15 is the scene depth in the main pass but the
+  sun's shadow map (DepthTextureSampler0, a comparison sampler) in the light pass. Redirecting by slot number gave the
+  right eye no sun shadows; the converter now redirects a slot only when the shader names it as a screen image.
+
+Tools: `vi plain [reset]` (the region's eye-1-only draws), `prepass grab <kind> <path>` + `tools/sp/rda2png.py` (both
+slices of a pre-pass array), `vi load <dir> all` (remake every twin from reconverted shaders, no restart).
+
+Performance: not measured properly yet. Playback draws fell 16.5k -> 10.6k a frame, but frame time in the free camera
+rose (14.3 -> 16.0 ms, GPU-bound, and the view moved between windows). Suspects: the publishes' full-screen copies (the
+depth's two planes at each write->read barrier, now also into eye 2's copies). Next: GPU timestamps around the regions
+and the publishes, A/B in a fixed view, then fewer copies (publish once per region end where the game allows).
