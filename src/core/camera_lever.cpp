@@ -532,8 +532,10 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
     }
     if (cam) ring_probe::matrix_expect(pass_eye, copy + 12, other + 12, cam + 12);
     const bool first_pass = pass_eye == (g_swap.load(std::memory_order_relaxed) ? 1 : 0);
-    // A view-instanced frame (hk_Regenerate): pass 1 keeps both eyes' positions; eye 2's private viewport takes eye 1's
-    // position, as pass 2 will, so its rows, its jitter and its TAA history are pass 2's own
+    // A view-instanced frame: pass 1 keeps both eyes' positions (the camfix switch's pass 2). The world matrices are absolute:
+    // a vertex shader subtracts gViewInverse's position (rage_matrices row 15) and applies gWorldView (rows 4-7, the
+    // view-projection without the camera's translation), so eye 2's private viewport stands at eye 2 and its rows are
+    // exactly pass 2's (2026-10-13, VSFlattenTerrain's position math; the earlier "camera-relative world" reading was wrong)
     alignas(16) float other_at_c1[16];
     std::memcpy(other_at_c1, other, sizeof(other_at_c1));
     if (t_vi_frame && first_pass && cam) {
@@ -547,7 +549,7 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
         const float* a2 = views[pass_eye == 1 ? 0 : 1].fov;
         std::memcpy(g_eye2_vp, g_saved_vp, kViewportSize);
         apply_tangents(g_eye2_vp, std::tan(a2[0]), std::tan(a2[1]), std::tan(a2[2]), std::tan(a2[3]));
-        o_SetCamera(g_eye2_vp, t_vi_frame ? other_at_c1 : other);
+        o_SetCamera(g_eye2_vp, other);
         prepass::set_eye2_offset(copy + 12, other + 12);
         prepass::set_eye2(g_eye2_vp, nullptr);  // (without jitter; the TAA update's jittered rows replace these)
         g_eye2_frame = state::presents.load();
@@ -555,7 +557,7 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
         // the flat double pass ("double on <ipd>", no headset): eye 2's viewport is the frame's with the other eye's
         // camera, so the view-instanced pre-pass can be tested on the monitor
         std::memcpy(g_eye2_vp, g_saved_vp, kViewportSize);
-        o_SetCamera(g_eye2_vp, t_vi_frame ? other_at_c1 : other);
+        o_SetCamera(g_eye2_vp, other);
         prepass::set_eye2_offset(copy + 12, other + 12);
         prepass::set_eye2(g_eye2_vp, nullptr);
         g_eye2_frame = state::presents.load();
@@ -639,7 +641,7 @@ Regenerate_t o_Regenerate = nullptr;
 void hk_Regenerate(void* vp, char push) {
     o_Regenerate(vp, push);
     if (t_vi_fix) vi_log("Regenerate", vp);
-    if (!((t_vi_fix && vp == t_scene_vp) || (t_vi_frame && vp == g_eye2_vp))) return;
+    if (!(t_vi_fix && vp == t_scene_vp)) return;
     float* m = reinterpret_cast<float*>(static_cast<char*>(vp) + 0xc0);
     const float d[3] = {t_vi_c1[0] - t_vi_c2[0], t_vi_c1[1] - t_vi_c2[1], t_vi_c1[2] - t_vi_c2[2]};
     for (int c = 0; c < 4; ++c) m[12 + c] += d[0] * m[c] + d[1] * m[4 + c] + d[2] * m[8 + c];

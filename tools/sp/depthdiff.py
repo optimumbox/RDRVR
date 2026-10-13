@@ -15,7 +15,7 @@ def read(path):
     if magic != b'RDZ1':
         raise ValueError(f'{path}: not RDZ1')
     v = np.frombuffer(b, dtype='<u4', count=w * h, offset=16).reshape(h, w)
-    if fmt in (45, 44, 46, 47):  # D24S8 family: depth in the low 24 bits
+    if fmt in (39, 44, 45, 46, 47):  # D24S8 copied as typeless 32-bit: depth in the low 24 bits
         d = (v & 0xFFFFFF).astype(np.float64) / 0xFFFFFF
     else:  # R32 float family
         d = v.view('<f4').astype(np.float64)

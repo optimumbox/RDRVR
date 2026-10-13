@@ -883,11 +883,7 @@ void set_eye2(const void* vp2, const void* prev_vp) {
     g_e2_ok = read_raw(reinterpret_cast<uintptr_t>(v + 0xc0), g_e2_wv, 64) && read_raw(reinterpret_cast<uintptr_t>(v + 0x140), g_e2_vi, 64);
     g_e2_pvp_ok = prev_vp && read_raw(reinterpret_cast<uintptr_t>(prev_vp), g_e2_pvp, 64);
     g_e2_frame = state::presents.load();
-    // A view-instanced frame (camera_lever.cpp hk_Regenerate): vp2 stands at eye 1's position with its view-projection
-    // already moved by eye 1 - eye 2, as pass 2 will (the world matrices both share are eye 1's); its camera position
-    // goes back to eye 2's for the shaders (gViewInverse), as pass 2's SetCamera hook does.
-    if (g_e2_ok && t_latched_vi && g_e2_off_ok)
-        for (int i = 0; i < 3; ++i) g_e2_vi[12 + i] -= g_e2_off[i];
+    // (vp2 is eye 2's own viewport: the shaders take the camera's position from gViewInverse, so its rows are pass 2's)
     if (g_e2_ok && g_views_write.load(std::memory_order_relaxed) && g_grow_state >= 0) {
         write_eye2(g_e2_wv, g_e2_vi, g_e2_pvp_ok ? g_e2_pvp : nullptr);
         if (t_latched_vi) write_prev_delta(g_e1_pvp_ok ? g_e1_pvp : nullptr, g_e2_pvp_ok ? g_e2_pvp : nullptr);

@@ -1,6 +1,6 @@
-﻿<#
+<#
 .SYNOPSIS
-    A flat test session: deploy this tree's build with the test switches, start the game, enter the save; or end it
+    A flat test session: deploy this tree's build with the test switches and start the game (the player loads the save); or end it
     (close the game, put the release back, remove the test files).
 
 .EXAMPLE
@@ -50,9 +50,6 @@ $ExtraIni
     # the front end: the mod's device is up, then a few seconds for the menu
     do { Start-Sleep 2 } until ((Test-Path $log) -and (Get-Item $log).LastWriteTime -gt $t0 -and
                                 (Select-String -Path $log -Pattern '\[vi\] view instancing tier' -Quiet))
-    Start-Sleep 35
-    & (Join-Path $here 'keys.ps1') '{ENTER}'
-    Start-Sleep 25
-    'session started (flat, in the save)'
+    'game launched (flat): at the menu; the player loads the save'
 }
 
