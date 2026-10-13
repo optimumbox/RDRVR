@@ -645,6 +645,20 @@ std::string execute(const std::vector<std::string>& t) {
         frame_probe::game_frame_limit(t.size() >= 2 ? t[1].c_str() : "", st, sizeof(st));
         return st;
     }
+    if (c == "probe" && t.size() >= 2 && t[1] == "delta") {
+        // probe delta: the per-frame split since the last "probe delta" (any mode, flat included: perf's window
+        // follows the XR frames)
+        static frame_probe::Snap last{};
+        static bool have = false;
+        frame_probe::Snap now{};
+        frame_probe::snap(&now);
+        char line[1024];
+        if (have) frame_probe::format(last, now, line, sizeof(line));
+        else std::snprintf(line, sizeof(line), "probe delta: the window starts now");
+        last = now;
+        have = true;
+        return line;
+    }
     if (c == "probe" && t.size() >= 2) {  // probe on|off: the single-pass probe's timers (frame_probe.h)
         return frame_probe::set_on(t[1] == "on") ? "probe " + t[1] : "ERROR the probe is not installed ([XR] TimingProbe=0)";
     }
