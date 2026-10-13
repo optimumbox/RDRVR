@@ -8,6 +8,7 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <algorithm>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -260,6 +261,19 @@ ID3D12PipelineState* twin_of(ID3D12PipelineState* game) {
     return t && k->made_frame.load(std::memory_order_relaxed) < state::presents.load(std::memory_order_relaxed) ? t : nullptr;
 }
 
+// ---- "vi plain": slice 0's region's draws made as the game's (eye 1 only), by pipeline and whether all targets were arrays
+struct PlainStat {
+    uint64_t n = 0, n_arrays = 0;
+};
+std::mutex g_plain_mutex;
+std::unordered_map<ID3D12PipelineState*, PlainStat> g_plain;
+void note_plain(ID3D12PipelineState* game, bool arrays) {
+    std::lock_guard lock(g_plain_mutex);
+    PlainStat& st = g_plain[game];
+    ++st.n;
+    if (arrays) ++st.n_arrays;
+}
+
 // ---- the playback thread's lists
 struct ListState {
     ID3D12PipelineState* game = nullptr;   // the game's pipeline (set or the Reset's)
@@ -415,6 +429,11 @@ bool before_draw(ID3D12GraphicsCommandList* cl) {
     }
     if (s.game) bind(cl, s, p);  // (out of a region a twin left bound goes back to the game's)
     if (region == 1) (p != s.game ? g_draws_both : g_draws_plain).fetch_add(1, std::memory_order_relaxed);
+    if (region == 1 && p == s.game) {
+        bool arrays = false;
+        prepass::vi_region(cl, &arrays);
+        note_plain(s.game, arrays);
+    }
     return false;
 }
 
@@ -472,6 +491,31 @@ std::string command(const std::vector<std::string>& t) {
         return std::string("vi ") + sub + " (from the next pre-pass)";
     }
     if (sub == "heap") return heap_status();
+    if (sub == "plain") {  // vi plain [reset]: slice 0's region's eye-1-only draws, most first
+        std::vector<std::pair<ID3D12PipelineState*, PlainStat>> v;
+        {
+            std::lock_guard lock(g_plain_mutex);
+            if (t.size() >= 3 && t[2] == "reset") {
+                g_plain.clear();
+                return "reset";
+            }
+            v.assign(g_plain.begin(), g_plain.end());
+        }
+        std::sort(v.begin(), v.end(), [](auto& x, auto& y) { return x.second.n > y.second.n; });
+        std::string r = std::to_string(v.size()) + " pipelines: ";
+        AcquireSRWLockShared(&g_lock);
+        for (size_t i = 0; i < v.size() && i < 40; ++i) {
+            auto it = g_by_pso.find(v[i].first);
+            const Kept* k = it == g_by_pso.end() ? nullptr : it->second;
+            char x[256];
+            std::snprintf(x, sizeof(x), "%llu (all arrays %llu) vs %s ps %s %s; ", static_cast<unsigned long long>(v[i].second.n),
+                          static_cast<unsigned long long>(v[i].second.n_arrays), k ? hex(k->vs_hash).c_str() : "?",
+                          k ? hex(k->ps_hash).c_str() : "?", k ? (k->twin.load() ? "twin" : k->why) : "not kept");
+            r += x;
+        }
+        ReleaseSRWLockShared(&g_lock);
+        return r;
+    }
     if (sub == "camfix" && t.size() >= 3) {
         camera_lever::set_vi_camfix(t[2] == "on");
         return std::string("pass 2 from eye 1's position: ") + t[2];
