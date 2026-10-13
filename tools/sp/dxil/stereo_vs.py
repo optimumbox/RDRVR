@@ -1,0 +1,76 @@
+"""stereo_vs.py: the game's vertex shaders made view-instanced, in bulk.
+
+For each <hash>.dxbc in IN (the core's "pso dump" output): dumpbin -> viewid_patch -> dxa (assemble) -> extract the
+module -> dxopt (-viewid-state: the ViewID dependency tables the validator checks) -> dxa -> dxv (the retail
+validator). Writes OUT/vs_<hash>.dxil for each shader that validates, and OUT/report.txt (one line per shader:
+ok, refused with the reason, or failed with the stage).
+
+    python stereo_vs.py <in dir> <out dir> [--dxc-build research\\dxc-build\\bin] [--dxv research\\dxc\\x\\bin\\x64\\dxv.exe]
+"""
+import argparse
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+import viewid_patch  # noqa: E402
+
+ROOT = pathlib.Path(__file__).resolve().parents[3]
+
+
+def run(args, cwd=None):
+    r = subprocess.run([str(a) for a in args], cwd=cwd, capture_output=True, text=True, errors='replace')
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('src')
+    ap.add_argument('dst')
+    ap.add_argument('--dxc-build', default=ROOT / 'research' / 'dxc-build' / 'bin')
+    ap.add_argument('--dxv', default=ROOT / 'research' / 'dxc' / 'x' / 'bin' / 'x64' / 'dxv.exe')
+    a = ap.parse_args()
+    bin_dir = pathlib.Path(a.dxc_build).resolve()
+    dxc, dxa, dxopt = bin_dir / 'dxc.exe', bin_dir / 'dxa.exe', bin_dir / 'dxopt.exe'
+    out = pathlib.Path(a.dst)
+    out.mkdir(parents=True, exist_ok=True)
+    report, counts = [], {'ok': 0, 'refused': 0, 'failed': 0}
+    with tempfile.TemporaryDirectory() as tmp:
+        t = pathlib.Path(tmp)
+        for f in sorted(pathlib.Path(a.src).glob('*.dxbc')):
+            h = f.stem.split('_')[-1]
+            code, text = run([dxc, '-dumpbin', f])
+            if code:
+                report.append(f'{h} failed dumpbin: {text[:200]}'); counts['failed'] += 1; continue
+            try:
+                patched, n = viewid_patch.patch(text)
+            except viewid_patch.Refused as e:
+                report.append(f'{h} refused: {e}'); counts['refused'] += 1; continue
+            ll, c1, bc, bc2, fin = (t / f'{h}{s}' for s in ('.ll', '.1.dxbc', '.bc', '.2.bc', '.dxil'))
+            ll.write_text(patched, encoding='utf-8', newline='\n')
+            steps = [
+                ('dxa', [dxa, ll, '-o', c1], None),
+                ('extract', [dxa, c1, '-extractpart=module', '-o', bc], None),
+                # dxopt loads dxcompiler.dll from its own folder: run it there, with absolute paths
+                ('viewid-state', [dxopt, f'-o={bc2}', bc, '-hlsl-dxilload', '-viewid-state', '-hlsl-dxilemit'], bin_dir),
+                ('dxa 2', [dxa, bc2, '-o', fin], None),
+                ('dxv', [a.dxv, fin], None),
+            ]
+            failed = None
+            for name, cmd, cwd in steps:
+                code, text = run(cmd, cwd)
+                if code or (name == 'dxv' and 'Validation succeeded' not in text):
+                    failed = f'{name}: {text.splitlines()[0] if text else code}'
+                    break
+            if failed:
+                report.append(f'{h} failed {failed}'); counts['failed'] += 1; continue
+            (out / f'vs_{h}.dxil').write_bytes(fin.read_bytes())
+            report.append(f'{h} ok ({n} row reads)'); counts['ok'] += 1
+    (out / 'report.txt').write_text('\n'.join(report) + '\n', encoding='utf-8')
+    print(f"ok {counts['ok']}, refused {counts['refused']}, failed {counts['failed']} -> {out}")
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
