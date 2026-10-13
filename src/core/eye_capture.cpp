@@ -21,6 +21,7 @@ std::atomic<int> g_period_s{0};  // 0: off
 std::atomic<bool> g_thread{false};
 std::atomic<uint64_t> g_taken{0}, g_failed{0};
 std::string g_last = "none yet";
+std::atomic<bool> g_async{false};
 
 std::string default_dir() {
     wchar_t w[MAX_PATH];
@@ -79,6 +80,22 @@ void start(int seconds, const std::string& dir) {
 void init() {
     const int s = config::get_int("Debug", "EyeCapture", 0);
     if (s > 0) start(s, config::get_string("Debug", "EyeCaptureDir", ""));
+}
+
+bool take_async(void (*done)(bool ok)) {
+    if (g_async.exchange(true)) return false;
+    std::thread([done] {
+        std::string dir;
+        {
+            std::lock_guard lock(g_mutex);
+            dir = g_dir.empty() ? default_dir() : g_dir;
+        }
+        const std::string r = take(dir);
+        const bool ok = r.find("NOT MEASURED") == std::string::npos && r.find("ERROR") == std::string::npos;
+        if (done) done(ok);
+        g_async = false;
+    }).detach();
+    return true;
 }
 
 std::string command(const std::vector<std::string>& t) {

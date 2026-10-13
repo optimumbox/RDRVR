@@ -34,6 +34,13 @@ def to_rgb(w, fmt, a):
     if fmt in (10,):  # rgba16f
         px = a[:, :w * 8].view(np.float16).reshape(a.shape[0], w, 4).astype(np.float32)
         return np.clip(px[..., :3] * 255, 0, 255).astype(np.uint8), px
+    if fmt == 34:  # rg16f (velocity): x in red, y in green, around grey; scaled to the 99th percentile of |v|
+        px = a[:, :w * 4].view(np.float16).reshape(a.shape[0], w, 2).astype(np.float32)
+        s = max(float(np.nanpercentile(np.abs(px), 99)), 1e-6)
+        rgb = np.zeros(px.shape[:2] + (3,), np.uint8)
+        rgb[..., :2] = np.clip(128 + np.nan_to_num(px) / s * 127, 0, 255).astype(np.uint8)
+        rgb[..., 2] = 128
+        return rgb, px
     if fmt in (39, 40, 41, 45, 46, 19, 20):  # 32-bit: depth-ish, shown as normalised grey
         px = a[:, :w * 4].view(np.uint32).reshape(a.shape[0], w)
         v = (px & 0xffffff).astype(np.float64) if fmt in (39, 45, 46) else px.view(np.float32).astype(np.float64)

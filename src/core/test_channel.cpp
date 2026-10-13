@@ -748,6 +748,7 @@ std::string execute(const std::vector<std::string>& t) {
         if (t.size() >= 2 && t[1] == "trace") prepass::trace_start(t.size() >= 3 ? std::atoi(t[2].c_str()) : 2);
         if (t.size() >= 4 && t[1] == "views" && t[2] == "size") prepass::views_size(t[3] == "on");
         if (t.size() >= 2 && t[1] == "views") return prepass::views_status();
+        if (t.size() >= 2 && t[1] == "mv") return prepass::mv_text();
         return prepass::status();
     }
     if (c == "pso") {

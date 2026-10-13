@@ -711,6 +711,8 @@ Rows g_seen[2];          // after the walk, pass 1 and pass 2 (the game's own)
 float g_e2_wv[16], g_e2_vi[16], g_e2_pvp[16];  // pass 1's prediction of eye 2's
 bool g_e2_ok = false, g_e2_pvp_ok = false;
 float g_e2_off[3] = {0, 0, 0};  // eye 1's camera position less eye 2's (set_eye2_offset, before set_eye2)
+float g_e2_off_prev[3] = {0, 0, 0};  // the same, the previous frame's (D's move between the eyes' previous cameras)
+uint64_t g_e2_off_frame = 0;
 bool g_e2_off_ok = false;
 float g_e1_pvp[16];       // eye 1's gPrevViewProj this frame (taa.cpp, before eye 2's update): D's first factor
 bool g_e1_pvp_ok = false;
@@ -922,6 +924,17 @@ void write_inv_wv2(const float* wv) {
     write_raw(g_b1.block + 0x1d0, rows, sizeof(rows));
     ++g_inv_written;
 }
+// The velocity pass (rdr2_taa's PSGenerateVelocityBuffer, view-instanced: tools/sp/dxil/viewid_patch.py patch_ndc) reads
+// eye 2's NDCToPrevNDC and depth from its effect's $Globals: the block grown 0xf0 -> 0x100 (the size it is uploaded
+// with), the matrix's x, y and w columns in its padding (kNdcSpare, row-major (row, component)), and the game's two
+// depth views' indices plus one at +0x14 (the depth buffer, eye 2's copy at slot 16) and +0x18 (the depth resolve,
+// slot 15). The game writes its variables only, never the padding.
+Grown g_taa;
+int g_taa_state = 0;  // 0 not tried, 1 grown, -1 refused
+uint64_t g_ndc_written = 0, g_ndc_eye1 = 0;
+float g_ndc_last[16] = {};
+constexpr uint32_t kTaaGlobalsSize = 0xf0;  // (the 228 bytes rounded to a row)
+constexpr int kNdcSpare[12][2] = {{15, 0}, {15, 1}, {15, 2}, {15, 3}, {7, 1}, {7, 2}, {7, 3}, {14, 1}, {14, 2}, {14, 3}, {12, 2}, {12, 3}};
 void write_eye2(const float* wv, const float* vi, const float* pvp) {
     if (!ensure_grown()) return;
     apply_size_want();
@@ -953,10 +966,22 @@ void write_prev_delta(const float* p1, const float* p2) {
         double a[16], inv[16];
         for (int i = 0; i < 16; ++i) a[i] = p1[i];
         if (invert4(a, inv)) {
+            // The previous view-projections are rotation-only: the camera's translation is in each draw's previous
+            // world, eye 1's previous position (pass 1's). So D = inverse(P1) x T(eye 1 - eye 2, previous frame) x P2:
+            // back to eye 1's camera-relative position, moved to eye 2's, projected with eye 2's (without the move,
+            // eye 2's motion vectors were the eyes' disparity: 2026-10-13, VR plants smeared in the right eye).
+            double t[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}, it[16];
+            for (int i = 0; i < 3; ++i) t[12 + i] = g_e2_off_prev[i];
             for (int r = 0; r < 4; ++r)
                 for (int c = 0; c < 4; ++c) {
                     double s = 0;
-                    for (int k = 0; k < 4; ++k) s += inv[r * 4 + k] * static_cast<double>(p2[k * 4 + c]);
+                    for (int k = 0; k < 4; ++k) s += inv[r * 4 + k] * t[k * 4 + c];
+                    it[r * 4 + c] = s;
+                }
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 4; ++c) {
+                    double s = 0;
+                    for (int k = 0; k < 4; ++k) s += it[r * 4 + k] * static_cast<double>(p2[k * 4 + c]);
                     d[r * 4 + c] = s;
                 }
             ok = true;
@@ -1394,11 +1419,57 @@ int vi_region(const ID3D12GraphicsCommandList* cl, bool* all_arrays) {
     if (all_arrays) *all_arrays = g_r.all_arrays;
     return g_r.slice + 1;
 }
+void set_eye2_ndc(const void* eff, const float* ndc, bool eye2) {
+    if (!eff || !ndc || g_taa_state < 0) return;
+    uintptr_t cb = 0;
+    if (!rd(reinterpret_cast<uintptr_t>(eff) + 0x38, &cb) || !cb) return;
+    if (g_taa_state == 0 || g_taa.cb != cb || !still_grown(g_taa)) {
+        if (!grow(g_taa, cb, kTaaGlobalsSize, 0x100, 0x100)) {
+            g_taa_state = -1;
+            uint64_t q[8] = {}, l[8] = {};
+            read_raw(cb, q, sizeof(q));
+            if (q[1]) read_raw(q[1], l, sizeof(l));
+            log::warn("[prepass] the TAA effect (%p) $Globals cb %#llx: %llx %llx %llx %llx %llx %llx %llx %llx | +8 -> %llx %llx %llx %llx %llx %llx %llx %llx",
+                      eff, static_cast<unsigned long long>(cb), q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], l[0], l[1], l[2], l[3], l[4], l[5], l[6], l[7]);
+            log::warn("[prepass] the TAA effect's $Globals not grown (its size is not %#x, or a read failed): eye 2's velocity from eye 1's", kTaaGlobalsSize);
+            return;
+        }
+        g_taa_state = 1;
+        log::info("[prepass] the TAA effect's $Globals %#llx grown %#x -> 0x100 (eye 2's NDCToPrevNDC and depth for the velocity pass)",
+                  static_cast<unsigned long long>(cb), kTaaGlobalsSize);
+    }
+    const int cols[3] = {0, 1, 3};
+    for (int j = 0; j < 4; ++j)
+        for (int k = 0; k < 3; ++k) {
+            const float v = ndc[j * 4 + cols[k]];
+            write_raw(g_taa.block + kNdcSpare[j * 3 + k][0] * 16 + kNdcSpare[j * 3 + k][1] * 4, &v, 4);
+        }
+    uint32_t d[2] = {0, 0};
+    const int64_t di[2] = {vi::game_view_index(vi::kDepthBufferSlot), vi::game_view_index(kDepthSlot)};
+    for (int i = 0; i < 2; ++i) d[i] = di[i] >= 0 && di[i] < 0x7ffffffe ? static_cast<uint32_t>(di[i]) + 1 : 0;
+    write_raw(g_taa.block + 0x14, d, sizeof(d));
+    wr<int>(cb + 0x24, -1);  // (re-uploaded at its next commit)
+    ++(eye2 ? g_ndc_written : g_ndc_eye1);
+    std::memcpy(g_ndc_last, ndc, sizeof(g_ndc_last));
+}
+std::string mv_text() {  // test: the motion-vector matrices last written (row-major, 4 decimals)
+    auto m = [](const char* n, const float* a) {
+        char b[400];
+        std::snprintf(b, sizeof(b), "%s [%.4f %.4f %.4f %.4f; %.4f %.4f %.4f %.4f; %.4f %.4f %.4f %.4f; %.4f %.4f %.4f %.4f]", n, a[0], a[1], a[2], a[3],
+                      a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]);
+        return std::string(b);
+    };
+    char o[120];
+    std::snprintf(o, sizeof(o), " | eye offset (%.4f %.4f %.4f)", g_e2_off[0], g_e2_off[1], g_e2_off[2]);
+    return m("ndc2", g_ndc_last) + " | " + m("D", g_e2_delta) + " | " + m("prevVP1", g_e1_pvp) + " | " + m("prevVP2", g_e2_pvp) + o;
+}
+
 std::string vi_status() {
-    char b[900];
+    char b[1100];
     std::snprintf(b, sizeof(b), "view-instanced regions: slice 0 %llu, slice 1 %llu | pass 2's rows as the pre-pass's: same %llu, differ %llu (max %.7f)"
                   " | motion vectors: D %s, checked %llu frames, largest relative difference %.2e (not checked: unread %llu, not vi %llu, no D %llu)"
-                  " | main pass %s: publishes %llu, depth copies %llu | eye 2's inverse gWorldView: %llu written, %llu not invertible, packing drops %.1e | the depth's view index %lld",
+                  " | main pass %s: publishes %llu, depth copies %llu | eye 2's inverse gWorldView: %llu written, %llu not invertible, packing drops %.1e | the depth's view index %lld"
+                  " | velocity pass: TAA $Globals %s, eye 2's NDCToPrevNDC written %llu, eye 1's (no eye-2 update) %llu",
                   static_cast<unsigned long long>(g_vi_regions[0].load()), static_cast<unsigned long long>(g_vi_regions[1].load()),
                   static_cast<unsigned long long>(g_vi_rows_same), static_cast<unsigned long long>(g_vi_rows_differ), g_vi_rows_max,
                   g_e2_delta_ok ? "from the updates" : "identity", static_cast<unsigned long long>(g_mv_checks), g_mv_err,
@@ -1406,7 +1477,8 @@ std::string vi_status() {
                   static_cast<unsigned long long>(g_mv_no_delta), g_i2.load() ? "on" : "off",
                   static_cast<unsigned long long>(g_publishes.load()), static_cast<unsigned long long>(g_depth_copies.load()),
                   static_cast<unsigned long long>(g_inv_written), static_cast<unsigned long long>(g_inv_failed), g_inv_dropped,
-                  static_cast<long long>(g_depth_index));
+                  static_cast<long long>(g_depth_index), g_taa_state > 0 ? "grown" : g_taa_state < 0 ? "refused" : "not yet",
+                  static_cast<unsigned long long>(g_ndc_written), static_cast<unsigned long long>(g_ndc_eye1));
     return b;
 }
 
@@ -1425,6 +1497,12 @@ void set_eye2(const void* vp2, const void* prev_vp) {
 }
 void set_eye1_prev(const void* p1) { g_e1_pvp_ok = p1 && read_raw(reinterpret_cast<uintptr_t>(p1), g_e1_pvp, 64); }
 void set_eye2_offset(const float* eye1, const float* eye2) {
+    const uint64_t f = state::presents.load();
+    if (f != g_e2_off_frame) {  // a new frame: the last one's offset is the previous cameras'
+        if (g_e2_off_ok) std::memcpy(g_e2_off_prev, g_e2_off, sizeof(g_e2_off_prev));
+        else for (int i = 0; i < 3; ++i) g_e2_off_prev[i] = eye1[i] - eye2[i];
+        g_e2_off_frame = f;
+    }
     for (int i = 0; i < 3; ++i) g_e2_off[i] = eye1[i] - eye2[i];
     g_e2_off_ok = true;
 }

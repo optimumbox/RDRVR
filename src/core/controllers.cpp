@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "core/config.h"
+#include "core/eye_capture.h"
 #include "core/hands.h"
 #include "core/log.h"
 #include "core/xinput.h"
@@ -63,6 +64,10 @@ double g_last_pulse_ms[2] = {0, 0};
 // a pulse asked for by the mod (a holster under the hand): amplitude and length, taken by the next sync
 std::atomic<float> g_req_amp[2] = {0.0f, 0.0f};
 std::atomic<int> g_req_ms[2] = {0, 0};
+// both trackpads held down kEyecapHoldMs: one eye capture (eye_capture.h), a buzz on both hands when it is saved
+constexpr double kEyecapHoldMs = 700.0;
+double g_pads_since = 0.0;  // under g_mutex: when both went down (0: not both)
+bool g_pads_fired = false;
 
 XrPath path(const char* s) {
     XrPath p = XR_NULL_PATH;
@@ -169,6 +174,7 @@ void suggest_all() {
         both(v, &g_stick_click, "/input/thumbstick/click");
         both(v, &g_primary, "/input/a/click");
         both(v, &g_secondary, "/input/b/click");
+        both(v, &g_pad_click, "/input/trackpad/force");  // (the runtime's threshold): both held, an eye capture (sync)
         both(v, &g_haptic, "/output/haptic");
         suggest("/interaction_profiles/valve/index_controller", v);
     }
@@ -482,6 +488,23 @@ void sync(XrSpace base, XrTime time) {
         d.connected = active || d.valid;
         tracked[h] = d.valid;
         hands::set_real(h, d);
+    }
+    {  // both trackpads held: an eye capture, once per hold
+        bool down[2] = {false, false};
+        for (int h = 0; h < 2; ++h) down[h] = get_bool(g_pad_click, h, nullptr);
+        const double now = log::now_ms();
+        if (!down[0] || !down[1]) {
+            g_pads_since = 0.0;
+            g_pads_fired = false;
+        } else if (g_pads_since == 0.0) {
+            g_pads_since = now;
+        } else if (!g_pads_fired && now - g_pads_since >= kEyecapHoldMs) {
+            g_pads_fired = true;
+            const bool started = eye_capture::take_async([](bool ok) {
+                for (int h = 0; h < 2; ++h) pulse(h, ok ? 0.6f : 1.0f, ok ? 80 : 400);  // short: saved; long: failed
+            });
+            log::info("[controllers] both trackpads held: eye capture %s", started ? "started" : "already running");
+        }
     }
     g_any_tracked = tracked[0] || tracked[1];
     haptics(tracked);

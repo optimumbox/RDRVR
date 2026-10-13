@@ -362,6 +362,7 @@ void eye2_update(char* p) {
     update_on(p, vp2);
     prepass::set_eye1_prev(b + 0xc0);              // eye 1's gPrevViewProj (its update's, kept above)
     prepass::set_eye2(vp2, p + kPrevBlock + 0xc0);  // +0x4f0: gPrevViewProj
+    prepass::set_eye2_ndc(at<void*>(p, kTaaEffect), reinterpret_cast<const float*>(p + kNdcToPrev), true);
     std::memcpy(p + kJitter, a, sizeof(a));
     std::memcpy(p + kPrevBlock, b, sizeof(b));
     if (void* eff = at<void*>(p, kTaaEffect)) set_vec(eff, at<int>(p, kVarNdcToPrev), p + kNdcToPrev, 0x40);
@@ -369,7 +370,13 @@ void eye2_update(char* p) {
 }
 
 void after_scene_wait(int pass) {
-    if (!jitter_active()) return;
+    if (!jitter_active()) {
+        // no TAA update for eye 2: the view-instanced velocity pass's view 1 reprojects with eye 1's matrix
+        char* p = postfx();
+        if (pass == 1 && p && prepass::views_wanted())
+            prepass::set_eye2_ndc(at<void*>(p, kTaaEffect), reinterpret_cast<const float*>(p + kNdcToPrev), false);
+        return;
+    }
     char* p = postfx();
     void* vp = camera_lever::scene_viewport();
     if (!vp) return;

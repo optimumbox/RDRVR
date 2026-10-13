@@ -183,9 +183,10 @@ def patch(text, allow_prev_world=True):  # (allow_prev_world: kept for callers; 
     text, n_wvp = patch_wvp(text) if found['wvp'] else (text, 0)
     text, n_inv = patch_inverse(text, found['inverse']) if found['inverse'] else (text, 0)
     text, n_remap = patch_index_remap(text, set(screen))
-    if n_redirect + n_screen + n_wvp + n_inv + n_remap == 0:
+    text, n_ndc = patch_ndc(text)
+    if n_redirect + n_screen + n_wvp + n_inv + n_remap + n_ndc == 0:
         raise Refused('no view-dependent block')
-    n_redirect += n_screen + n_wvp + n_inv + n_remap
+    n_redirect += n_screen + n_wvp + n_inv + n_remap + n_ndc
     # the ViewID op's declaration, beside the other dx.op declarations (readnone, as the compiler declares it)
     ro = re.search(r'^attributes (#\d+) = \{ nounwind readnone \}', text, re.M)
     if not ro:
@@ -448,6 +449,91 @@ def patch_index_remap(text, done):
         cur = f'{t}.nd'
         out.append(ln.replace(f', i32 {idx}, i1', f', i32 {cur}, i1', 1))
     return chr(10).join(out), n
+
+
+# The velocity pass (rdr2_taa's PSGenerateVelocityBuffer: NDCToPrevNDC and DepthMapSampler in its $Globals, nothing
+# else camera-dependent) for eye 2: view 1 reads eye 2's NDCToPrevNDC and eye 2's scene depth. The core
+# (prepass_arrays.cpp set_eye2_ndc) grows the effect's $Globals 0xf0 -> 0x100 (the upload's size) and writes, in its
+# padding, the matrix's x, y and w columns (the only ones the pass reads) and the game's two depth views' indices
+# plus one (0: not written, compares with nothing).
+NDC_GLOBALS = {'NDCToPrevNDC': 128, 'DepthMapSampler': 68, 'TexelSize': 32}
+NDC_SIZE = 228
+NDC_COLS = (0, 1, 3)
+NDC_SPARE = [(15, 0), (15, 1), (15, 2), (15, 3), (7, 1), (7, 2), (7, 3), (14, 1), (14, 2), (14, 3), (12, 2), (12, 3)]
+NDC_DEPTH_ROW = 1  # .y: the scene depth buffer's view index + 1 (eye 2's copy: slot DEPTH_BUFFER_SLOT), .z: the depth
+NDC_DEPTH_SLOTS = (DEPTH_BUFFER_SLOT, 15)  # resolve's (slot 15)
+
+
+def ndc_layout(text):
+    m = re.search(r'^; cbuffer \$Globals$(.*?)^;\s+\} \$Globals;\s+; Offset:\s+0 Size:\s+(\d+)', text, re.M | re.S)
+    if not m or int(m.group(2)) != NDC_SIZE:
+        return False
+    offs = {n: int(o) for n, o in re.findall(r' (\w+);\s+; Offset:\s+(\d+)', m.group(1))}
+    return all(offs.get(n) == o for n, o in NDC_GLOBALS.items())
+
+
+def patch_ndc(text):
+    """view 1's NDCToPrevNDC and scene depth as eye 2's, in a shader with the velocity pass's $Globals layout"""
+    if not ndc_layout(text):
+        return text, 0
+    rid = range_ids(text)
+    srv = re.search(r'^!\d+ = !\{i32 (\d+), \[0 x %"class\.Texture2D<[^"]*>"\]\* undef, !"[^"]*", i32 \d+, i32 0, i32 -1, i32 2,', text, re.M)
+    hg = cb_handles(text, rid['$Globals']) if '$Globals' in rid else []
+    if not hg:
+        return text, 0
+    base = NDC_GLOBALS['NDCToPrevNDC'] // 16
+    out, rename, n = [], {}, 0
+    for ln in text.split(chr(10)):
+        m = F32_LOAD.match(ln)
+        out.append(ln)
+        if not m or m.group(2) not in hg or not base <= int(m.group(3)) < base + 4:
+            continue
+        j = int(m.group(3)) - base
+        n += 1
+        L, t = m.group(1), f'%ndc{n}.sp'
+        sel = {}
+        for k, c in enumerate(NDC_COLS):
+            row, comp = NDC_SPARE[j * 3 + k]
+            v = emit_row(out, f'{t}.r{k}', m.group(2), row, past_end=row * 16 >= NDC_SIZE)
+            sel[c] = v[comp]
+        for c in range(4):
+            out.append(f'  {t}.e{c} = extractvalue %dx.types.CBufRet.f32 {L}, {c}')
+            if c in sel:
+                out.append(f'  {t}.s{c} = select i1 %isv1.sp, float {sel[c]}, float {t}.e{c}')
+            else:
+                out.append(f'  {t}.s{c} = select i1 %isv1.sp, float 0.000000e+00, float {t}.e{c}')
+        rename[L] = t
+    ext = re.compile(r'^  (%\d+) = extractvalue %dx\.types\.CBufRet\.f32 (%\d+), (\d)$')
+    alias, defs = {}, set()
+    for i, ln in enumerate(out):
+        mm = ext.match(ln.split('  ;')[0].rstrip())
+        if mm and mm.group(2) in rename:
+            alias[mm.group(1)] = f'{rename[mm.group(2)]}.s{mm.group(3)}'
+            defs.add(i)
+    tok = re.compile(r'%\d+(?![\w.])')
+    out = [ln if i in defs else tok.sub(lambda q: alias.get(q.group(0), q.group(0)), ln) for i, ln in enumerate(out)]
+    # the scene depth: view 1's 2D texture index equal to a depth view's (the core's value minus one) reads eye 2's copy
+    n_depth = 0
+    if srv:
+        hre = re.compile(r'^  (%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 0, i32 ' + srv.group(1) + r', i32 (%\d+), i1')
+        res = []
+        for ln in out:
+            m = hre.match(ln)
+            if not m:
+                res.append(ln)
+                continue
+            n_depth += 1
+            t, cur = f'%ndd{n_depth}.sp', m.group(2)
+            d = emit_row(res, f'{t}.d', hg[0], NDC_DEPTH_ROW, kind='i32')
+            for s, slot in enumerate(NDC_DEPTH_SLOTS):
+                res.append(f'  {t}.v{s} = sub i32 {d[1 + s]}, 1')
+                res.append(f'  {t}.q{s} = icmp eq i32 {m.group(2)}, {t}.v{s}')
+                res.append(f'  {t}.b{s} = and i1 {t}.q{s}, %isv1.sp')
+                res.append(f'  {t}.n{s} = select i1 {t}.b{s}, i32 {EYE2_SLOT_BASE + slot}, i32 {cur}')
+                cur = f'{t}.n{s}'
+            res.append(ln.replace(f', i32 {m.group(2)}, i1', f', i32 {cur}, i1', 1))
+        out = res
+    return chr(10).join(out), n + n_depth
 
 
 def patch_prev_world(text):

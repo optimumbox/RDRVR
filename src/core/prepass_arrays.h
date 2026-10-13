@@ -64,6 +64,10 @@ void set_eye2(const void* vp2, const void* prev_vp);
 void set_eye2_offset(const float* eye1, const float* eye2);
 // Before set_eye2 (taa.cpp's eye-2 update): eye 1's gPrevViewProj this frame, for eye 2's motion-vector transform
 void set_eye1_prev(const void* p1);
+// The render thread, pass 1 (taa.cpp): the NDCToPrevNDC the view-instanced velocity pass's view 1 reads (eff: the TAA
+// effect; eye2: eye 2's own update's, else eye 1's when no eye-2 update ran), with the depth views' indices
+void set_eye2_ndc(const void* eff, const float* ndc, bool eye2);
+std::string mv_text();  // test ("prepass mv"): the motion-vector matrices last written
 std::string views_status();
 void views_size(bool grown);  // the test's: the two declared sizes grown or as the game's (from the next pass 1)
 // A trace of the frames after "prepass on" (or "prepass trace"): every bind, clear and barrier of the six targets
