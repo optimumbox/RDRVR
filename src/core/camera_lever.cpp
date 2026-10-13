@@ -574,6 +574,7 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
                           t_vi_c2[1], t_vi_c2[2]);
             }
             o_SceneRender(renderer, vp, copy, a4);
+            prepass::scene_end();
             if (g_vi_log.load() == 2) g_vi_log = 0;
             t_vi_fix = false;
             ring_probe::matrix_expect(-2, nullptr, nullptr, nullptr);
@@ -581,6 +582,7 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
             return;
         }
         o_SceneRender(renderer, vp, copy, a4);
+        prepass::scene_end();  // [Stereo] ViMain: the region ends with the scene
         ring_probe::matrix_expect(-2, nullptr, nullptr, nullptr);
         if (pass_eye == (g_swap.load() ? 1 : 0) && g_findcam.exchange(false)) {
             log::info("[findcam] after the first pass: centre camera (%.3f %.3f %.3f), this eye (%.3f %.3f %.3f)", cam[12],

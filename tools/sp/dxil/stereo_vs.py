@@ -54,6 +54,12 @@ def main():
                     safe.append(h)
                     report.append(f'ps {h} safe')
                     counts['safe'] += 1
+                elif kind == 'vs' and str(e) == 'no view-dependent block':
+                    # nothing camera-dependent (a full-screen pass): both views draw the same positions, so the game's
+                    # own shader serves the twin (the pixel shader picks each eye's images)
+                    (out / f'vs_{h}.dxil').write_bytes(f.read_bytes())
+                    report.append(f'vs {h} shared as is')
+                    counts['safe'] += 1
                 else:
                     report.append(f'{kind} {h} refused: {e}')
                     counts['refused'] += 1

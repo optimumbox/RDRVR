@@ -62,7 +62,11 @@ struct Kept {
 std::atomic<bool> g_configured{false}, g_on{true};
 std::atomic<bool> g_query_draws{true};
 std::atomic<bool> g_skip{true};      // slice 1's twinned draws skipped ("vi skip off": eye 2 draws them itself, the A/B)
-std::atomic<bool> g_pred_off{false}; // pass 2's main pass ignores the game's predication ("vi pred off": the A/B)  // slice 1's draws inside an occlusion query drawn ("vi qdraw on|off": the A/B)
+std::atomic<bool> g_pred_off{false}; // pass 2's main pass ignores the game's predication ("vi pred off": the A/B)
+// [Stereo] ViMain (I2): the main pass in the regions too. Slice 1's region then holds eye 2's main pass, whose draws the
+// game predicates by eye 2's own queries, which see nothing once its pre-pass draws are skipped: its predication is
+// dropped instead (the draws it still makes, the untwinned, all drawn) and its queried draws need not be redrawn.
+std::atomic<bool> g_main{false};  // slice 1's draws inside an occlusion query drawn ("vi qdraw on|off": the A/B)
 ID3D12Device2* g_dev = nullptr;
 int g_tier = -1;
 std::string g_dir;
@@ -298,6 +302,8 @@ void init() {
     g_dir = config::get_string("Stereo", "ViShaders", "");
     if (!g_dir.empty()) load_shaders(g_dir);
     g_on = config::get_bool("Stereo", "ViOn", true);
+    g_main = config::get_bool("Stereo", "ViMain", false);
+    if (g_main) g_query_draws = false;
     g_configured = true;
     log::info("[vi] view-instanced pre-pass configured (%s)", g_on.load() ? "on" : "off until \"vi on\"");
 }
@@ -360,7 +366,10 @@ void on_pipeline(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d,
 
 bool configured() { return g_configured.load(std::memory_order_relaxed); }
 
-bool wanted() { return g_configured.load(std::memory_order_relaxed) && g_on.load(std::memory_order_relaxed) && g_made.load() > 0; }
+bool wanted() {
+    return g_configured.load(std::memory_order_relaxed) && g_on.load(std::memory_order_relaxed) && g_made.load() > 0 &&
+           (!g_main.load(std::memory_order_relaxed) || heap_ready());  // (ViMain: view 1 reads eye 2's views unconditionally)
+}
 
 ID3D12PipelineState* on_set_pso(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps) {
     if (!g_configured.load(std::memory_order_relaxed)) return ps;
@@ -440,9 +449,13 @@ void on_query(ID3D12GraphicsCommandList* cl, int kind, D3D12_QUERY_TYPE type, UI
 }
 
 bool drop_predication(ID3D12GraphicsCommandList* cl) {
-    if (!g_configured.load(std::memory_order_relaxed) || !g_pred_off.load(std::memory_order_relaxed)) return false;
+    if (!g_configured.load(std::memory_order_relaxed)) return false;
+    if (g_main.load(std::memory_order_relaxed) && prepass::vi_region(cl, nullptr) == 2) return true;
+    if (!g_pred_off.load(std::memory_order_relaxed)) return false;
     return prepass::vi_region(cl, nullptr) == 0 && prepass::last_slice() == 1 && prepass::vi_frame_now();
 }
+
+bool main_pass() { return g_main.load(std::memory_order_relaxed); }
 
 bool skip_clear(ID3D12GraphicsCommandList* cl) {
     if (!g_configured.load(std::memory_order_relaxed) || !g_skip.load(std::memory_order_relaxed)) return false;
@@ -458,6 +471,7 @@ std::string command(const std::vector<std::string>& t) {
         g_on = sub == "on";
         return std::string("vi ") + sub + " (from the next pre-pass)";
     }
+    if (sub == "heap") return heap_status();
     if (sub == "camfix" && t.size() >= 3) {
         camera_lever::set_vi_camfix(t[2] == "on");
         return std::string("pass 2 from eye 1's position: ") + t[2];

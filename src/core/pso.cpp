@@ -372,6 +372,7 @@ bool current(const ID3D12GraphicsCommandList* cl, uint64_t* vs, uint64_t* ps, ui
 }
 
 void install_device_hooks(ID3D12Device* dev) {
+    vi::install_device_hooks(dev);
     static bool loaded = false;
     if (!loaded) {
         loaded = true;
@@ -427,6 +428,7 @@ void on_draw_args(ID3D12GraphicsCommandList* cl, int64_t first_vertex, uint32_t 
 void install_list_hooks(ID3D12GraphicsCommandList* cl) {
     hooks::install("CL::IASetVertexBuffers", hooks::vtable_entry(cl, 44), hk_SetVB, &o_SetVB);
     hooks::install("CL::SetPipelineState", hooks::vtable_entry(cl, 25), hk_SetPipelineState, &o_SetPipelineState);
+    vi::install_list_hooks(cl);
 }
 
 bool on_draw(ID3D12GraphicsCommandList* cl) {

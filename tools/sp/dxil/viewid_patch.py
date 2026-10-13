@@ -33,6 +33,12 @@ VIEW_NAME_OK = {'gViewport'}
 # to rage_matrices rows 21-24, eye 2's unused gWorldViewProj slot): eye 2's own previous-frame position, as the game's
 # second pass computes it (KF2VR's lesson: each eye's own previous-to-current transform).
 PREV_WORLD = 'rage_prev_world'
+# The screen-space images the main pass reads through global_textures (a uint slot each: the bindless index into the
+# pixel shaders' unbounded SRV table, t0 space2): 11 LightBufferSampler, 13 ShadowCollectorSampler, 15 the scene depth
+# (DepthMapTexSampler / DepthTextureSampler0). In view 1 a shader reads eye 2's copy at table slot EYE2_SLOT_BASE + slot,
+# where the core writes it (stereo_vi.cpp: the table's base from the game's own bind, the slots past what the game uses).
+SCREEN_SLOTS = {11, 13, 15}
+EYE2_SLOT_BASE = 14960
 PREV_WORLD_ROWS = range(0, 4)
 DELTA_ROW = 21  # rage_matrices
 VIEWID_OPCODE = 138
@@ -105,14 +111,13 @@ def patch(text, allow_prev_world=True):  # (allow_prev_world: kept for callers; 
         if m.group(2) in VIEW_BLOCKS:
             ranges[m.group(1)] = m.group(2)
     approx = check_reads(text, allow_prev_world)
-    if not ranges:
-        raise Refused('no view-dependent block')
     handles = {}
     for m in re.finditer(r'(%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 2, i32 (\d+), i32 (\S+), i1', text):
         if m.group(2) in ranges:
             handles[m.group(1)] = ranges[m.group(2)]
-    if not handles:
-        raise Refused('view-dependent block declared but never loaded')
+    screen = screen_slot_reads(text)
+    if not handles and not screen:
+        raise Refused('no view-dependent block')
 
     out, n_redirect, in_entry, inserted = [], 0, False, False
     load = re.compile(r'(@dx\.op\.cbufferLoadLegacy\.\w+\(i32 59, %dx\.types\.Handle (%\d+), i32 )([%\w.]+)\)')
@@ -141,8 +146,10 @@ def patch(text, allow_prev_world=True):  # (allow_prev_world: kept for callers; 
         out.append(ln)
     if not inserted:
         raise Refused('no entry function')
-    if n_redirect == 0:
+    out, n_screen = patch_screen_slots(out, screen)
+    if n_redirect + n_screen == 0:
         raise Refused('no view-dependent block')
+    n_redirect += n_screen
     text = '\n'.join(out)
     # the ViewID op's declaration, beside the other dx.op declarations (readnone, as the compiler declares it)
     ro = re.search(r'^attributes (#\d+) = \{ nounwind readnone \}', text, re.M)
@@ -173,6 +180,69 @@ def patch(text, allow_prev_world=True):  # (allow_prev_world: kept for callers; 
     if approx:
         text = patch_prev_world(text)
     return text, n_redirect, approx
+
+
+def screen_slot_reads(text):
+    """the SRV handles whose index is a screen slot read from global_textures: {handle value: (index value, slot)};
+    refuses an index computed from a screen slot (only a direct use can be redirected)"""
+    rid = None
+    for m in re.finditer(r'^!\d+ = !\{i32 (\d+), %"?(?:hostlayout\.)?([^"*]+)"?\* undef, !"[^"]*", i32 \d+, i32 \d+, i32 \d+, i32 \d+, null\}',
+                         text, re.M):
+        if m.group(2) == 'global_textures':
+            rid = m.group(1)
+    if rid is None:
+        return {}
+    hs = {m.group(1) for m in re.finditer(r'(%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 2, i32 ' + rid + r',', text)}
+    loads = {}
+    for m in re.finditer(r'(%\d+) = call %dx\.types\.CBufRet\.i32 @dx\.op\.cbufferLoadLegacy\.i32\(i32 59, %dx\.types\.Handle (%\d+), i32 (\d+)\)', text):
+        if m.group(2) in hs:
+            loads[m.group(1)] = int(m.group(3))
+    slot_of = {}
+    for m in re.finditer(r'(%\d+) = extractvalue %dx\.types\.CBufRet\.i32 (%\d+), (\d)', text):
+        if m.group(2) in loads:
+            slot = loads[m.group(2)] * 4 + int(m.group(3))
+            if slot in SCREEN_SLOTS:
+                slot_of[m.group(1)] = slot
+    if not slot_of:
+        return {}
+    # the compiler adds the range's base to the index (add i32 %slot, 0): followed (a non-zero constant would be the
+    # range's lower bound, the same in eye 2's index)
+    for m in re.finditer(r'^  (%\d+) = add i32 (%\d+), 0$', text, re.M):
+        if m.group(2) in slot_of:
+            slot_of[m.group(1)] = slot_of[m.group(2)]
+
+    out = {}
+    tok = re.compile(r'%\d+(?![\w.])')
+    for ln in text.split('\n'):
+        a = re.match(r'^  (%\d+) = add i32 (%\d+), 0$', ln)
+        if a and a.group(2) in slot_of:
+            continue  # (the alias above)
+        m = re.match(r'^  (%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 0, i32 \d+, i32 (%\d+), i1', ln)
+        if m and m.group(2) in slot_of:
+            out[m.group(1)] = (m.group(2), slot_of[m.group(2)])
+            continue
+        d = re.match(r'^  (%\d+) = ', ln)
+        if d and any(t in slot_of for t in tok.findall(ln[d.end():].split('  ;')[0])):
+            raise Refused("a screen slot's index used other than as a texture handle's index")
+    return out
+
+
+def patch_screen_slots(lines, screen):
+    """view 1's handles of the screen slots take eye 2's table slot (EYE2_SLOT_BASE + slot)"""
+    if not screen:
+        return lines, 0
+    out, n = [], 0
+    for ln in lines:
+        m = re.match(r'^  (%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 0, i32 \d+, i32 (%\d+), i1', ln)
+        if m and m.group(1) in screen:
+            idx, slot = screen[m.group(1)]
+            n += 1
+            t = f'%scr{n}.sp'
+            out.append(f'  {t}.v1 = icmp ne i32 %vid.sp, 0')
+            out.append(f'  {t} = select i1 {t}.v1, i32 {EYE2_SLOT_BASE + slot}, i32 {idx}')
+            ln = ln.replace(f', i32 {idx}, i1', f', i32 {t}, i1', 1)
+        out.append(ln)
+    return out, n
 
 
 def patch_prev_world(text):

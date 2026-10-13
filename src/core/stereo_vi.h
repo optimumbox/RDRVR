@@ -34,6 +34,16 @@ bool drop_predication(ID3D12GraphicsCommandList* cl);  // "vi pred off": pass 2'
 // The query probe (I2's occlusion study): kind 0 BeginQuery, 1 EndQuery, 2 ResolveQueryData (index = start, n), 3
 // SetPredication (res and off: the predicate's buffer; type: the op). Counted per region of a view-instanced frame.
 void on_query(ID3D12GraphicsCommandList* cl, int kind, D3D12_QUERY_TYPE type, UINT index, ID3D12Resource* res, UINT64 off, UINT n);
+// [Stereo] ViMain: eye 2's copy of a texture the main pass reads through global_textures slot `slot` (prepass_arrays.cpp
+// made it, like `game`): its view is written into the pixel shaders' bindless table at eye 2's slot (the table's base,
+// learnt from the game's own binds, + kEye2SlotBase + slot), as the game's own view of `game`.
+constexpr unsigned kEye2SlotBase = 14960;  // = tools/sp/dxil/viewid_patch.py EYE2_SLOT_BASE
+void eye2_texture(int slot, ID3D12Resource* e2, ID3D12Resource* game);
+void install_device_hooks(ID3D12Device* dev);           // CreateShaderResourceView (the game's views, for eye 2's)
+void install_list_hooks(ID3D12GraphicsCommandList* cl);  // SetDescriptorHeaps, SetGraphicsRootDescriptorTable (the table)
+bool main_pass();  // [Stereo] ViMain
+std::string heap_status();  // "vi heap": eye 2's views
+bool heap_ready();          // every screen image's eye-2 view written (view 1 reads them unconditionally)
 bool wanted();      // this frame's pre-pass may draw both eyes (configured, switched on, twins made)
 bool configured();  // [Stereo] ViPrepass on and its prerequisites met
 std::string command(const std::vector<std::string>& t);

@@ -491,6 +491,7 @@ void STDMETHODCALLTYPE hk_CopyResource(ID3D12GraphicsCommandList* cl, ID3D12Reso
         }
         fg_event(cl, "CopyResource %s <- %s", d.c_str(), s.c_str());
     }
+    if (prepass::copy_resource(cl, dst, src)) return;  // [Stereo] ViMain: the depth from the region's arrays
     o_CopyResource(cl, dst, src);
     for (auto& t : g_copy_tap)
         if (CopyTapFn tap = t.load(std::memory_order_relaxed)) tap(cl, dst, src);

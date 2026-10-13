@@ -23,11 +23,26 @@
 namespace rdrvr::prepass {
 namespace {
 
-enum Kind { kDepth, kCollector, kVelocity, kGrassColour, kGrassLight, kTree, kKinds };
+// The pre-pass's six, then (view-instanced main pass, [Stereo] ViMain) the main pass's own targets
+enum Kind { kDepth, kCollector, kVelocity, kGrassColour, kGrassLight, kTree, kLight, kFsc, kReact, kRefr, kKinds };
+constexpr int kPrepassKinds = kLight;
+// The global_textures slot each kind is read through (the main pass's shaders: 11 LightBufferSampler, 13
+// ShadowCollectorSampler), -1 none. Eye 2's copy of such a kind is made for view 1's reads (stereo_vi.h).
+const int kSlot[kKinds] = {-1, 13, -1, -1, -1, -1, 11, -1, -1, -1};
+constexpr int kDepthSlot = 15;  // the scene depth's slot: the game's "Depth Resolve" copy
 const char* const kNames[kKinds] = {"Shadow Collector Depth Buffer", "Shadow Collector",        "Velocity RT",
-                                    "Grass FS Colour",               "Grass FS Light Multiply", "Tree FS Colour Diffuse"};
+                                    "Grass FS Colour",               "Grass FS Light Multiply", "Tree FS Colour Diffuse",
+                                    "Light Buffer",                  "FullScreenCopy",          "Reactivity RT",
+                                    "Refraction RT"};
 
 std::atomic<bool> g_on{false}, g_active{false}, g_failed{false}, g_hooked{false};
+// [Stereo] ViMain (I2, test only): the region runs from the pre-pass's start to the scene's end (a marker after each
+// SceneRender, scene_end) and takes the main pass's targets too; a target the game turns from written to read in the
+// region is copied out of its slices there (publish: the region's slice into the game's target, and in a
+// view-instanced slice-0 region slice 1 into eye 2's copy, which view 1 reads through its global_textures slot).
+std::atomic<bool> g_i2{false};
+std::atomic<uint64_t> g_publishes{0}, g_depth_copies{0};
+int kind_count() { return g_i2.load(std::memory_order_relaxed) ? kKinds : kPrepassKinds; }
 std::atomic<bool> g_views{false}, g_views_write{false};  // [Stereo] PrepassViews: 1 observe, 2 also write eye 2's rows
 std::atomic<bool> g_end_pending{false};  // the walk's end marker played back: the next list call ends the region
 std::atomic<uint64_t> g_markers{0}, g_marker_ends{0};
@@ -43,8 +58,17 @@ struct Arr {
     ID3D12Resource* arr = nullptr;  // 2 slices
     UINT planes = 1;
     D3D12_CPU_DESCRIPTOR_HANDLE view[3]{};  // slice 0, slice 1, both (view-instanced stereo: views 0 and 1 to slices 0 and 1)
+    ID3D12Resource* e2 = nullptr;           // eye 2's copy (a kind with a global slot, ViMain), its state
+    D3D12_RESOURCE_STATES e2_state = D3D12_RESOURCE_STATE_COMMON;
 };
 Arr g_arr[kKinds];
+// Eye 2's copy of the game's "Depth Resolve" (the depth the main pass reads through slot 15), made at its first copy
+struct DepthResolve {
+    ID3D12Resource* game = nullptr;
+    ID3D12Resource* e2 = nullptr;
+    D3D12_RESOURCE_STATES e2_state = D3D12_RESOURCE_STATE_COMMON;
+    UINT planes = 1;
+} g_dr;
 struct Retired {
     ID3D12Resource* res;
     uint64_t frame;
@@ -61,6 +85,7 @@ struct Region {
     int slice = 0;
     bool vi = false;          // view-instanced (stereo_vi.h): slice 0's region draws both slices, slice 1's skips those draws
     bool all_arrays = true;   // every target of the current bind is one of the six (a view-instanced draw may run)
+    unsigned published = 0;   // ViMain: kinds copied out since their last writing (bit k)
     unsigned touched = 0, known = 0;   // bit (kind * 2 + plane): that plane's state known
     D3D12_RESOURCE_STATES state[kKinds][2]{};  // per plane (the depth's two: the game moves them one at a time)
 } g_r;
@@ -103,7 +128,7 @@ int kind_of(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource** res, DXGI_FORMAT* fm
     if (!r) return -1;
     const char* name = d3d::resource_name(r);
     if (!name) return -1;
-    for (int k = 0; k < kKinds; ++k)
+    for (int k = 0; k < kind_count(); ++k)
         if (std::strcmp(name, kNames[k]) == 0) {
             *res = static_cast<ID3D12Resource*>(const_cast<void*>(r));
             return k;
@@ -111,7 +136,7 @@ int kind_of(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource** res, DXGI_FORMAT* fm
     return -1;
 }
 int kind_of_resource(const ID3D12Resource* res) {
-    for (int k = 0; k < kKinds; ++k)
+    for (int k = 0; k < kind_count(); ++k)
         if (g_arr[k].game && g_arr[k].game == res) return k;
     return -1;
 }
@@ -143,6 +168,7 @@ bool ensure(int k, ID3D12Resource* res, DXGI_FORMAT view_fmt) {
         return false;
     }
     if (a.arr) g_retired.push_back({a.arr, state::presents.load()});  // the GPU may still use it: released later
+    if (a.e2) g_retired.push_back({a.e2, state::presents.load()});
     a = Arr{};
     D3D12_RESOURCE_DESC ad = d;
     ad.DepthOrArraySize = 2;
@@ -193,6 +219,20 @@ bool ensure(int k, ID3D12Resource* res, DXGI_FORMAT view_fmt) {
     arr->SetName(nm);
     log::info("[prepass] %s: a 2-slice array %llux%u (format %d, view %d, %u plane(s))", kNames[k], static_cast<unsigned long long>(d.Width),
               d.Height, static_cast<int>(d.Format), static_cast<int>(vf), a.planes);
+    if (g_i2.load(std::memory_order_relaxed) && kSlot[k] >= 0) {  // eye 2's copy, read by view 1 through the slot
+        D3D12_RESOURCE_DESC ed = d;
+        ed.Flags &= ~(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        ID3D12Resource* e2 = nullptr;
+        if (SUCCEEDED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &ed, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&e2))) && e2) {
+            std::swprintf(nm, 96, L"RDRVR eye 2 %S", kNames[k]);
+            e2->SetName(nm);
+            a.e2 = e2;
+            a.e2_state = D3D12_RESOURCE_STATE_COMMON;
+            vi::eye2_texture(kSlot[k], e2, res);
+        } else {
+            log::warn("[prepass] %s: eye 2's copy not made (view 1 reads eye 1's)", kNames[k]);
+        }
+    }
     return true;
 }
 
@@ -262,6 +302,56 @@ void end_region(ID3D12GraphicsCommandList* cl) {
     }
     d3d::raw_barrier(cl, n, post);
     g_marker_ends.fetch_add(1, std::memory_order_relaxed);
+}
+
+// ---- [Stereo] ViMain: a kind the game turns from written to read in the region, copied out of its slices before the
+// game's barrier: the region's slice into the game's target (from `st`, its states per plane before the barrier), and,
+// in a view-instanced slice-0 region, slice 1 into eye 2's copy (left readable by the pixel shaders).
+constexpr D3D12_RESOURCE_STATES kReadable = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+void publish(ID3D12GraphicsCommandList* cl, int k, const D3D12_RESOURCE_STATES st[2]) {
+    Arr& a = g_arr[k];
+    if (!a.arr || !a.game) return;
+    const bool e2 = a.e2 && g_r.vi && g_r.slice == 0;
+    D3D12_RESOURCE_BARRIER pre[4], post[4];
+    UINT n = 0;
+    pre[n] = transition(a.arr, write_state(k), D3D12_RESOURCE_STATE_COPY_SOURCE);
+    post[n++] = transition(a.arr, D3D12_RESOURCE_STATE_COPY_SOURCE, write_state(k));
+    for (UINT p = 0; p < a.planes && p < 2; ++p) {
+        if (st[p] == D3D12_RESOURCE_STATE_COPY_DEST) return;  // (never seen: nothing to do safely)
+        pre[n] = transition(a.game, st[p], D3D12_RESOURCE_STATE_COPY_DEST);
+        post[n] = transition(a.game, D3D12_RESOURCE_STATE_COPY_DEST, st[p]);
+        if (a.planes > 1) pre[n].Transition.Subresource = post[n].Transition.Subresource = p;
+        ++n;
+    }
+    if (e2) {
+        if (a.e2_state != D3D12_RESOURCE_STATE_COPY_DEST) {
+            pre[n] = transition(a.e2, a.e2_state, D3D12_RESOURCE_STATE_COPY_DEST);
+            post[n++] = transition(a.e2, D3D12_RESOURCE_STATE_COPY_DEST, kReadable);
+        }
+        a.e2_state = kReadable;
+    }
+    d3d::raw_barrier(cl, n, pre);
+    for (UINT p = 0; p < a.planes; ++p) {
+        D3D12_TEXTURE_COPY_LOCATION src{a.arr, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+        src.SubresourceIndex = static_cast<UINT>(g_r.slice) + p * 2;
+        D3D12_TEXTURE_COPY_LOCATION dst{a.game, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+        dst.SubresourceIndex = p;
+        d3d::raw_copy_region(cl, &dst, &src);
+        if (e2) {
+            src.SubresourceIndex = 1 + p * 2;
+            dst.pResource = a.e2;
+            d3d::raw_copy_region(cl, &dst, &src);
+        }
+    }
+    d3d::raw_barrier(cl, n, post);
+    g_publishes.fetch_add(1, std::memory_order_relaxed);
+}
+UINT plane_count(ID3D12Resource* r) {
+    D3D12_FEATURE_DATA_FORMAT_INFO fi{r->GetDesc().Format, 0};
+    return g_dev && SUCCEEDED(g_dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &fi, sizeof(fi))) && fi.PlaneCount ? fi.PlaneCount : 1;
+}
+bool writing(int k, D3D12_RESOURCE_STATES s) {
+    return s == write_state(k) || (is_depth(k) && s == D3D12_RESOURCE_STATE_DEPTH_WRITE);
 }
 
 // ---- the walk's end, recorded on the render thread: FUN_1405cbfd0 calls the letterbox clear right after the walk
@@ -644,7 +734,7 @@ void hk_letterbox(void* renderer) {
     if (g_views.load(std::memory_order_relaxed) &&
         reinterpret_cast<uintptr_t>(_ReturnAddress()) == anchors::addr(anchors::Id::PrepassLetterboxCall) + 5)
         observe_after_walk();
-    if (g_on.load(std::memory_order_relaxed) && !g_failed.load(std::memory_order_relaxed) &&
+    if (g_on.load(std::memory_order_relaxed) && !g_failed.load(std::memory_order_relaxed) && !g_i2.load(std::memory_order_relaxed) &&
         reinterpret_cast<uintptr_t>(_ReturnAddress()) == anchors::addr(anchors::Id::PrepassLetterboxCall) + 5) {
         uintptr_t dev = 0, hrec = 0, rec = 0, vt = 0;
         if (rd(anchors::addr(anchors::Id::D3dDeviceSingleton), &dev) && rd(dev + 0x58, &hrec) && rd(hrec + 0x128, &rec) && rd(rec, &vt) &&
@@ -677,6 +767,8 @@ void install() {
         return;
     g_hooked = true;
     g_on = arrays;
+    g_i2 = arrays && config::get_bool("Stereo", "ViMain", false);
+    if (g_i2) log::info("[prepass] [Stereo] ViMain on (test only: the region to the scene's end, the main pass's targets too)");
     if (arrays) log::info("[prepass] [Stereo] PrepassArrays on (test only: each eye's pre-pass drawn into 2-slice arrays, copied back at the walk's end)");
     if (views && anchors::present(Id::HandleWorldView) && anchors::present(Id::HandleViewInverse) && anchors::present(Id::HandlePrevViewProj) &&
         anchors::present(Id::HandleViewport) && anchors::present(Id::HandlePrevWorldVP)) {
@@ -841,7 +933,17 @@ void barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BAR
         if ((g_r.known & (1u << (k * 2 + p0))) && b[i].Transition.StateBefore != g_r.state[k][p0])
             log::limited("prepass.mismatch", 20, "[prepass] %s plane %d: the game's barrier from %#x, the region had %#x", kNames[k], p0,
                          static_cast<unsigned>(b[i].Transition.StateBefore), static_cast<unsigned>(g_r.state[k][p0]));
-        set_state(k, plane, b[i].Transition.StateAfter);
+        // [Stereo] ViMain: written in the region and now to be read: its slices copied out first (once per writing)
+        const D3D12_RESOURCE_STATES after = b[i].Transition.StateAfter;
+        if (g_i2.load(std::memory_order_relaxed) && (g_r.touched & (1u << k)) && writing(k, b[i].Transition.StateBefore) &&
+            !writing(k, after) && after != D3D12_RESOURCE_STATE_COPY_DEST && !(g_r.published & (1u << k)) &&
+            (g_r.known & plane_bits(k)) == plane_bits(k)) {
+            const D3D12_RESOURCE_STATES st[2] = {g_r.state[k][0], g_r.state[k][1]};
+            publish(cl, k, st);
+            g_r.published |= 1u << k;
+        }
+        if (writing(k, after)) g_r.published &= ~(1u << k);
+        set_state(k, plane, after);
     }
 }
 
@@ -858,6 +960,68 @@ bool latch_vi() {
 }
 
 bool vi_frame_now() { return g_vi_frame == state::presents.load(); }
+bool copy_resource(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, ID3D12Resource* src) {
+    if (!g_i2.load(std::memory_order_relaxed) || !g_active.load(std::memory_order_relaxed) || cl != g_r.cl || !dst ||
+        src != g_arr[kDepth].game || !g_arr[kDepth].arr)
+        return false;
+    // the depth the region drew is in its array: the region's slice (and in a view-instanced slice-0 region slice 1 into
+    // eye 2's copy of the destination, read by view 1 through slot 15)
+    const Arr& a = g_arr[kDepth];
+    if (g_dr.game != dst) {
+        if (g_dr.e2) g_retired.push_back({g_dr.e2, state::presents.load()});
+        g_dr = DepthResolve{};
+        g_dr.game = dst;
+        g_dr.planes = plane_count(dst);
+    }
+    const bool e2 = g_r.vi && g_r.slice == 0;
+    if (!g_dr.e2) {  // (made at the first copy, so eye 2's view is written before any view-instanced frame reads it)
+        D3D12_RESOURCE_DESC ed = dst->GetDesc();
+        ed.Flags &= ~(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        ID3D12Resource* r = nullptr;
+        if (SUCCEEDED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &ed, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r))) && r) {
+            r->SetName(L"RDRVR eye 2 Depth Resolve");
+            g_dr.e2 = r;
+            g_dr.e2_state = D3D12_RESOURCE_STATE_COMMON;
+            vi::eye2_texture(kDepthSlot, r, dst);
+        }
+    }
+    const UINT planes = std::min(a.planes, g_dr.planes);
+    D3D12_RESOURCE_BARRIER pre[2], post[2];
+    UINT n = 0;
+    pre[n] = transition(a.arr, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    post[n++] = transition(a.arr, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    const bool to_e2 = e2 && g_dr.e2;
+    if (to_e2) {
+        if (g_dr.e2_state != D3D12_RESOURCE_STATE_COPY_DEST) {
+            pre[n] = transition(g_dr.e2, g_dr.e2_state, D3D12_RESOURCE_STATE_COPY_DEST);
+            post[n++] = transition(g_dr.e2, D3D12_RESOURCE_STATE_COPY_DEST, kReadable);
+        }
+        g_dr.e2_state = kReadable;
+    }
+    d3d::raw_barrier(cl, n, pre);
+    for (UINT p = 0; p < planes; ++p) {
+        D3D12_TEXTURE_COPY_LOCATION s{a.arr, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+        s.SubresourceIndex = static_cast<UINT>(g_r.slice) + p * 2;
+        D3D12_TEXTURE_COPY_LOCATION d{dst, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+        d.SubresourceIndex = p;
+        d3d::raw_copy_region(cl, &d, &s);
+        if (to_e2) {
+            s.SubresourceIndex = 1 + p * 2;
+            d.pResource = g_dr.e2;
+            d3d::raw_copy_region(cl, &d, &s);
+        }
+    }
+    d3d::raw_barrier(cl, n, post);
+    g_depth_copies.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void scene_end() {
+    if (g_i2.load(std::memory_order_relaxed) && g_on.load(std::memory_order_relaxed) && !g_failed.load(std::memory_order_relaxed))
+        append_marker(&walk_end_cb);  // (the region's end: the scene's, not the pre-pass walk's)
+}
+
 int last_slice() { return g_frame_seen == state::presents.load() ? g_pass_in_frame - 1 : -1; }
 
 int vi_region(const ID3D12GraphicsCommandList* cl, bool* all_arrays) {
@@ -866,14 +1030,16 @@ int vi_region(const ID3D12GraphicsCommandList* cl, bool* all_arrays) {
     return g_r.slice + 1;
 }
 std::string vi_status() {
-    char b[520];
+    char b[700];
     std::snprintf(b, sizeof(b), "view-instanced regions: slice 0 %llu, slice 1 %llu | pass 2's rows as the pre-pass's: same %llu, differ %llu (max %.7f)"
-                  " | motion vectors: D %s, checked %llu frames, largest relative difference %.2e (not checked: unread %llu, not vi %llu, no D %llu)",
+                  " | motion vectors: D %s, checked %llu frames, largest relative difference %.2e (not checked: unread %llu, not vi %llu, no D %llu)"
+                  " | main pass %s: publishes %llu, depth copies %llu",
                   static_cast<unsigned long long>(g_vi_regions[0].load()), static_cast<unsigned long long>(g_vi_regions[1].load()),
                   static_cast<unsigned long long>(g_vi_rows_same), static_cast<unsigned long long>(g_vi_rows_differ), g_vi_rows_max,
                   g_e2_delta_ok ? "from the updates" : "identity", static_cast<unsigned long long>(g_mv_checks), g_mv_err,
                   static_cast<unsigned long long>(g_mv_unread), static_cast<unsigned long long>(g_mv_not_vi),
-                  static_cast<unsigned long long>(g_mv_no_delta));
+                  static_cast<unsigned long long>(g_mv_no_delta), g_i2.load() ? "on" : "off",
+                  static_cast<unsigned long long>(g_publishes.load()), static_cast<unsigned long long>(g_depth_copies.load()));
     return b;
 }
 
