@@ -222,6 +222,41 @@ Next, in the game:
 3. **I3:** the remaining passes, with the walk itself once (`SceneRender` once, both eyes'
    post runs after it), then the headset.
 
+## I1 result (2026-10-12, flat double pass in Armadillo, `double on 0.064`)
+
+What works:
+
+- Twin pipelines need **signed** DXIL: the runtime refuses an unsigned container with
+  E_INVALIDARG. `dxv -o=` signs. With that, 369 of 484 pipelines got twins and none were
+  refused.
+- Eye 2's rows: the prediction matches the game's real pass 2 exactly (402 frames, difference
+  0).
+- **The world matrices are camera-relative** (gWorldView is the same for both eyes; only
+  gViewInverse moves), so eye 2's gWorldView must also carry eye 1 - eye 2 as a translation
+  (`prepass::set_eye2_offset`).
+- 421 view-instanced frames, with no device loss. Per frame, about 3,750 pre-pass draws were
+  made once for both eyes, about 60 were drawn as the game's (no twin), and eye 2's copies were
+  skipped.
+
+**The blocker:**
+
+- 37 main-pass pipelines (HDR target, format 10) draw the twinned geometry with depth **EQUAL**
+  and no depth write.
+- Eye 2's pre-pass depth now comes from the twin's math: pass 1's camera-relative world, times
+  the translated eye-2 view-projection. Eye 2's main pass is still the game's own pass 2: the
+  world relative to eye 2, times the untranslated view-projection. The two differ by rounding,
+  so EQUAL fails and the background shows through, worst on John (hat and head).
+- With the eyes 0.1 mm apart the image is correct.
+- (`tools/sp/psoinfo.py` lists each dumped pipeline's depth test.)
+
+**Conclusion:** the pre-pass cannot be instanced alone. Eye 2's main pass must come from the
+same walk with the same math. I2 extends the region from the pre-pass through the opaque main
+pass:
+
+- the HDR target and the main depth become 2-slice arrays too;
+- the full-screen passes in between (the Shadow Collector) read the arrays per view;
+- the second pass skips everything the first drew.
+
 ## Risks
 
 - The recorded packets may point into per-pass transient memory that is recycled before the
