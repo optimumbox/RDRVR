@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cmath>
 #include <cstring>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include "core/anchors.h"
@@ -259,6 +261,117 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* r, D3D12_RESOURCE_STATES from,
 }
 
 // The region's end: each touched target's slice copied into the game's target, from the states seen (per plane).
+// ---- "prepass gpu [reset]": GPU timestamps on the region's list (the game's queue's clock): each region's span, and
+// the copies inside it (publishes, the depth resolve, the region end's). Frames sorted by view-instanced or not, so
+// "vi ab <n>" (view instancing every other n frames) compares both in the same view. Read back kFrames frames later.
+namespace gpu {
+constexpr int kFrames = 4, kMax = 256;
+enum Tag : uint8_t { kBegin0, kEnd0, kBegin1, kEnd1, kCopyBegin, kCopyEnd };
+ID3D12QueryHeap* g_heap = nullptr;
+ID3D12Resource* g_rb = nullptr;
+uint64_t* g_mapped = nullptr;
+bool g_on = false, g_failed = false;
+struct Rec {
+    int n = 0;
+    Tag tag[kMax];
+    bool vi = false, resolved = false, complete = false;
+};
+Rec g_rec[kFrames];
+int g_slot = -1;
+struct Sum {
+    uint64_t frames = 0;
+    double span = 0, r0 = 0, r1 = 0, copies = 0;
+};
+Sum g_sum[2];  // [vi]
+std::mutex g_mutex;
+double g_tick_ms = 0;
+bool ensure() {
+    if (g_heap) return true;
+    if (g_failed || !g_dev) return false;
+    ID3D12CommandQueue* q = state::present_queue.load();
+    UINT64 hz = 0;
+    D3D12_QUERY_HEAP_DESC qd{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kFrames * kMax, 0};
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC r{};
+    r.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    r.Width = kFrames * kMax * 8;
+    r.Height = r.DepthOrArraySize = r.MipLevels = 1;
+    r.SampleDesc.Count = 1;
+    r.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (!q || FAILED(q->GetTimestampFrequency(&hz)) || !hz || FAILED(g_dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_heap))) ||
+        FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &r, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_rb))) ||
+        FAILED(g_rb->Map(0, nullptr, reinterpret_cast<void**>(&g_mapped)))) {
+        g_failed = true;
+        log::warn("[prepass] gpu timers not made");
+        return false;
+    }
+    g_tick_ms = 1000.0 / static_cast<double>(hz);
+    return true;
+}
+void harvest(int slot) {  // that slot's frame, resolved kFrames frames ago
+    Rec& rc = g_rec[slot];
+    if (!rc.resolved || !rc.complete) return;
+    const uint64_t* t = g_mapped + slot * kMax;
+    double b0 = -1, e0 = -1, b1 = -1, e1 = -1, copies = 0, cb = -1;
+    for (int i = 0; i < rc.n; ++i) {
+        const double v = static_cast<double>(t[i]) * g_tick_ms;
+        switch (rc.tag[i]) {
+            case kBegin0: b0 = v; break;
+            case kEnd0: e0 = v; break;
+            case kBegin1: b1 = v; break;
+            case kEnd1: e1 = v; break;
+            case kCopyBegin: cb = v; break;
+            case kCopyEnd:
+                if (cb >= 0) copies += v - cb;
+                cb = -1;
+                break;
+        }
+    }
+    if (b0 < 0 || e0 < b0 || b1 < e0 || e1 < b1 || e1 - b0 > 200) return;  // (an incomplete or wrapped frame)
+    std::lock_guard lock(g_mutex);
+    Sum& s = g_sum[rc.vi ? 1 : 0];
+    ++s.frames;
+    s.span += e1 - b0;
+    s.r0 += e0 - b0;
+    s.r1 += e1 - b1;
+    s.copies += copies;
+}
+void mark(ID3D12GraphicsCommandList* cl, Tag tag) {
+    if (!g_on || !ensure()) return;
+    if (tag == kBegin0) {
+        g_slot = static_cast<int>(state::presents.load() % kFrames);
+        harvest(g_slot);
+        g_rec[g_slot] = Rec{};
+        g_rec[g_slot].vi = g_r.vi;
+    }
+    if (g_slot < 0) return;
+    Rec& rc = g_rec[g_slot];
+    if (rc.n >= kMax) return;
+    cl->EndQuery(g_heap, D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(g_slot * kMax + rc.n));
+    rc.tag[rc.n++] = tag;
+    if (tag == kEnd1) {
+        cl->ResolveQueryData(g_heap, D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(g_slot * kMax), static_cast<UINT>(rc.n), g_rb,
+                             static_cast<UINT64>(g_slot) * kMax * 8);
+        rc.resolved = rc.complete = true;
+        g_slot = -1;
+    }
+}
+std::string status(bool reset) {
+    std::lock_guard lock(g_mutex);
+    std::string r = g_on ? "gpu timers on" : "gpu timers off (prepass gpu on)";
+    for (int v = 0; v < 2; ++v) {
+        const Sum& s = g_sum[v];
+        const double n = s.frames ? static_cast<double>(s.frames) : 1.0;
+        char b[200];
+        std::snprintf(b, sizeof(b), " | %s: %llu frames, both regions %.3f ms (eye 1's %.3f, eye 2's %.3f), copies in them %.3f",
+                      v ? "view-instanced" : "two passes", static_cast<unsigned long long>(s.frames), s.span / n, s.r0 / n, s.r1 / n, s.copies / n);
+        r += b;
+    }
+    if (reset) g_sum[0] = g_sum[1] = Sum{};
+    return r;
+}
+}  // namespace gpu
+
 void end_region(ID3D12GraphicsCommandList* cl) {
     g_active = false;
     g_end_pending = false;
@@ -289,7 +402,12 @@ void end_region(ID3D12GraphicsCommandList* cl) {
             ++n;
         }
     }
-    if (!n) return;
+    const gpu::Tag end_tag = g_r.slice == 0 ? gpu::kEnd0 : gpu::kEnd1;
+    if (!n) {
+        gpu::mark(cl, end_tag);
+        return;
+    }
+    gpu::mark(cl, gpu::kCopyBegin);
     d3d::raw_barrier(cl, n, pre);
     for (int k = 0; k < kKinds; ++k) {
         if (!(g_r.touched & (1u << k))) continue;
@@ -304,6 +422,8 @@ void end_region(ID3D12GraphicsCommandList* cl) {
         g_copies.fetch_add(1, std::memory_order_relaxed);
     }
     d3d::raw_barrier(cl, n, post);
+    gpu::mark(cl, gpu::kCopyEnd);
+    gpu::mark(cl, end_tag);
     g_marker_ends.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -311,6 +431,7 @@ void end_region(ID3D12GraphicsCommandList* cl) {
 // game's barrier: the region's slice into the game's target (from `st`, its states per plane before the barrier), and,
 // in a view-instanced slice-0 region, slice 1 into eye 2's copy (left readable by the pixel shaders).
 constexpr D3D12_RESOURCE_STATES kReadable = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
 // ---- "prepass grab <kind> <path>": both slices of a kind's array as the next view-instanced frame's slice-0 region
 // publishes them (plane 0; each publish in that region copies again, the last one's in the file): "RDA1", width,
 // height, footprint format, row bytes, then slice 0's rows and slice 1's (slice 1: what eye 2's copy got).
@@ -415,6 +536,7 @@ void publish(ID3D12GraphicsCommandList* cl, int k, const D3D12_RESOURCE_STATES s
         }
         a.e2_state = kReadable;
     }
+    gpu::mark(cl, gpu::kCopyBegin);
     d3d::raw_barrier(cl, n, pre);
     for (UINT p = 0; p < a.planes; ++p) {
         D3D12_TEXTURE_COPY_LOCATION src{a.arr, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
@@ -430,6 +552,7 @@ void publish(ID3D12GraphicsCommandList* cl, int k, const D3D12_RESOURCE_STATES s
     }
     if (g_grab_phase.load(std::memory_order_relaxed)) grab_tap(cl, k, a.arr);
     d3d::raw_barrier(cl, n, post);
+    gpu::mark(cl, gpu::kCopyEnd);
     g_publishes.fetch_add(1, std::memory_order_relaxed);
 }
 UINT plane_count(ID3D12Resource* r) {
@@ -946,6 +1069,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_dsv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
     g_end_pending = false;
     g_active = true;
     g_regions.fetch_add(1, std::memory_order_relaxed);
+    gpu::mark(cl, slice == 0 ? gpu::kBegin0 : gpu::kBegin1);
     if (g_last.cl == cl) {  // the targets bound before this clear: bound again, the six as the slices
         D3D12_CPU_DESCRIPTOR_HANDLE r2[8], d2{};
         if (bind(cl, g_last.n, g_last.rts, g_last.single, g_last.has_ds ? &g_last.ds : nullptr, r2, &d2))
@@ -1069,8 +1193,11 @@ void before_draw(ID3D12GraphicsCommandList* cl) {
     if (cl == g_r.cl && g_end_pending.load(std::memory_order_acquire)) end_region(cl);
 }
 
+std::atomic<unsigned> g_ab{0};  // "vi ab <n>": view-instanced every other n frames (0: every frame)
 bool latch_vi() {
-    const bool want = g_on.load(std::memory_order_relaxed) && !g_failed.load(std::memory_order_relaxed) && vi::wanted();
+    const unsigned ab = g_ab.load(std::memory_order_relaxed);
+    const bool want = g_on.load(std::memory_order_relaxed) && !g_failed.load(std::memory_order_relaxed) && vi::wanted() &&
+                      (ab == 0 || (state::presents.load() / ab) % 2 == 0);
     t_latched_vi = false;
     if (!append_marker(want ? &vi_on_cb : &vi_off_cb)) return false;
     t_latched_vi = want;
@@ -1117,6 +1244,7 @@ bool copy_resource(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, ID3D12Res
         }
         g_dr.e2_state = kReadable;
     }
+    gpu::mark(cl, gpu::kCopyBegin);
     d3d::raw_barrier(cl, n, pre);
     for (UINT p = 0; p < planes; ++p) {
         D3D12_TEXTURE_COPY_LOCATION s{a.arr, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
@@ -1131,6 +1259,7 @@ bool copy_resource(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, ID3D12Res
         }
     }
     d3d::raw_barrier(cl, n, post);
+    gpu::mark(cl, gpu::kCopyEnd);
     g_depth_copies.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -1242,6 +1371,12 @@ void trace_clear(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE h, b
     log::info("[prepass] trace frame %llu draws %llu: clear %s %s%s", static_cast<unsigned long long>(state::presents.load()),
               static_cast<unsigned long long>(d3d::thread_draws()), depth ? "DSV" : "RTV", nm, g_active.load() ? " in a region" : "");
     (void)cl;
+}
+
+void set_ab(unsigned frames) { g_ab = frames; }
+std::string gpu_command(const std::string& arg) {
+    if (arg == "on" || arg == "off") gpu::g_on = arg == "on";  // (the playback thread reads it: a flag, set between frames)
+    return gpu::status(arg == "reset");
 }
 
 std::string grab(const std::string& kind, const std::string& path) {

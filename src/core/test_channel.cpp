@@ -733,10 +733,15 @@ std::string execute(const std::vector<std::string>& t) {
         }
         return "teleported: " + r;
     }
+    if (c == "vi" && t.size() >= 3 && t[1] == "ab") {
+        prepass::set_ab(static_cast<unsigned>(std::atoi(t[2].c_str())));
+        return "view-instanced every other " + t[2] + " frames (0: every frame)";
+    }
     if (c == "vi") return vi::command(t);  // view-instanced stereo (stereo_vi.h)
     if (c == "prepass") {  // prepass [on|off]: [Stereo] PrepassArrays (test only, stageVI-prepass.md milestone 2)
         if (t.size() >= 2 && (t[1] == "on" || t[1] == "off")) prepass::set_on(t[1] == "on");
         if (t.size() >= 4 && t[1] == "grab") return prepass::grab(t[2], t[3]);
+        if (t.size() >= 2 && t[1] == "gpu") return prepass::gpu_command(t.size() >= 3 ? t[2] : "");
         if (t.size() >= 2 && t[1] == "trace") prepass::trace_start(t.size() >= 3 ? std::atoi(t[2].c_str()) : 2);
         if (t.size() >= 4 && t[1] == "views" && t[2] == "size") prepass::views_size(t[3] == "on");
         if (t.size() >= 2 && t[1] == "views") return prepass::views_status();
