@@ -43,7 +43,7 @@ while ((Get-Date) -lt $deadline) {
     }
     $good = 0
     "  not yet: $why"
-    try { & "$here\keys.ps1" '{ENTER}' -DelayMs 200 | Out-Null } catch {}
+    try { & "$here\keys.ps1" '{ENTER}' -DelayMs 200 | Out-Null } catch { "  Enter not sent: $_" }
     Start-Sleep -Seconds $IntervalSec
 }
 throw "not in the world after $TimeoutSec s (last: $why)"
