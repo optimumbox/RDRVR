@@ -10,6 +10,7 @@
 param(
     [switch] $Start,
     [switch] $Stop,
+    [switch] $Install,
     [string] $GameDir = 'G:\Games\Red Dead Redemption',
     [string] $Shaders = 'C:\Games\RDRVR-src\research\stereo_all4',
     [string] $ExtraIni = ''
@@ -29,6 +30,26 @@ if ($Stop) {
     & (Join-Path $here 'deploy.ps1') -GameDir $GameDir -Restore
     foreach ($f in $test) { Remove-Item (Join-Path $GameDir $f) -ErrorAction SilentlyContinue }
     'session ended: the release is back'
+    return
+}
+if ($Install) {
+    # a headset session the player starts: this build, single-pass stereo on from the start (the view-instanced main pass,
+    # the second scene recorded without draws), the OpenXR runtime as configured (no flat override); "-Stop" undoes it
+    & (Join-Path $here 'deploy.ps1') -GameDir $GameDir
+    @"
+; RDRVR development build: single-pass stereo for a headset session (delete this file to go back to normal)
+[Stereo]
+PrepassArrays=1
+PrepassViews=2
+ViPrepass=1
+ViOn=1
+ViMain=1
+ViSkipRecord=1
+ViShaders=$Shaders
+$ExtraIni
+"@ | Set-Content (Join-Path $GameDir 'RDRVR.dev.ini') -Encoding ascii
+    Remove-Item (Join-Path $GameDir 'RDRVR_xr_runtime.txt') -ErrorAction SilentlyContinue
+    'installed for a VR session: start the game yourself ("tools\sp\session.ps1 -Stop" puts the release back)'
     return
 }
 if ($Start) {
