@@ -857,6 +857,8 @@ bool latch_vi() {
     return want;
 }
 
+int last_slice() { return g_frame_seen == state::presents.load() ? g_pass_in_frame - 1 : -1; }
+
 int vi_region(const ID3D12GraphicsCommandList* cl, bool* all_arrays) {
     if (!g_active.load(std::memory_order_relaxed) || cl != g_r.cl || !g_r.vi) return 0;
     if (all_arrays) *all_arrays = g_r.all_arrays;

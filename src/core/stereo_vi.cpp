@@ -75,7 +75,7 @@ std::deque<Kept*> g_queue;
 bool g_worker = false;
 
 std::atomic<uint64_t> g_kept_n{0}, g_made{0}, g_failed{0}, g_no_vs{0}, g_no_ps{0}, g_stages{0};
-std::atomic<uint64_t> g_draws_both{0}, g_draws_skipped{0}, g_draws_plain{0}, g_clears_skipped{0}, g_rebinds{0};
+std::atomic<uint64_t> g_draws_both{0}, g_draws_skipped{0}, g_draws_plain{0}, g_clears_skipped{0}, g_rebinds{0}, g_draws_queried{0};
 
 std::string hex(uint64_t h) {
     char b[20];
@@ -257,6 +257,7 @@ struct ListState {
     ID3D12PipelineState* game = nullptr;   // the game's pipeline (set or the Reset's)
     ID3D12PipelineState* bound = nullptr;  // what is bound: the game's or its twin
     ID3D12GraphicsCommandList1* cl1 = nullptr;
+    int queries_open = 0;  // occlusion queries begun and not ended on this list
 };
 thread_local std::unordered_map<ID3D12GraphicsCommandList*, ListState> t_lists;
 
@@ -373,6 +374,7 @@ void on_reset(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps) {
     if (!g_configured.load(std::memory_order_relaxed)) return;
     ListState& s = list(cl);
     s.game = s.bound = ps;
+    s.queries_open = 0;
 }
 
 bool before_draw(ID3D12GraphicsCommandList* cl) {
@@ -382,12 +384,51 @@ bool before_draw(ID3D12GraphicsCommandList* cl) {
     ID3D12PipelineState* twin = nullptr;
     ID3D12PipelineState* p = wanted_for(cl, s.game, &region, &twin);
     if (region == 2 && twin) {  // drawn for both eyes in slice 0's region
+        // ... except inside an occlusion query (the probe, 2026-10-13: the pre-pass's queries are resolved and predicate
+        // the main pass's draws in the same pass; skipped here, eye 2's queries saw nothing, its main pass skipped those
+        // objects and eye 1's pixels stayed in the shared target). Drawn again as the game's, with pass 2's same math, so
+        // the depth is equal and the query counts what eye 2 sees (KF2VR's lesson: occlusion per eye).
+        if (s.queries_open > 0) {
+            g_draws_queried.fetch_add(1, std::memory_order_relaxed);
+            if (s.game) bind(cl, s, s.game);
+            return false;
+        }
         g_draws_skipped.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
     if (s.game) bind(cl, s, p);  // (out of a region a twin left bound goes back to the game's)
     if (region == 1) (p != s.game ? g_draws_both : g_draws_plain).fetch_add(1, std::memory_order_relaxed);
     return false;
+}
+
+// ---- the query probe: per region (0 outside, 1 slice 0's, 2 slice 1's) and kind, counts; the index and offset ranges
+struct QStat {
+    uint64_t n = 0;
+    uint64_t lo = ~0ull, hi = 0;  // the query indices (or the predicate offsets) seen
+};
+std::mutex g_qmutex;
+QStat g_q[5][4];  // 0 before any region this frame, 1 in slice 0's, 2 in slice 1's, 3 after slice 0's, 4 after slice 1's
+std::unordered_map<ID3D12Resource*, int> g_pred_res;  // predicate buffers seen (by region bits)
+void on_query_impl(ID3D12GraphicsCommandList* cl, int kind, UINT index, ID3D12Resource* res, UINT64 off, UINT n) {
+    bool arrays = false;
+    int region = prepass::vi_region(cl, &arrays);
+    if (!region) region = prepass::last_slice() < 0 ? 0 : 3 + prepass::last_slice();
+    std::lock_guard lock(g_qmutex);
+    QStat& q = g_q[region][kind];
+    q.n += n;
+    const uint64_t v = kind == 3 ? off : index;
+    if (v < q.lo) q.lo = v;
+    if (v + (kind == 2 ? n : 1) > q.hi) q.hi = v + (kind == 2 ? n : 1);
+    if (res) g_pred_res[res] |= 1 << (region * 2 + (kind == 3 ? 0 : 1));  // bit 2r: predicate, 2r+1: resolve target
+}
+
+void on_query(ID3D12GraphicsCommandList* cl, int kind, D3D12_QUERY_TYPE type, UINT index, ID3D12Resource* res, UINT64 off, UINT n) {
+    if (!g_configured.load(std::memory_order_relaxed)) return;
+    if (kind <= 1 && (type == D3D12_QUERY_TYPE_OCCLUSION || type == D3D12_QUERY_TYPE_BINARY_OCCLUSION)) {
+        ListState& s = list(cl);
+        s.queries_open = kind == 0 ? s.queries_open + 1 : (s.queries_open > 0 ? s.queries_open - 1 : 0);
+    }
+    on_query_impl(cl, kind, index, res, off, n);
 }
 
 bool skip_clear(ID3D12GraphicsCommandList* cl) {
@@ -448,15 +489,44 @@ std::string command(const std::vector<std::string>& t) {
         ReleaseSRWLockShared(&g_lock);
         return r.empty() ? "no pipeline of that vertex shader" : r;
     }
+    if (sub == "queries") {  // the query probe: per region, Begin/End/Resolve/Predicate counts and ranges; "queries reset"
+        std::lock_guard lock(g_qmutex);
+        if (t.size() >= 3 && t[2] == "reset") {
+            for (auto& r : g_q)
+                for (auto& q : r) q = QStat{};
+            g_pred_res.clear();
+            return "reset";
+        }
+        static const char* const kKind[4] = {"begin", "end", "resolve", "predicate"};
+        std::string out;
+        static const char* const kWhere[5] = {"before the regions:", " | slice 0 region:", " | slice 1 region:", " | after slice 0 (pass 1's main):",
+                                              " | after slice 1 (pass 2's main):"};
+        for (int r = 0; r < 5; ++r) {
+            out += kWhere[r];
+            for (int k = 0; k < 4; ++k) {
+                char x[96];
+                std::snprintf(x, sizeof(x), " %s %llu [%llu..%llu)", kKind[k], static_cast<unsigned long long>(g_q[r][k].n),
+                              static_cast<unsigned long long>(g_q[r][k].n ? g_q[r][k].lo : 0), static_cast<unsigned long long>(g_q[r][k].hi));
+                out += x;
+            }
+        }
+        for (auto& [res, bits] : g_pred_res) {
+            char x[64];
+            std::snprintf(x, sizeof(x), " | buffer %p bits %x", static_cast<void*>(res), bits);
+            out += x;
+        }
+        return out;
+    }
     char b[640];
     std::snprintf(b, sizeof(b),
                   "vi %s, tier %d | pipelines kept %llu, twins %llu (refused %llu; no converted vs %llu, ps %llu; other stages %llu) | "
-                  "slice 0: draws for both eyes %llu, as the game's %llu | slice 1: draws skipped %llu, clears skipped %llu | rebinds %llu | %s",
+                  "slice 0: draws for both eyes %llu, as the game's %llu | slice 1: draws skipped %llu, drawn for their queries %llu, clears skipped %llu | rebinds %llu | %s",
                   wanted() ? "on" : g_on.load() ? "on, no twin yet" : "off", g_tier, static_cast<unsigned long long>(g_kept_n.load()),
                   static_cast<unsigned long long>(g_made.load()), static_cast<unsigned long long>(g_failed.load()),
                   static_cast<unsigned long long>(g_no_vs.load()), static_cast<unsigned long long>(g_no_ps.load()),
                   static_cast<unsigned long long>(g_stages.load()), static_cast<unsigned long long>(g_draws_both.load()),
                   static_cast<unsigned long long>(g_draws_plain.load()), static_cast<unsigned long long>(g_draws_skipped.load()),
+                  static_cast<unsigned long long>(g_draws_queried.load()),
                   static_cast<unsigned long long>(g_clears_skipped.load()), static_cast<unsigned long long>(g_rebinds.load()),
                   prepass::vi_status().c_str());
     return b;

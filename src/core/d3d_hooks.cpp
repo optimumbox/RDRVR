@@ -304,6 +304,11 @@ ClearRTV_t o_ClearRTV = nullptr;
 ClearDSV_t o_ClearDSV = nullptr;
 BeginEvent_t o_BeginEvent = nullptr;
 EndQuery_t o_EndQuery = nullptr;
+using BeginQuery_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12QueryHeap*, D3D12_QUERY_TYPE, UINT);
+using ResolveQuery_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12QueryHeap*, D3D12_QUERY_TYPE, UINT, UINT, ID3D12Resource*,
+                                                 UINT64);
+BeginQuery_t o_BeginQuery = nullptr;
+ResolveQuery_t o_ResolveQuery = nullptr;
 ExecuteIndirect_t o_ExecuteIndirect = nullptr;
 SetPredication_t o_SetPredication = nullptr;
 Close_t o_Close = nullptr;
@@ -460,7 +465,17 @@ HRESULT STDMETHODCALLTYPE hk_Reset(ID3D12GraphicsCommandList* cl, ID3D12CommandA
     vi::on_reset(cl, ps);
     return o_Reset(cl, a, ps);
 }
+void STDMETHODCALLTYPE hk_BeginQuery(ID3D12GraphicsCommandList* cl, ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) {
+    vi::on_query(cl, 0, t, i, nullptr, 0, 1);
+    o_BeginQuery(cl, h, t, i);
+}
+void STDMETHODCALLTYPE hk_ResolveQuery(ID3D12GraphicsCommandList* cl, ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT start, UINT n,
+                                       ID3D12Resource* dst, UINT64 off) {
+    vi::on_query(cl, 2, t, start, dst, off, n);
+    o_ResolveQuery(cl, h, t, start, n, dst, off);
+}
 void STDMETHODCALLTYPE hk_EndQuery(ID3D12GraphicsCommandList* cl, ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) {
+    vi::on_query(cl, 1, t, i, nullptr, 0, 1);
     ++t_queries;
     fg_count(cl, [](ListLog& l) { ++l.queries; });
     o_EndQuery(cl, h, t, i);
@@ -542,6 +557,7 @@ void STDMETHODCALLTYPE hk_BeginEvent(ID3D12GraphicsCommandList* cl, UINT meta, c
     o_BeginEvent(cl, meta, data, size);
 }
 void STDMETHODCALLTYPE hk_SetPredication(ID3D12GraphicsCommandList* cl, ID3D12Resource* r, UINT64 off, D3D12_PREDICATION_OP op) {
+    vi::on_query(cl, 3, static_cast<D3D12_QUERY_TYPE>(op), 0, r, off, 1);
     fg_count(cl, [](ListLog& l) { ++l.queries; });
     o_SetPredication(cl, r, off, op);
 }
@@ -778,6 +794,8 @@ void hook_command_list_methods(ID3D12Device* dev) {
     hooks::install("CL::ClearDepthStencilView", hooks::vtable_entry(cl, 47), hk_ClearDSV, &o_ClearDSV);
     hooks::install("CL::ClearRenderTargetView", hooks::vtable_entry(cl, 48), hk_ClearRTV, &o_ClearRTV);
     hooks::install("CL::EndQuery", hooks::vtable_entry(cl, 53), hk_EndQuery, &o_EndQuery);
+    hooks::install("CL::BeginQuery", hooks::vtable_entry(cl, 52), hk_BeginQuery, &o_BeginQuery);
+    hooks::install("CL::ResolveQueryData", hooks::vtable_entry(cl, 54), hk_ResolveQuery, &o_ResolveQuery);
     hooks::install("CL::SetPredication", hooks::vtable_entry(cl, 55), hk_SetPredication, &o_SetPredication);
     hooks::install("CL::BeginEvent", hooks::vtable_entry(cl, 57), hk_BeginEvent, &o_BeginEvent);
     hooks::install("CL::ExecuteIndirect", hooks::vtable_entry(cl, 59), hk_ExecuteIndirect, &o_ExecuteIndirect);

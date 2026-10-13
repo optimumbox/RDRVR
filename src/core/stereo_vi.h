@@ -30,6 +30,9 @@ ID3D12PipelineState* on_set_pso(ID3D12GraphicsCommandList* cl, ID3D12PipelineSta
 void on_reset(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps);
 bool before_draw(ID3D12GraphicsCommandList* cl);
 bool skip_clear(ID3D12GraphicsCommandList* cl);
+// The query probe (I2's occlusion study): kind 0 BeginQuery, 1 EndQuery, 2 ResolveQueryData (index = start, n), 3
+// SetPredication (res and off: the predicate's buffer; type: the op). Counted per region of a view-instanced frame.
+void on_query(ID3D12GraphicsCommandList* cl, int kind, D3D12_QUERY_TYPE type, UINT index, ID3D12Resource* res, UINT64 off, UINT n);
 bool wanted();      // this frame's pre-pass may draw both eyes (configured, switched on, twins made)
 bool configured();  // [Stereo] ViPrepass on and its prerequisites met
 std::string command(const std::vector<std::string>& t);
