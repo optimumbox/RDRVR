@@ -360,6 +360,7 @@ void eye2_update(char* p) {
     at<int>(p, kJitterIndex) = t_index_base - 1;
     reinterpret_cast<Persp_t>(anchors::addr(Id::ViewportPerspective))(vp2);  // without jitter, as pass 2 starts it
     update_on(p, vp2);
+    prepass::set_eye1_prev(b + 0xc0);              // eye 1's gPrevViewProj (its update's, kept above)
     prepass::set_eye2(vp2, p + kPrevBlock + 0xc0);  // +0x4f0: gPrevViewProj
     std::memcpy(p + kJitter, a, sizeof(a));
     std::memcpy(p + kPrevBlock, b, sizeof(b));

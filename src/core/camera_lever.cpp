@@ -353,6 +353,15 @@ bool build_union_vp(void* vp, const float* cam_in);
 // the second pass would see consumed, and runs the post chain for the first eye between the passes (with the first
 // pass's viewport still current).
 std::atomic<float> g_scene_near{0}, g_scene_far{0};
+// View-instanced pre-pass (stereo_vi.h): in such a frame the pre-pass draws both eyes from pass 1's walk, whose world
+// matrices are relative to eye 1's camera, with eye 2's view-projection moved by eye 1 - eye 2. Pass 2's main pass must
+// compute eye 2's depth the same way, or its EQUAL depth test fails against the pre-pass (holes): pass 2's camera gets
+// eye 1's position (so its world matrices are eye 1's), and after each SetCamera of it the view-projection (+0xc0) is
+// moved by the offset and the camera position (+0x140 row 3) set back to eye 2's. The render thread only.
+bool t_vi_frame = false;          // this frame's pre-pass is view-instanced (prepass::latch_vi)
+bool t_vi_fix = false;            // inside pass 2 of such a frame
+float t_vi_c1[3], t_vi_c2[3];     // eye 1's and eye 2's camera positions (pass 1)
+std::atomic<uint64_t> g_vi_fixes{0}, g_vi_frames{0};
 thread_local float t_frame_yaw = 0.0f;  // the test yaw latched once a frame: both passes and the union see the same
 
 void hk_SceneRender(void* renderer, void* vp, const float* cam_game, void* a4) {
@@ -400,6 +409,8 @@ void hk_SceneRender(void* renderer, void* vp, const float* cam_game, void* a4) {
         std::memcpy(g_saved_vp, vp, kViewportSize);
         g_union_ok = dual_pass::shadows_wanted() && g_xr_pose.load(std::memory_order_relaxed) && build_union_vp(vp, cam);
         dual_pass::begin_frame(renderer);
+        t_vi_frame = prepass::latch_vi();
+        if (t_vi_frame) g_vi_frames.fetch_add(1, std::memory_order_relaxed);
         const double t1 = probe ? log::now_ms() : 0;
         if (probe) frame_probe::set_phase(frame_probe::kPhasePass1);
         scene_once(renderer, vp, cam, a4, first);
@@ -410,6 +421,7 @@ void hk_SceneRender(void* renderer, void* vp, const float* cam_game, void* a4) {
         if (probe) frame_probe::set_phase(frame_probe::kPhasePass2);
         std::memcpy(vp, g_saved_vp, kViewportSize);
         scene_once(renderer, vp, cam, a4, 1 - first);
+        t_vi_frame = false;
         dual_pass::end_frame(1 - first);
         g_double_frames.fetch_add(1, std::memory_order_relaxed);
         if (probe) {
@@ -501,29 +513,47 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
         }
     }
     if (cam) ring_probe::matrix_expect(pass_eye, copy + 12, other + 12, cam + 12);
-    if (xr_pose && have && eye == 3 && pass_eye == (g_swap.load(std::memory_order_relaxed) ? 1 : 0) && prepass::views_wanted() &&
-        xr::eye_views(views)) {
+    const bool first_pass = pass_eye == (g_swap.load(std::memory_order_relaxed) ? 1 : 0);
+    // A view-instanced frame (hk_Regenerate): pass 1 keeps both eyes' positions; eye 2's private viewport takes eye 1's
+    // position, as pass 2 will, so its rows, its jitter and its TAA history are pass 2's own
+    alignas(16) float other_at_c1[16];
+    std::memcpy(other_at_c1, other, sizeof(other_at_c1));
+    if (t_vi_frame && first_pass && cam) {
+        std::memcpy(t_vi_c1, copy + 12, sizeof(t_vi_c1));
+        std::memcpy(t_vi_c2, other + 12, sizeof(t_vi_c2));
+        std::memcpy(other_at_c1 + 12, t_vi_c1, sizeof(t_vi_c1));
+    }
+    if (xr_pose && have && eye == 3 && first_pass && prepass::views_wanted() && xr::eye_views(views)) {
         // [Stereo] PrepassViews: the other eye's viewport now, as pass 2 will make it (its saved copy, that eye's
         // tangents, its camera); never current, so the engine pushes and records nothing for it
         const float* a2 = views[pass_eye == 1 ? 0 : 1].fov;
         std::memcpy(g_eye2_vp, g_saved_vp, kViewportSize);
         apply_tangents(g_eye2_vp, std::tan(a2[0]), std::tan(a2[1]), std::tan(a2[2]), std::tan(a2[3]));
-        o_SetCamera(g_eye2_vp, other);
+        o_SetCamera(g_eye2_vp, t_vi_frame ? other_at_c1 : other);
         prepass::set_eye2_offset(copy + 12, other + 12);
         prepass::set_eye2(g_eye2_vp, nullptr);  // (without jitter; the TAA update's jittered rows replace these)
         g_eye2_frame = state::presents.load();
-    } else if (!xr_pose && ipd != 0 && cam && pass_eye == (g_swap.load(std::memory_order_relaxed) ? 1 : 0) &&
-               prepass::views_wanted()) {
+    } else if (!xr_pose && ipd != 0 && cam && first_pass && prepass::views_wanted()) {
         // the flat double pass ("double on <ipd>", no headset): eye 2's viewport is the frame's with the other eye's
         // camera, so the view-instanced pre-pass can be tested on the monitor
         std::memcpy(g_eye2_vp, g_saved_vp, kViewportSize);
-        o_SetCamera(g_eye2_vp, other);
+        o_SetCamera(g_eye2_vp, t_vi_frame ? other_at_c1 : other);
         prepass::set_eye2_offset(copy + 12, other + 12);
         prepass::set_eye2(g_eye2_vp, nullptr);
         g_eye2_frame = state::presents.load();
     }
     if (pass_eye >= 0 && (ipd != 0 || xr_pose) && cam) {
         if (have) round_draw::note_pass(pass_eye, copy, l, r, u, d);  // [Reload] RoundInHand: this eye's camera
+        const bool second = !first_pass;
+        if (t_vi_frame && second) {  // drawn from eye 1's position, its view rows moved after each SetCamera (hk_SetCamera)
+            std::memcpy(copy + 12, t_vi_c1, sizeof(t_vi_c1));
+            t_vi_fix = true;
+            o_SceneRender(renderer, vp, copy, a4);
+            t_vi_fix = false;
+            ring_probe::matrix_expect(-2, nullptr, nullptr, nullptr);
+            t_scene_vp = outer;
+            return;
+        }
         o_SceneRender(renderer, vp, copy, a4);
         ring_probe::matrix_expect(-2, nullptr, nullptr, nullptr);
         if (pass_eye == (g_swap.load() ? 1 : 0) && g_findcam.exchange(false)) {
@@ -554,6 +584,14 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
 
 void hk_SetCamera(void* vp, const float* cam) {
     o_SetCamera(vp, cam);
+    if (t_vi_fix && vp == t_scene_vp) {
+        // (the view-projection's move is made in hk_Regenerate, which SetCamera calls and which rebuilds +0xc0 each time)
+        char* v = static_cast<char*>(vp);
+        float* vi = reinterpret_cast<float*>(v + 0x140);
+        for (int k = 0; k < 3; ++k) vi[12 + k] = t_vi_c2[k];
+        if (o_PushGlobals) o_PushGlobals(vp, 1);  // (the camera's globals again, with eye 2's position)
+        return;
+    }
     if (vp != t_scene_vp || !g_active.load(std::memory_order_relaxed)) return;
     Offset o = current();
     char* v = static_cast<char*>(vp);
@@ -567,6 +605,20 @@ void hk_SetCamera(void* vp, const float* cam) {
     }
     g_applied.fetch_add(1, std::memory_order_relaxed);
     g_regenerate(vp, 1);
+}
+
+// grcViewport::Regenerate rebuilds the rotation-only view-projection (+0xc0) from View and the projection, from scratch:
+// in pass 2 of a view-instanced frame each rebuild of the scene viewport gets eye 2's move (as prepass_arrays.cpp's
+// set_eye2 writes the pre-pass's rows: row 3 += d x rows 0-2, the same expression, so the same bits).
+Regenerate_t o_Regenerate = nullptr;
+void hk_Regenerate(void* vp, char push) {
+    o_Regenerate(vp, push);
+    if (!((t_vi_fix && vp == t_scene_vp) || (t_vi_frame && vp == g_eye2_vp))) return;
+    float* m = reinterpret_cast<float*>(static_cast<char*>(vp) + 0xc0);
+    const float d[3] = {t_vi_c1[0] - t_vi_c2[0], t_vi_c1[1] - t_vi_c2[1], t_vi_c1[2] - t_vi_c2[2]};
+    for (int c = 0; c < 4; ++c) m[12 + c] += d[0] * m[c] + d[1] * m[4 + c] + d[2] * m[8 + c];
+    if (push && vp == t_scene_vp && o_PushGlobals) o_PushGlobals(vp, 1);  // (eye 2's private viewport is never current)
+    g_vi_fixes.fetch_add(1, std::memory_order_relaxed);
 }
 
 alignas(16) float g_cover_cam[16];  // the yawed camera handed to the visibility build (it may keep the pointer)
@@ -839,6 +891,11 @@ bool install() {
                         &o_AudioListeners))
         log::warn("[cam] the audio listeners' hook not installed: the game's own (the body's heading)");
     g_regenerate = reinterpret_cast<Regenerate_t>(anchors::addr(anchors::Id::ViewportRegenerate));
+    // the view-instanced pre-pass's pass 2 (stereo_vi.h; test only): hooked only with it configured
+    if (config::get_bool("Stereo", "ViPrepass", false) &&
+        !hooks::install("RDR grcViewport::Regenerate (view-instanced pass 2)", reinterpret_cast<void*>(g_regenerate), hk_Regenerate,
+                        &o_Regenerate))
+        log::warn("[cam] Regenerate not hooked: pass 2 of a view-instanced frame keeps its own rows");
     g_perspective = reinterpret_cast<Perspective_t>(anchors::addr(anchors::Id::ViewportPerspective));
     g_head_cover = config::get_bool("XR", "HeadCover", true);
     bool ok = hooks::install("RDR SceneRender", reinterpret_cast<void*>(anchors::addr(anchors::Id::SceneRender)),

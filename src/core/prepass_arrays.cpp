@@ -284,6 +284,21 @@ bool rd(uintptr_t a, T* out) {
 
 void walk_end_cb(void*) { g_end_pending.store(true, std::memory_order_release); }
 
+// View-instanced frames are decided on the render thread (pass 2's camera depends on it, camera_lever.cpp) and told to
+// the playback thread through the stream: a marker recorded before pass 1 sets the next slice-0 region's choice.
+std::atomic<int> g_next_vi{0};  // 1: the next slice-0 region draws both eyes
+thread_local bool t_latched_vi = false;  // the render thread's choice for its current frame (latch_vi)
+void vi_on_cb(void*) { g_next_vi.store(1, std::memory_order_release); }
+void vi_off_cb(void*) { g_next_vi.store(0, std::memory_order_release); }
+bool append_marker(void (*fn)(void*)) {
+    uintptr_t dev = 0, hrec = 0, rec = 0, vt = 0;
+    if (!rd(anchors::addr(anchors::Id::D3dDeviceSingleton), &dev) || !rd(dev + 0x58, &hrec) || !rd(hrec + 0x128, &rec) || !rd(rec, &vt) ||
+        vt != anchors::addr(anchors::Id::RecorderVtbl))
+        return false;
+    reinterpret_cast<Append_t>(anchors::addr(anchors::Id::DeferredAppend))(reinterpret_cast<void*>(rec), reinterpret_cast<void*>(fn), nullptr, 0);
+    return true;
+}
+
 // ---- [Stereo] PrepassViews, step 1 (observe): the render thread only
 struct Rows {
     float wv[16], vi[16], pvp[16], vport[4];  // gWorldView, gViewInverse (b1), gPrevViewProj (rage_prev_proj), gViewport
@@ -294,6 +309,39 @@ float g_e2_wv[16], g_e2_vi[16], g_e2_pvp[16];  // pass 1's prediction of eye 2's
 bool g_e2_ok = false, g_e2_pvp_ok = false;
 float g_e2_off[3] = {0, 0, 0};  // eye 1's camera position less eye 2's (set_eye2_offset, before set_eye2)
 bool g_e2_off_ok = false;
+float g_e1_pvp[16];       // eye 1's gPrevViewProj this frame (taa.cpp, before eye 2's update): D's first factor
+bool g_e1_pvp_ok = false;
+// ---- eye 2's motion vectors in view-instanced draws (KF2VR's lesson: each eye's own previous-to-current transform, in
+// double precision). The per-draw gPrevWorldViewProjSingle (rage_prev_world) is the draw's previous world times the
+// pass's gPrevViewProj; both passes share the world (eye 1's camera-relative frame), so eye 2's is eye 1's times
+// D = inverse(eye 1's gPrevViewProj) x eye 2's. D goes to rage_matrices rows 21-24 (eye 2's gWorldViewProj slot, unused:
+// the converter refuses that row), where view 1 of a converted shader multiplies its rage_prev_world rows by it.
+// Identity when the previous view-projections are not known (no TAA or DLSS update: no motion vectors used then).
+float g_e2_delta[16];
+bool g_e2_delta_ok = false;
+bool invert4(const double m[16], double out[16]) {
+    double inv[16];
+    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+    const double det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if (!(std::fabs(det) > 1e-30)) return false;
+    for (int i = 0; i < 16; ++i) out[i] = inv[i] / det;
+    return true;
+}
 uint64_t g_e2_frame = ~0ull;
 struct Stats {
     uint64_t frames = 0, refused = 0;
@@ -361,6 +409,10 @@ Grown g_b1, g_pp;           // rage_matrices, rage_prev_proj
 int g_grow_state = 0;       // 0 not tried, 1 grown, -1 refused
 char g_grow_why[160] = "";
 uint64_t g_written = 0, g_kept = 0, g_lost = 0;
+uint64_t g_vi_rows_same = 0, g_vi_rows_differ = 0;  // view-instanced frames: pass 2's gWorldView/position as the pre-pass's
+float g_vi_rows_max = 0;
+uint64_t g_mv_checks = 0;  // view-instanced frames whose motion-vector transform was checked against pass 2
+float g_mv_err = 0;        // the largest relative difference
 float g_written_wv[16], g_written_vi[16], g_written_pp[16];
 
 bool grow(Grown& g, uintptr_t cb, uint32_t declared, uint32_t grown, uint32_t alloc) {
@@ -459,6 +511,28 @@ void write_eye2(const float* wv, const float* vi, const float* pvp) {
     std::memcpy(g_written_pp, pp, 64);
     ++g_written;
 }
+void write_prev_delta(const float* p1, const float* p2) {
+    double d[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    bool ok = false;
+    if (p1 && p2) {
+        double a[16], inv[16];
+        for (int i = 0; i < 16; ++i) a[i] = p1[i];
+        if (invert4(a, inv)) {
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 4; ++c) {
+                    double s = 0;
+                    for (int k = 0; k < 4; ++k) s += inv[r * 4 + k] * static_cast<double>(p2[k * 4 + c]);
+                    d[r * 4 + c] = s;
+                }
+            ok = true;
+            for (double x : d) ok = ok && std::isfinite(x);
+        }
+    }
+    if (!ok) d[0] = d[5] = d[10] = d[15] = 1, d[1] = d[2] = d[3] = d[4] = d[6] = d[7] = d[8] = d[9] = d[11] = d[12] = d[13] = d[14] = 0;
+    for (int i = 0; i < 16; ++i) g_e2_delta[i] = static_cast<float>(d[i]);
+    g_e2_delta_ok = ok;
+    write_raw(g_b1.block + 0x150, g_e2_delta, 64);  // rows 21-24 (re-uploaded with the rows write_eye2 marked)
+}
 // after pass 1's walk: the rows still as written (nothing else writes past the declared ends)
 void check_written() {
     if (g_grow_state <= 0) return;
@@ -488,8 +562,38 @@ void observe_after_walk() {
     Rows& r = g_seen[pass - 1];
     r.ok = global_rows(anchors::Id::HandleWorldView, r.wv, 64) && global_rows(anchors::Id::HandleViewInverse, r.vi, 64) &&
            global_rows(anchors::Id::HandlePrevViewProj, r.pvp, 64) && global_rows(anchors::Id::HandleViewport, r.vport, 16);
+    // the motion-vector transform's check: the walk's last draw's gPrevWorldViewProjSingle, pass 1's times D against the
+    // game's own in pass 2 (the same draw: both passes walk the same lists)
+    {
+        static float pw1[16];
+        static bool pw1_ok = false;
+        float pw[16];
+        const bool got = global_rows(anchors::Id::HandlePrevWorldVP, pw, 64);
+        if (pass == 1) {
+            pw1_ok = got && t_latched_vi && g_e2_delta_ok;
+            if (pw1_ok) std::memcpy(pw1, pw, sizeof(pw1));
+        } else if (pw1_ok && got) {
+            float pred[16];
+            for (int rr = 0; rr < 4; ++rr)
+                for (int c = 0; c < 4; ++c) {
+                    float s = 0;
+                    for (int k = 0; k < 4; ++k) s += pw1[rr * 4 + k] * g_e2_delta[k * 4 + c];
+                    pred[rr * 4 + c] = s;
+                }
+            float scale = 1e-6f;
+            for (float x : pw) scale = std::fmax(scale, std::fabs(x));
+            g_mv_err = std::fmax(g_mv_err, max_diff(pred, pw, 16) / scale);
+            ++g_mv_checks;
+            pw1_ok = false;
+        }
+    }
     if (pass != 2) return;
     const uint64_t f = state::presents.load();
+    if (r.ok && t_latched_vi && g_written) {  // a view-instanced frame: pass 2's rows are the ones its pre-pass drew with
+        const float dw = max_diff(g_written_wv, r.wv, 16), dv = max_diff(g_written_vi + 12, r.vi + 12, 3);
+        g_vi_rows_max = std::fmax(g_vi_rows_max, std::fmax(dw, dv));
+        ++(dw == 0.0f && dv == 0.0f ? g_vi_rows_same : g_vi_rows_differ);
+    }
     if (!g_seen[0].ok || !r.ok || !g_e2_ok || g_e2_frame != f) {
         ++g_vs.refused;
         return;
@@ -618,7 +722,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_dsv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
     // view-instanced stereo: slice 0's region draws both eyes when wanted; slice 1's region follows it in the same frame
     // only (a frame whose slice 0 drew one eye draws slice 1 itself)
     if (slice == 0) {
-        g_r.vi = vi::wanted();
+        g_r.vi = g_next_vi.exchange(0, std::memory_order_acq_rel) != 0;
         g_vi_frame = g_r.vi ? f : ~0ull;
     } else {
         g_r.vi = g_vi_frame == f;
@@ -742,15 +846,26 @@ void before_draw(ID3D12GraphicsCommandList* cl) {
     if (cl == g_r.cl && g_end_pending.load(std::memory_order_acquire)) end_region(cl);
 }
 
+bool latch_vi() {
+    const bool want = g_on.load(std::memory_order_relaxed) && !g_failed.load(std::memory_order_relaxed) && vi::wanted();
+    t_latched_vi = false;
+    if (!append_marker(want ? &vi_on_cb : &vi_off_cb)) return false;
+    t_latched_vi = want;
+    return want;
+}
+
 int vi_region(const ID3D12GraphicsCommandList* cl, bool* all_arrays) {
     if (!g_active.load(std::memory_order_relaxed) || cl != g_r.cl || !g_r.vi) return 0;
     if (all_arrays) *all_arrays = g_r.all_arrays;
     return g_r.slice + 1;
 }
 std::string vi_status() {
-    char b[160];
-    std::snprintf(b, sizeof(b), "view-instanced regions: slice 0 %llu, slice 1 %llu",
-                  static_cast<unsigned long long>(g_vi_regions[0].load()), static_cast<unsigned long long>(g_vi_regions[1].load()));
+    char b[400];
+    std::snprintf(b, sizeof(b), "view-instanced regions: slice 0 %llu, slice 1 %llu | pass 2's rows as the pre-pass's: same %llu, differ %llu (max %.7f)"
+                  " | motion vectors: D %s, checked %llu frames, largest relative difference %.2e",
+                  static_cast<unsigned long long>(g_vi_regions[0].load()), static_cast<unsigned long long>(g_vi_regions[1].load()),
+                  static_cast<unsigned long long>(g_vi_rows_same), static_cast<unsigned long long>(g_vi_rows_differ), g_vi_rows_max,
+                  g_e2_delta_ok ? "from the updates" : "identity", static_cast<unsigned long long>(g_mv_checks), g_mv_err);
     return b;
 }
 
@@ -760,18 +875,18 @@ void set_eye2(const void* vp2, const void* prev_vp) {
     g_e2_ok = read_raw(reinterpret_cast<uintptr_t>(v + 0xc0), g_e2_wv, 64) && read_raw(reinterpret_cast<uintptr_t>(v + 0x140), g_e2_vi, 64);
     g_e2_pvp_ok = prev_vp && read_raw(reinterpret_cast<uintptr_t>(prev_vp), g_e2_pvp, 64);
     g_e2_frame = state::presents.load();
+    // A view-instanced frame (camera_lever.cpp hk_Regenerate): vp2 stands at eye 1's position with its view-projection
+    // already moved by eye 1 - eye 2, as pass 2 will (the world matrices both share are eye 1's); its camera position
+    // goes back to eye 2's for the shaders (gViewInverse), as pass 2's SetCamera hook does.
+    if (g_e2_ok && t_latched_vi && g_e2_off_ok)
+        for (int i = 0; i < 3; ++i) g_e2_vi[12 + i] -= g_e2_off[i];
     if (g_e2_ok && g_views_write.load(std::memory_order_relaxed) && g_grow_state >= 0) {
-        // View-instanced draws (stereo_vi.h) share pass 1's per-draw rows, whose world matrices are relative to eye 1's
-        // camera: eye 2's gWorldView then also moves by eye 1 - eye 2 (row-vector p (T M): row 3 += d x M's rows 0-2).
-        // The comparison with the game's pass 2 (observe_after_walk) keeps the untranslated prediction.
-        float wv[16];
-        std::memcpy(wv, g_e2_wv, sizeof(wv));
-        if (g_e2_off_ok && vi::configured())
-            for (int c = 0; c < 4; ++c) wv[12 + c] += g_e2_off[0] * wv[c] + g_e2_off[1] * wv[4 + c] + g_e2_off[2] * wv[8 + c];
-        write_eye2(wv, g_e2_vi, g_e2_pvp_ok ? g_e2_pvp : nullptr);
+        write_eye2(g_e2_wv, g_e2_vi, g_e2_pvp_ok ? g_e2_pvp : nullptr);
+        if (t_latched_vi) write_prev_delta(g_e1_pvp_ok ? g_e1_pvp : nullptr, g_e2_pvp_ok ? g_e2_pvp : nullptr);
     }
-    g_e2_off_ok = false;
+    g_e1_pvp_ok = false;
 }
+void set_eye1_prev(const void* p1) { g_e1_pvp_ok = p1 && read_raw(reinterpret_cast<uintptr_t>(p1), g_e1_pvp, 64); }
 void set_eye2_offset(const float* eye1, const float* eye2) {
     for (int i = 0; i < 3; ++i) g_e2_off[i] = eye1[i] - eye2[i];
     g_e2_off_ok = true;

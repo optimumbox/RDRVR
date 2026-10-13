@@ -35,6 +35,9 @@ std::string status();
 // both slices) or 2 (slice 1's: the draws made in slice 0's are skipped), else 0. *all_arrays: every target bound now is
 // one of the six (only then can a view-instanced pipeline draw).
 int vi_region(const ID3D12GraphicsCommandList* cl, bool* all_arrays);
+// The render thread, before pass 1 of a double frame: whether this frame's pre-pass is view-instanced (recorded into the
+// stream for the playback thread's regions; false when the marker could not be recorded).
+bool latch_vi();
 std::string vi_status();
 // [Stereo] PrepassViews (milestone 3, test only; stageVI-prepass.md): eye 2's per-view constants for pass 1.
 // Step 1, observe only (nothing written to the game): camera_lever builds a private eye-2 viewport in pass 1 and hands
@@ -46,6 +49,8 @@ bool views_wanted();
 void set_eye2(const void* vp2, const void* prev_vp);
 // Before set_eye2: the two eyes' camera positions (world), for the view-instanced pre-pass's eye-2 rows
 void set_eye2_offset(const float* eye1, const float* eye2);
+// Before set_eye2 (taa.cpp's eye-2 update): eye 1's gPrevViewProj this frame, for eye 2's motion-vector transform
+void set_eye1_prev(const void* p1);
 std::string views_status();
 void views_size(bool grown);  // the test's: the two declared sizes grown or as the game's (from the next pass 1)
 // A trace of the frames after "prepass on" (or "prepass trace"): every bind, clear and barrier of the six targets

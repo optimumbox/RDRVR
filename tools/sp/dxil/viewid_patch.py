@@ -28,9 +28,13 @@ REFUSED_ROWS = {'rage_matrices': range(8, 12)}
 VIEW_NAME = re.compile(r'View(?!port)|Camera|Proj|Eye|FOV', re.I)
 # ... except these: the same for both eyes, or handled above
 VIEW_NAME_OK = {'gViewport'}
-# rage_prev_world's gPrevWorldViewProjSingle (per draw: the motion vectors) has no eye-2 copy yet. With allow_prev_world
-# its reads stay eye 1's (eye 2's motion vectors are wrong; harmless without TAA, DLSS or motion blur); else refused.
+# rage_prev_world's gPrevWorldViewProjSingle (rows 0-3, per draw: the motion vectors) is eye 1's in the shared rows; in
+# view 1 each row read is multiplied by D (eye 1's previous view-projection inverted, times eye 2's; the core writes it
+# to rage_matrices rows 21-24, eye 2's unused gWorldViewProj slot): eye 2's own previous-frame position, as the game's
+# second pass computes it (KF2VR's lesson: each eye's own previous-to-current transform).
 PREV_WORLD = 'rage_prev_world'
+PREV_WORLD_ROWS = range(0, 4)
+DELTA_ROW = 21  # rage_matrices
 VIEWID_OPCODE = 138
 VIEWID_FLAG = 1 << 21  # ShaderFlags: ViewID
 
@@ -83,14 +87,14 @@ def check_reads(text, allow_prev_world):
         names = [n for a, b, n in lay.get(block, []) if m.group(2).startswith('%') or a <= int(m.group(2)) <= b]
         for n in names:
             if VIEW_NAME.search(n) and n not in VIEW_NAME_OK:
-                if block == PREV_WORLD and allow_prev_world:
-                    prev_world = True
+                if block == PREV_WORLD and not m.group(2).startswith('%') and int(m.group(2)) in PREV_WORLD_ROWS:
+                    prev_world = True  # handled: patch_prev_world
                     continue
                 raise Refused(f'reads {block}.{n} (camera-dependent, no eye-2 copy)')
     return prev_world
 
 
-def patch(text, allow_prev_world=True):
+def patch(text, allow_prev_world=True):  # (allow_prev_world: kept for callers; rage_prev_world is handled now)
     if '@dx.op.viewID' in text:
         raise Refused('already uses ViewID')
     lines = text.split('\n')
@@ -166,7 +170,69 @@ def patch(text, allow_prev_world=True):
         raise Refused('no shader flags entry in the entry properties')
     new_props = props.group(1).replace(flags.group(0), f'i32 0, i64 {int(flags.group(1)) | VIEWID_FLAG}', 1)
     text = text[:props.start(1)] + new_props + text[props.end(1):]
+    if approx:
+        text = patch_prev_world(text)
     return text, n_redirect, approx
+
+
+def patch_prev_world(text):
+    """view 1's reads of rage_prev_world rows 0-3 become row x D (D: rage_matrices rows 21-24); view 0's unchanged"""
+    rid = {}
+    for m in re.finditer(r'^!\d+ = !\{i32 (\d+), %"?(?:hostlayout\.)?([^"*]+)"?\* undef, !"[^"]*", i32 \d+, i32 \d+, i32 \d+, i32 \d+, null\}',
+                         text, re.M):
+        rid[m.group(2)] = m.group(1)
+    if 'rage_matrices' not in rid or PREV_WORLD not in rid:
+        raise Refused('reads rage_prev_world without rage_matrices')
+    hm = re.search(r'(%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 2, i32 ' + rid['rage_matrices'] + r',', text)
+    hp = {m.group(1) for m in re.finditer(r'(%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 2, i32 '
+                                          + rid[PREV_WORLD] + r',', text)}
+    if not hm or not hp:
+        raise Refused('rage_prev_world or rage_matrices handle not found')
+    hm = hm.group(1)
+    lines = text.split(chr(10))
+    load = re.compile(r'^  (%\d+) = call %dx\.types\.CBufRet\.f32 @dx\.op\.cbufferLoadLegacy\.f32\(i32 59, %dx\.types\.Handle (%\d+), i32 (\d+)\)')
+    out, rename, n = [], {}, 0
+    for i, ln in enumerate(lines):
+        if ln.startswith('  %vid.sp = '):
+            out.append(ln)
+            out.append('  %isv1.sp = icmp ne i32 %vid.sp, 0')
+            continue
+        m = load.match(ln)
+        out.append(ln)
+        if not m or m.group(2) not in hp or int(m.group(3)) not in PREV_WORLD_ROWS:
+            continue
+        n += 1
+        L, t = m.group(1), f'%pw{n}.sp'
+        e = [f'{t}.e{k}' for k in range(4)]
+        for k in range(4):
+            out.append(f'  {e[k]} = extractvalue %dx.types.CBufRet.f32 {L}, {k}')
+        for j in range(4):
+            # (a constant row past the block's declared end fails validation: view 0 reads row j instead, unused)
+            out.append(f'  {t}.r{j} = select i1 %isv1.sp, i32 {DELTA_ROW + j}, i32 {j}')
+            out.append(f'  {t}.d{j} = call %dx.types.CBufRet.f32 @dx.op.cbufferLoadLegacy.f32(i32 59, %dx.types.Handle {hm}, i32 {t}.r{j})')
+            for k in range(4):
+                out.append(f'  {t}.d{j}c{k} = extractvalue %dx.types.CBufRet.f32 {t}.d{j}, {k}')
+        for k in range(4):  # (row x D)[k] = sum_j row[j] D[j][k]
+            out.append(f'  {t}.m0c{k} = fmul float {e[0]}, {t}.d0c{k}')
+            for j in range(1, 4):
+                out.append(f'  {t}.m{j}c{k} = fmul float {e[j]}, {t}.d{j}c{k}')
+                prev = f'{t}.m0c{k}' if j == 1 else f'{t}.a{j - 1}c{k}'
+                out.append(f'  {t}.a{j}c{k} = fadd float {prev}, {t}.m{j}c{k}')
+            out.append(f'  {t}.s{k} = select i1 %isv1.sp, float {t}.a3c{k}, float {e[k]}')
+        rename[L] = t
+    if not n:
+        return text
+    # the original component reads of each such load now read the selected values
+    ext = re.compile(r'^  (%\d+) = extractvalue %dx\.types\.CBufRet\.f32 (%\d+), (\d)$')
+    # (the original reads stay, now unused: removing them would renumber the unnamed values after them)
+    alias, defs = {}, set()
+    for i, ln in enumerate(out):
+        m = ext.match(ln.split('  ;')[0].rstrip())
+        if m and m.group(2) in rename:
+            alias[m.group(1)] = f'{rename[m.group(2)]}.s{m.group(3)}'
+            defs.add(i)
+    tok = re.compile(r'%\d+(?![\w.])')
+    return chr(10).join(ln if i in defs else tok.sub(lambda mm: alias.get(mm.group(0), mm.group(0)), ln) for i, ln in enumerate(out))
 
 
 def main():

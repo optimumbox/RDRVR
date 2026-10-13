@@ -85,7 +85,7 @@ def main():
                 counts['failed'] += 1
                 continue
             (out / f'{kind}_{h}.dxil').write_bytes(signed)
-            report.append(f'{kind} {h} ok ({n} row reads{"; eye 1 motion vectors" if approx else ""})')
+            report.append(f'{kind} {h} ok ({n} row reads{"; motion vectors through D" if approx else ""})')
             counts['ok'] += 1
     (out / 'ps_safe.txt').write_text(''.join(x + '\n' for x in safe), encoding='utf-8')
     (out / 'report.txt').write_text('\n'.join(report) + '\n', encoding='utf-8')
