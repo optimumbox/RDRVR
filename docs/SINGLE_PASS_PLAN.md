@@ -153,6 +153,30 @@ Each milestone is a switch, off by default, until headset play accepts it.
   0x198), each with 3 or 4 integer arguments. These are the draw candidates; M1 confirms them
   in the game.
 
+## M0 measurement (2026-10-12, Armadillo free roam, Quest via SteamVR at 90 Hz, 0.8.8 release build)
+
+Frame probe over 7-10 s windows. In "one pass", `double off` drew one scene pass a frame:
+
+| per frame (ms) | one pass | two passes (today) | second eye's cost |
+|---|---|---|---|
+| render thread busy | 2.71 | 5.52 (pass 1 2.85, pass 2 1.80) | +2.8 |
+| **playback thread busy** | 3.77 | **6.72** | +2.95 |
+| main thread busy | 1.74 | 1.97 | +0.2 |
+| GPU | 3.17 | 5.60 | +2.4 |
+| D3D12 draws | 4440 | 10983 | +6500 |
+| xrWaitFrame (slack) | 6.51 | 3.40 | |
+
+- This PC holds 90 Hz in stereo with about 3.4 ms to spare.
+- **The busiest thread in stereo is the playback thread** (6.7 ms), the one that turns packets
+  into D3D12 calls, at about 0.6 µs a draw.
+- Record-once-and-replay removes the render thread's second walk (about 1.8 to 2.8 ms) but
+  replays every packet per eye. It leaves the playback thread, and so the stereo frame's
+  ceiling, where it is.
+- KF2's single pass paid off because UE3's per-view CPU work was its bottleneck. Here that work
+  (visibility and shadows) is already shared.
+- Lowering the playback thread's cost needs fewer D3D12 calls: one instanced draw for both eyes
+  (view instancing). That also gives the single walk.
+
 ## Risks
 
 - The recorded packets may point into per-pass transient memory that is recycled before the
