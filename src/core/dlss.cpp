@@ -16,6 +16,7 @@
 #include "core/eye_shape.h"
 #include "core/hooks.h"
 #include "core/log.h"
+#include "core/prepass_arrays.h"
 
 namespace rdrvr::dlss {
 namespace {
@@ -333,7 +334,15 @@ int hk_set_tag(const void* vp, const void* tags, uint32_t n, void* cmd) {
     return o_set_tag(vp, tags, n, cmd);
 }
 
+int evaluate(uint32_t feature, const void* token, const void** inputs, uint32_t n, void* cmd);
 int hk_evaluate(uint32_t feature, const void* token, const void** inputs, uint32_t n, void* cmd) {
+    auto* cl = feature == 0 ? static_cast<ID3D12GraphicsCommandList*>(cmd) : nullptr;
+    if (cl) prepass::gpu_mark_dlss(cl, false);
+    const int r = evaluate(feature, token, inputs, n, cmd);
+    if (cl) prepass::gpu_mark_dlss(cl, true);
+    return r;
+}
+int evaluate(uint32_t feature, const void* token, const void** inputs, uint32_t n, void* cmd) {
     if (feature == 0) {
         const int v = t_vp1 ? 1 : 0;  // this evaluate's token against its viewport's constants
         if (g_chk.tc[v] && token != g_chk.tc[v]) g_eval_tok_ne[v].fetch_add(1, std::memory_order_relaxed);

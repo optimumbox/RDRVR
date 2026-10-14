@@ -173,8 +173,9 @@ std::string cut(uintptr_t rva, bool on) {
     j3[1] = static_cast<uint8_t>(orig - (j3 + 2));
     FlushInstructionCache(GetCurrentProcess(), &c, sizeof(Cut));
     void* target = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + rva);
-    char name[64];
-    std::snprintf(name, sizeof(name), "RDR second-scene cut +%#llx", static_cast<unsigned long long>(rva));
+    static char names[8][64];  // (the hook list keeps the name's pointer)
+    char* name = names[g_ncuts & 7];
+    std::snprintf(name, sizeof(names[0]), "RDR second-scene cut +%#llx", static_cast<unsigned long long>(rva));
     if (!hooks::install(name, target, c.code, &c.orig)) return "ERROR the hook failed";
     ++g_ncuts;
     return std::string("cut ") + name + " on";

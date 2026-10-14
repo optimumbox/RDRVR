@@ -37,6 +37,7 @@ std::string status();
 std::string grab(const std::string& kind, const std::string& path);
 // "prepass gpu [on|off|reset]": GPU time of the regions and their copies, view-instanced frames and two-pass ones apart
 std::string gpu_command(const std::string& arg);
+void gpu_mark_dlss(ID3D12GraphicsCommandList* cl, bool end);  // the playback thread, around slEvaluateFeature (DLSS)
 void set_ab(unsigned frames);  // "vi ab <n>": view-instanced every other n frames (0 off), for "prepass gpu"
 // View-instanced stereo (stereo_vi.h): in a region of a view-instanced frame on this list, 1 (slice 0's: the draws go to
 // both slices) or 2 (slice 1's: the draws made in slice 0's are skipped), else 0. *all_arrays: every target bound now is

@@ -101,6 +101,11 @@ motion vectors) are still recorded; that is ~2.85 ms render + ~2.5 ms playback.
      the cut removes): not an error.
   3. Bigscreen Beyond (2560 an eye, 4552x2560) vs Automatic (SteamVR's recommended 2688, 4778x2688): GPU 8.04 vs 8.30
      ms, late frames 0.64 vs 1.37 %. The GPU's p95 (10.4-11 ms) is now the limit: most remaining late frames are GPU.
+- 2026-10-14, eye 2's post chain and DLSS (`prepass gpu` now times each slEvaluateFeature; the frame's timestamps are
+  resolved at the next frame's start so eye 2's post is in them). Town edge, walking/turning: 89.8 Hz, 0.25 % late,
+  GPU 5.56 ms (regions 3.55: eye 1's 2.94, eye 2's 0.15), DLSS 0.28 + 0.30 ms, the rest of the post/UI ~1.4 ms both
+  eyes. Eye 2's post + DLSS is ~1 ms at most: not worth a risky change now; the GPU has ~5 ms of headroom here.
+- Fixed: a cut's hook name was a stack buffer (recorder_skip.cpp); the status writer read it -> crash at startup.
 - Drive C: was full (55 MB) on 2026-10-14: eye captures are ~200 MB raw (.rde); delete them after converting.
 
 ## Open problems (as of 15:25; 1 and 2 addressed above, re-check in the user's next session) (the user's screenshots: `research\grab\vr3\`, eye captures; `tools\sp\eyesbs.py` views them)

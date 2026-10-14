@@ -308,7 +308,7 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* r, D3D12_RESOURCE_STATES from,
 // "vi ab <n>" (view instancing every other n frames) compares both in the same view. Read back kFrames frames later.
 namespace gpu {
 constexpr int kFrames = 4, kMax = 4096;
-enum Tag : uint8_t { kBegin0, kEnd0, kBegin1, kEnd1, kCopyBegin, kCopyEnd };
+enum Tag : uint8_t { kBegin0, kEnd0, kBegin1, kEnd1, kCopyBegin, kCopyEnd, kDlssBegin, kDlssEnd };
 ID3D12QueryHeap* g_heap = nullptr;
 ID3D12Resource* g_rb = nullptr;
 uint64_t* g_mapped = nullptr;
@@ -316,7 +316,7 @@ bool g_on = false, g_failed = false;
 struct Rec {
     int n = 0;
     Tag tag[kMax];
-    bool vi = false, resolved = false, complete = false;
+    bool vi = false, resolved = false, complete = false, ended = false;
     double cpu = 0;  // the playback thread's time from region 0's start to region 1's end (ms)
     double frame_ms = 0, frame_cyc = 0;  // ... from this frame's region 0 start to the next frame's (ms; Mcycles)
     bool has_frame = false;
@@ -341,6 +341,8 @@ int g_slot = -1;
 struct Sum {
     uint64_t frames = 0;
     double span = 0, r0 = 0, r1 = 0, copies = 0, cpu = 0, cycles = 0, cyc0 = 0, cyc1 = 0;
+    double dlss[2] = {0, 0}, pre[2] = {0, 0}, tail = 0;  // each eye's DLSS; region end to its DLSS; eye 2's DLSS end to the frame's last mark
+    uint64_t dlssed = 0;
     uint64_t framed = 0;
     double frame_ms = 0, frame_cyc = 0;
 };
@@ -383,7 +385,9 @@ void harvest(int slot) {  // that slot's frame, resolved kFrames frames ago
         return;
     }
     const uint64_t* t = g_mapped + slot * kMax;
-    double b0 = -1, e0 = -1, b1 = -1, e1 = -1, copies = 0, cb = -1;
+    double b0 = -1, e0 = -1, b1 = -1, e1 = -1, copies = 0, cb = -1, last = -1;
+    double db[2] = {-1, -1}, de[2] = {-1, -1};
+    int nd = 0;
     for (int i = 0; i < rc.n; ++i) {
         const double v = static_cast<double>(t[i]) * g_tick_ms;
         switch (rc.tag[i]) {
@@ -396,7 +400,14 @@ void harvest(int slot) {  // that slot's frame, resolved kFrames frames ago
                 if (cb >= 0) copies += v - cb;
                 cb = -1;
                 break;
+            case kDlssBegin:
+                if (nd < 2) db[nd] = v;
+                break;
+            case kDlssEnd:
+                if (nd < 2) de[nd++] = v;
+                break;
         }
+        last = v > last ? v : last;
     }
     if (b1 < 0 && e1 < 0) b1 = e1 = e0;  // (a frame without a second region: ViSkipPass2)
     if (b0 < 0 || e0 < b0 || b1 < e0 || e1 < b1 || e1 - b0 > 200) {  // (an incomplete or wrapped frame)
@@ -415,6 +426,13 @@ void harvest(int slot) {  // that slot's frame, resolved kFrames frames ago
     s.cycles += rc.cycles;
     s.cyc0 += rc.cyc0;
     s.cyc1 += rc.cyc1;
+    if (nd == 2 && db[0] >= e0 && db[1] >= e1) {
+        ++s.dlssed;
+        for (int i = 0; i < 2; ++i) s.dlss[i] += de[i] - db[i];
+        s.pre[0] += db[0] - e0;
+        s.pre[1] += db[1] - e1;
+        s.tail += last - de[1];
+    }
     if (rc.has_frame) {
         ++s.framed;
         s.frame_ms += rc.frame_ms;
@@ -436,8 +454,10 @@ void mark(ID3D12GraphicsCommandList* cl, Tag tag) {
                 cl->ResolveQueryData(g_heap, D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(g_prev * kMax), static_cast<UINT>(p.n), g_rb,
                                      static_cast<UINT64>(g_prev) * kMax * 8);
                 p.resolved = p.complete = true;
-                p.cpu = now - g_cpu_begin;
-                p.cycles = static_cast<double>(c - g_cyc_begin) / 1e6;
+                if (!p.ended) {
+                    p.cpu = now - g_cpu_begin;
+                    p.cycles = static_cast<double>(c - g_cyc_begin) / 1e6;
+                }
                 ++g_resolves;
             }
         }
@@ -466,16 +486,12 @@ void mark(ID3D12GraphicsCommandList* cl, Tag tag) {
     cl->EndQuery(g_heap, D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(g_slot * kMax + rc.n));
     ++g_marks;
     rc.tag[rc.n++] = tag;
-    if (tag == kEnd1) {
-        cl->ResolveQueryData(g_heap, D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(g_slot * kMax), static_cast<UINT>(rc.n), g_rb,
-                             static_cast<UINT64>(g_slot) * kMax * 8);
-        rc.resolved = rc.complete = true;
+    if (tag == kEnd1) {  // (resolved at the next frame's start, so eye 2's post chain's marks are in it)
+        rc.ended = true;
         rc.cpu = qpc_ms() - g_cpu_begin;
         ULONG64 c = 0;
         QueryThreadCycleTime(GetCurrentThread(), &c);
         rc.cycles = static_cast<double>(c - g_cyc_begin) / 1e6;
-        ++g_resolves;
-        g_slot = -1;
     }
 }
 std::string status(bool reset) {
@@ -490,6 +506,12 @@ std::string status(bool reset) {
                       s.cpu / n, s.cycles / n, s.cyc0 / n, s.cyc1 / n, s.framed ? s.frame_ms / static_cast<double>(s.framed) : 0.0,
                       s.framed ? s.frame_cyc / static_cast<double>(s.framed) : 0.0);
         r += b;
+        if (s.dlssed) {
+            const double m = static_cast<double>(s.dlssed);
+            std::snprintf(b, sizeof(b), "; %llu with DLSS: eye 1's DLSS %.3f ms (after its region %.3f), eye 2's %.3f (after its region %.3f), eye 2's DLSS end to the frame's last mark %.3f",
+                          static_cast<unsigned long long>(s.dlssed), s.dlss[0] / m, s.pre[0] / m, s.dlss[1] / m, s.pre[1] / m, s.tail / m);
+            r += b;
+        }
     }
     char d[260];
     std::snprintf(d, sizeof(d), " | marks %llu, resolves %llu, harvests %llu (unresolved %llu, out of order %llu: last %.3f %.3f %.3f %.3f)",
@@ -1865,6 +1887,7 @@ void trace_clear(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE h, b
 }
 
 void set_ab(unsigned frames) { g_ab = frames; }
+void gpu_mark_dlss(ID3D12GraphicsCommandList* cl, bool end) { gpu::mark(cl, end ? gpu::kDlssEnd : gpu::kDlssBegin); }
 std::string gpu_command(const std::string& arg) {
     if (arg == "box on" || arg == "box off") {
         g_box_copies = arg == "box on";
