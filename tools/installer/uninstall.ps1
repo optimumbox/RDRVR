@@ -74,6 +74,7 @@ foreach ($b in @($m.backups)) {
         if ($restored.ContainsKey($f)) { continue }
         $src = Join-Path (Join-Path $GameDir $b.dir) $f
         if (Test-Path -LiteralPath $src) {
+            New-Item -ItemType Directory -Force (Split-Path -Parent (Join-Path $GameDir $f)) | Out-Null
             Copy-Item -LiteralPath $src -Destination (Join-Path $GameDir $f) -Force
             $restored[$f] = $true
             Say "  restored $f (from $($b.dir))"

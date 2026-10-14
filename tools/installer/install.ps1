@@ -156,7 +156,8 @@ foreach ($f in $Files) {
     if ((Test-Path -LiteralPath $src) -and (Sha $src) -eq (Sha $dst)) { continue }  # already this version's file
     $ours = $prev -and @($prev.files | Where-Object { $_.file -eq $f -and $_.sha256 -eq (Sha $dst) }).Count
     if ($ours) { continue }  # an earlier RDRVR install's file: replaced, not kept
-    New-Item -ItemType Directory -Force $backupDir | Out-Null
+    if ($f -like 'RDRVR_shaders\*') { continue }  # (only ever RDRVR's: an older release's, replaced)
+    New-Item -ItemType Directory -Force (Split-Path -Parent (Join-Path $backupDir $f)) | Out-Null
     Copy-Item -LiteralPath $dst -Destination (Join-Path $backupDir $f) -Force
     $backedUp += $f
     Say "  backed up $f -> $backupRel"
