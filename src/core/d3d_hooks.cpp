@@ -41,6 +41,8 @@ using CreateCommittedResource_t = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, con
                                                               const D3D12_CLEAR_VALUE*, REFIID, void**);
 using CreatePlacedResource_t = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Heap*, UINT64, const D3D12_RESOURCE_DESC*,
                                                            D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
+using AllocInfo_t = D3D12_RESOURCE_ALLOCATION_INFO*(STDMETHODCALLTYPE*)(ID3D12Device*, D3D12_RESOURCE_ALLOCATION_INFO*, UINT, UINT,
+                                                                       const D3D12_RESOURCE_DESC*);
 using CreateView_t = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const void*, D3D12_CPU_DESCRIPTOR_HANDLE);
 using SetName_t = HRESULT(STDMETHODCALLTYPE*)(ID3D12Object*, LPCWSTR);
 using ECL_t = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
@@ -116,6 +118,7 @@ void raise_cb_capacity() {
 }
 CreateCommittedResource_t o_CreateCommittedResource = nullptr;
 CreatePlacedResource_t o_CreatePlacedResource = nullptr;
+AllocInfo_t o_GetResourceAllocationInfo = nullptr;
 CreateView_t o_CreateRTV = nullptr, o_CreateDSV = nullptr;
 SetName_t o_ResourceSetName = nullptr;
 ECL_t o_ECL = nullptr;
@@ -563,7 +566,7 @@ void note_made(ID3D12Device* dev, const void* r, const D3D12_RESOURCE_DESC* d, D
 // the scene depth again at the render size, on the render thread; all of them at the game's own size when the eye shape
 // went): such a desc on the thread that made them is a 2-slice target again at the render size, else one slice again.
 std::atomic<uint32_t> g_double_tid{0}, g_double_w{0}, g_double_h{0};  // the last set_stereo_targets' (w, h not 0)
-std::atomic<uint64_t> g_inherited{0}, g_unsliced{0};
+std::atomic<uint64_t> g_inherited{0}, g_unsliced{0}, g_unsliced_info{0};
 enum Make { kPlain, kDouble, kSingle };
 Make want_double(const D3D12_RESOURCE_DESC* d, REFIID riid) {
     if (!d || riid != __uuidof(ID3D12Resource) || d->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d->MipLevels != 1 ||
@@ -846,6 +849,49 @@ void fg_on_frame_end(uint64_t frame) {
     }
 }
 
+// The GPU's local video memory (DXGI's budget for this process and its use of it), from the device's adapter
+bool video_memory(ID3D12Device* dev, uint64_t* used, uint64_t* budget) {
+    static std::mutex m;
+    static IDXGIAdapter3* adapter = nullptr;
+    static LUID luid{};
+    if (!dev) return false;
+    const LUID l = dev->GetAdapterLuid();
+    std::lock_guard lock(m);
+    if (!adapter || l.LowPart != luid.LowPart || l.HighPart != luid.HighPart) {
+        if (adapter) adapter->Release();
+        adapter = nullptr;
+        IDXGIFactory4* f = nullptr;
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&f))) || !f) return false;
+        f->EnumAdapterByLuid(l, IID_PPV_ARGS(&adapter));
+        f->Release();
+        if (!adapter) return false;
+        luid = l;
+    }
+    DXGI_QUERY_VIDEO_MEMORY_INFO vi{};
+    if (FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vi))) return false;
+    *used = vi.CurrentUsage;
+    *budget = vi.Budget;
+    return true;
+}
+constexpr uint64_t kMiB = 1024ull * 1024;
+// A 2-slice target is made outside the game's own heaps (its place in them left unused), while the game is making its
+// targets again: 2026-10-14, a player's 4032x3376 eyes under a 6002x3376 game (DLAA) crashed at the game's next target
+// (its D3D_ERROR_CHECK on D3D12MA's CreateResource, an HRESULT 0x800700..). Made only while the budget keeps room for
+// the game's own: else the game's single target (the pre-pass copies into its arrays for that one), for the session.
+std::atomic<bool> g_doubled_no_room{false};
+uint64_t room_kept(uint64_t budget) { return std::max<uint64_t>(budget / 5, 1536 * kMiB); }
+
+// A resource the game asked for and did not get (its D3D_ERROR_CHECK ends the game on most): the HRESULT and the memory
+void note_failed(ID3D12Device* dev, const char* how, const D3D12_RESOURCE_DESC* d, HRESULT hr) {
+    char desc[160];
+    describe_desc(d, desc, sizeof(desc));
+    uint64_t used = 0, budget = 0;
+    video_memory(dev, &used, &budget);
+    log::limited("d3d.res.failed", 40, "[res] %s not made (%#lx): %s; video memory %llu of %llu MB used, %llu 2-slice targets made", how,
+                 static_cast<unsigned long>(hr), desc, static_cast<unsigned long long>(used / kMiB), static_cast<unsigned long long>(budget / kMiB),
+                 static_cast<unsigned long long>(g_doubled_made.load(std::memory_order_relaxed)));
+}
+
 // ---------------------------------------------------------------------------------- device & resources
 HRESULT STDMETHODCALLTYPE hk_CreateCommittedResource(ID3D12Device* dev, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf,
                                                      const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st,
@@ -861,6 +907,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateCommittedResource(ID3D12Device* dev, const D3
         d = &one;
     }
     if (!two) hr = o_CreateCommittedResource(dev, hp, hf, d, st, cv, riid, out);
+    if (FAILED(hr)) note_failed(dev, "a committed resource", d, hr);
     if (SUCCEEDED(hr) && out && *out && riid == __uuidof(ID3D12Resource)) {
         vi::forget_resource(static_cast<ID3D12Resource*>(*out));
         note_made(dev, *out, d, st, two);
@@ -880,6 +927,47 @@ HRESULT STDMETHODCALLTYPE hk_CreateCommittedResource(ID3D12Device* dev, const D3
     return hr;
 }
 
+// The size the game's allocator (D3D12MA) reserves for a target, asked before it makes it. The game re-sizes a target
+// from its GetDesc (a 2-slice target's: two slices) and makes it one slice again (want_double's kSingle), so it is
+// answered for one slice too. 2026-10-14: at DLAA under a 6002x3376 game, the Light Buffer's 2-slice answer (166 MB, not
+// its 83) went past D3D12MA's block size to a dedicated heap it refused (E_INVALIDARG), and the game's D3D_ERROR_CHECK
+// ended the game at the eye shape's next resize (a player's crash at launch)
+D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE hk_GetResourceAllocationInfo(ID3D12Device* dev, D3D12_RESOURCE_ALLOCATION_INFO* ret,
+                                                                              UINT mask, UINT n, const D3D12_RESOURCE_DESC* d) {
+    D3D12_RESOURCE_DESC one[4];
+    if (d && n && n <= 4 && g_doubled_made.load(std::memory_order_relaxed)) {
+        bool any = false;
+        for (UINT i = 0; i < n; ++i) {
+            one[i] = d[i];
+            if (d[i].DepthOrArraySize == 2 && want_double(&d[i], __uuidof(ID3D12Resource)) == kSingle) {
+                one[i].DepthOrArraySize = 1;
+                any = true;
+            }
+        }
+        if (any) {
+            g_unsliced_info.fetch_add(1, std::memory_order_relaxed);
+            d = one;
+        }
+    }
+    D3D12_RESOURCE_ALLOCATION_INFO* r = o_GetResourceAllocationInfo(dev, ret, mask, n, d);
+    if (r && r->SizeInBytes == UINT64_MAX) {
+        for (UINT i = 0; i < n && i < 4; ++i) {
+            char desc[160];
+            describe_desc(&d[i], desc, sizeof(desc));
+            log::limited("d3d.allocinfo.bad", 40, "[res] allocation info refused (desc %u of %u): %s, dim %d, align %#llx, slices %u, layout %d, thread %lu", i, n,
+                         desc, static_cast<int>(d[i].Dimension), static_cast<unsigned long long>(d[i].Alignment), d[i].DepthOrArraySize,
+                         static_cast<int>(d[i].Layout), GetCurrentThreadId());
+        }
+    } else if (n == 1 && d && d->DepthOrArraySize == 2 && g_doubled_made.load(std::memory_order_relaxed)) {
+        char desc[160];
+        describe_desc(d, desc, sizeof(desc));
+        log::limited("d3d.allocinfo.two", 40, "[res] allocation info for a 2-slice desc: %s, align %#llx -> %llu bytes (align %#llx), thread %lu", desc,
+                     static_cast<unsigned long long>(d->Alignment), static_cast<unsigned long long>(r ? r->SizeInBytes : 0),
+                     static_cast<unsigned long long>(r ? r->Alignment : 0), GetCurrentThreadId());
+    }
+    return r;
+}
+
 HRESULT STDMETHODCALLTYPE hk_CreatePlacedResource(ID3D12Device* dev, ID3D12Heap* heap, UINT64 off, const D3D12_RESOURCE_DESC* d,
                                                   D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
     HRESULT hr = E_FAIL;
@@ -893,6 +981,7 @@ HRESULT STDMETHODCALLTYPE hk_CreatePlacedResource(ID3D12Device* dev, ID3D12Heap*
         d = &one;
     }
     if (!two) hr = o_CreatePlacedResource(dev, heap, off, d, st, cv, riid, out);
+    if (FAILED(hr)) note_failed(dev, "a placed resource", d, hr);
     if (SUCCEEDED(hr) && out && *out && riid == __uuidof(ID3D12Resource)) {
         vi::forget_resource(static_cast<ID3D12Resource*>(*out));
         note_made(dev, *out, d, st, two);
@@ -915,19 +1004,33 @@ HRESULT STDMETHODCALLTYPE hk_CreatePlacedResource(ID3D12Device* dev, ID3D12Heap*
 
 HRESULT make_doubled(ID3D12Device* dev, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st,
                      const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
+    if (g_doubled_no_room.load(std::memory_order_relaxed)) return E_OUTOFMEMORY;
     D3D12_RESOURCE_DESC dd = *d;
     dd.DepthOrArraySize = 2;
+    char desc[160];
+    describe_desc(d, desc, sizeof(desc));
+    uint64_t used = 0, budget = 0;
+    if (video_memory(dev, &used, &budget)) {
+        const uint64_t size = dev->GetResourceAllocationInfo(0, 1, &dd).SizeInBytes;
+        if (size == UINT64_MAX || used + size + room_kept(budget) > budget) {
+            g_doubled_no_room = true;
+            log::warn("[slices] not made with two slices (and none from now on): %s needs %llu MB, video memory %llu of %llu MB used, %llu kept "
+                      "for the game's own targets. The pre-pass copies into its own arrays instead",
+                      desc, static_cast<unsigned long long>(size == UINT64_MAX ? 0 : size / kMiB), static_cast<unsigned long long>(used / kMiB),
+                      static_cast<unsigned long long>(budget / kMiB), static_cast<unsigned long long>(room_kept(budget) / kMiB));
+            return E_OUTOFMEMORY;
+        }
+    }
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     hf &= D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;  // (a heap's flags for a placed one's heap: not a committed one's)
     const HRESULT hr = o_CreateCommittedResource(dev, &hp, hf, &dd, st, cv, riid, out);
-    char desc[160];
-    describe_desc(d, desc, sizeof(desc));
     if (FAILED(hr)) {
         g_doubled_failed.fetch_add(1, std::memory_order_relaxed);
         log::warn("[slices] a 2-slice target not made (%#lx): %s (the game's own)", static_cast<unsigned long>(hr), desc);
     } else {
         g_doubled_made.fetch_add(1, std::memory_order_relaxed);
-        log::info("[slices] %p made with two slices: %s", out ? *out : nullptr, desc);
+        log::info("[slices] %p made with two slices: %s (video memory %llu of %llu MB used before it)", out ? *out : nullptr, desc,
+                  static_cast<unsigned long long>(used / kMiB), static_cast<unsigned long long>(budget / kMiB));
     }
     return hr;
 }
@@ -1102,6 +1205,8 @@ void hook_device_methods(ID3D12Device* dev) {
                        &o_CreateCommittedResource);
         hooks::install("ID3D12Device::CreatePlacedResource", hooks::vtable_entry(dev, 29), hk_CreatePlacedResource,
                        &o_CreatePlacedResource);
+        hooks::install("ID3D12Device::GetResourceAllocationInfo", hooks::vtable_entry(dev, 25), hk_GetResourceAllocationInfo,
+                       &o_GetResourceAllocationInfo);
         // A probe buffer gives the resource vtable, so SetName is hooked for every resource.
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
         D3D12_RESOURCE_DESC rd{};
@@ -1200,6 +1305,21 @@ HRESULT WINAPI hk_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl, REF
         if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&dev))) && dev) {
             log::info("[d3d] device %p created", static_cast<void*>(dev));
             hook_debug_messages(dev);
+            {  // the GPU and its memory (a player's log had none: 2026-10-14, a crash at a full target size)
+                IDXGIAdapter* a = nullptr;
+                DXGI_ADAPTER_DESC ad{};
+                if (adapter && SUCCEEDED(adapter->QueryInterface(IID_PPV_ARGS(&a))) && a) {
+                    a->GetDesc(&ad);
+                    a->Release();
+                }
+                uint64_t used = 0, budget = 0;
+                video_memory(dev, &used, &budget);
+                char name[128] = "";
+                WideCharToMultiByte(CP_UTF8, 0, ad.Description, -1, name, sizeof(name), nullptr, nullptr);
+                log::info("[d3d] the adapter: %s, %llu MB dedicated; video memory %llu of %llu MB used (the budget)", name[0] ? name : "(not known)",
+                          static_cast<unsigned long long>(ad.DedicatedVideoMemory / kMiB), static_cast<unsigned long long>(used / kMiB),
+                          static_cast<unsigned long long>(budget / kMiB));
+            }
             {  // single-pass stereo, view instancing (research\sps): what the device offers (two read-only queries)
                 D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3{};
                 const bool o3_ok = SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3)));
@@ -1731,10 +1851,11 @@ std::string doubled_status() {
     int live = 0;
     for (int i = 0, n = g_doubled_n.load(); i < n; ++i)
         if (g_doubled[i].res.load()) ++live;
-    char b[300];
-    std::snprintf(b, sizeof(b), "2-slice targets %d (made %llu, %llu of them from a 2-slice desc, %llu made single again; failed %llu, gone %llu; barriers rewritten %llu, copies %llu)", live,
+    char b[360];
+    std::snprintf(b, sizeof(b), "2-slice targets %d (made %llu, %llu of them from a 2-slice desc, %llu made single again (%llu sizes asked as single); failed %llu, gone %llu; barriers rewritten %llu, copies %llu)", live,
                   static_cast<unsigned long long>(g_doubled_made.load()), static_cast<unsigned long long>(g_inherited.load()),
-                  static_cast<unsigned long long>(g_unsliced.load()), static_cast<unsigned long long>(g_doubled_failed.load()),
+                  static_cast<unsigned long long>(g_unsliced.load()), static_cast<unsigned long long>(g_unsliced_info.load()),
+                  static_cast<unsigned long long>(g_doubled_failed.load()),
                   static_cast<unsigned long long>(g_doubled_gone.load()), static_cast<unsigned long long>(g_doubled_barriers.load()),
                   static_cast<unsigned long long>(g_doubled_copies.load()));
     return b;

@@ -219,6 +219,19 @@ LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
         log::error("[crash] exception %#lx (first chance) at %s: %s %#llx  rax %#llx rcx %#llx rdx %#llx r8 %#llx rsp %#llx", code,
                    where, ep->ExceptionRecord->ExceptionInformation[0] == 8 ? "DEP execute" : ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read",
                    static_cast<unsigned long long>(ep->ExceptionRecord->ExceptionInformation[1]), c->Rax, c->Rcx, c->Rdx, c->R8, c->Rsp);
+        // The game's own fatal stop (a write to a tiny address after its error text): its frame, for what it was given
+        // (2026-10-14: RDR.exe+0xf9793a, a target's D3D12MA block refused; its descs at rbp+0x28 and +0x60, the
+        // allocation info at +0x108..+0x150, the HRESULT in esi)
+        if (ep->ExceptionRecord->ExceptionInformation[0] && ep->ExceptionRecord->ExceptionInformation[1] < 0x100) {
+            log::error("[crash] rbp %#llx rsi %#llx rdi %#llx rbx %#llx", c->Rbp, c->Rsi, c->Rdi, c->Rbx);
+            for (uintptr_t o = 0; o < 0x160; o += 32) {
+                const auto* q = reinterpret_cast<const unsigned char*>(c->Rbp + o);
+                if (IsBadReadPtr(q, 32)) break;
+                char hex[100];
+                for (int k = 0; k < 32; ++k) std::snprintf(hex + k * 3, 4, "%02x ", q[k]);
+                log::error("[crash] rbp+%#05llx %s", static_cast<unsigned long long>(o), hex);
+            }
+        }
     } else {
         log::error("[crash] exception %#lx (first chance) at %s  rsp %#llx", code, where, c->Rsp);
     }
