@@ -1,4 +1,4 @@
-# RDRVR single-pass stereo: handoff (2026-10-13, updated 19:35 EDT)
+# RDRVR single-pass stereo: handoff (2026-10-13, updated 2026-10-14 02:50 EDT)
 
 A session resuming this work starts here. Branch `single-pass-stereo`, repo `C:\Games\RDRVR-src`, game at
 `G:\Games\Red Dead Redemption`. Background: `docs/SINGLE_PASS_PLAN.md` (I2: the view-instanced main pass).
@@ -17,7 +17,8 @@ A session resuming this work starts here. Branch `single-pass-stereo`, repo `C:\
 
 ## State
 
-Installed for VR: the latest build, shaders `research\stereo_all13` (session.ps1's default now), `ViSkipRecord=0`.
+Installed for VR: the latest build, shaders `research\stereo_all14` (session.ps1's default now), `ViSkipRecord=1`
+(session.ps1's default now: the recorder skip on).
 The user runs DLSS Quality (RDRVR.user.ini DlssQuality=5, RenderScale=100: render 1809x1790 per eye), not DLAA.
 The user's F7 menu render scale is at 200% (they tried it because 100% was blocked); 100% gives 4778x2688 (eyes
 2716x2688) once not blocked. Tell them to put it back to 100%.
@@ -69,6 +70,23 @@ motion vectors) are still recorded; that is ~2.85 ms render + ~2.5 ms playback.
   vs draw 82.4 Hz (8.4 % late, GPU 10.1, playback 10.4, scene 5.4). Earlier, a heavier view: 81.5 vs 65 Hz. The motion
   vectors under the skip were fine (ground and far within the headset's jitter). Not on by default: footprints/glows.
 - The box copies (`prepass gpu box`) do nothing: the game's targets are render-sized already ("last extents").
+
+## 2026-10-14: ViSlices, and the recorder skip on by default
+
+- `[Stereo] ViSlices` (on with ViMain, commit 95b7354): the game's render-size targets are made with two array slices
+  (d3d_hooks.cpp: made inside `set_stereo_targets`' window in eye_shape `shape()`; a desc inherited by GetDesc on the
+  window's thread is doubled again; a private-data sentinel forgets a destroyed target's registry entry, else the
+  registry filled and a re-make came out mixed). The prepass's native kinds need no publishes/end copies. Same spot:
+  two-pass GPU 5.15 ms (regions 3.35) vs single-pass 4.35 (regions 2.71, copies 0.12, was 2.6).
+- The user's headset run was CPU-bound (spikes to 18 ms) because the install wrote `ViSkipRecord=0`: eye 2's scene was
+  recorded whole (render thread scene 8.5 ms). The skip lost eye 2's light glows and footprints; they now have twins:
+  viewid_patch.py GLOBALS_DEPTH_PS (view 1 reads `EYE2_SLOT_BASE + 16`, the depth's slice 1, for their $Globals
+  DepthBufferSampler: no rage_matrices to compare the index with). Set `research\stereo_all14`; session.ps1 writes
+  `ViSkipRecord=1`. Desk test (DLSS Quality, town edge): skip vs draw, render busy 5.45 vs 6.42 ms, playback 7.32 vs
+  8.86, late 0.6 vs 2.3 %; eye 2 draws nothing in slice 1's region (`vi drawn2`); right eye skip vs draw the same
+  (`research\grabr27\R_skip_draw.png`; daytime, no footprints or glows in view: unconfirmed visually).
+- Still without a twin: PSMiragerSingle (heat haze; has rage_matrices, could take a SCREEN_INDEX_FIELDS field), PS_Blit
+  (unused by eye 2).
 
 ## Open problems (as of 15:25; 1 and 2 addressed above, re-check in the user's next session) (the user's screenshots: `research\grab\vr3\`, eye captures; `tools\sp\eyesbs.py` views them)
 

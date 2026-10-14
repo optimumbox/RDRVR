@@ -207,7 +207,8 @@ def patch(text, allow_prev_world=True):  # (allow_prev_world: kept for callers; 
     text, n_remap = patch_index_remap(text, set(screen))
     text, n_ndc = patch_ndc(text)
     text, n_sky = patch_sky_prev(text)
-    n_ndc += n_sky
+    text, n_gd = patch_globals_depth(text)
+    n_ndc += n_sky + n_gd
     if n_redirect + n_screen + n_wvp + n_inv + n_remap + n_ndc == 0:
         raise Refused('no view-dependent block')
     n_redirect += n_screen + n_wvp + n_inv + n_remap + n_ndc
@@ -562,6 +563,49 @@ def patch_ndc(text):
             res.append(ln.replace(f', i32 {m.group(2)}, i1', f', i32 {cur}, i1', 1))
         out = res
     return chr(10).join(out), n + n_depth
+
+
+# The passes that read the scene depth by a $Globals index of their own and have no rage_matrices to compare it with
+# (the light glows' occlusion test, the footprints): view 1 reads eye 2's depth (EYE2_SLOT_BASE + DEPTH_BUFFER_SLOT:
+# the depth's slice 1 with [Stereo] ViSlices, else eye 2's copy) whatever the index (in these shaders it is always the
+# scene depth; the depth resolve, when it is the one bound, holds the same image by then). So they draw for both eyes
+# in slice 0's region and the recorder skip (ViSkipRecord) does not lose them in eye 2.
+GLOBALS_DEPTH_PS = {'PS_lightglow': 'DepthBufferSampler', 'PSFootprintCollector': 'DepthBufferSampler',
+                    'PSFootprintColor': 'DepthBufferSampler'}
+
+
+def patch_globals_depth(text):
+    e = re.search(r'^define void @(\w+)\(', text, re.M)
+    name = GLOBALS_DEPTH_PS.get(e.group(1)) if e else None
+    rid = range_ids(text)
+    if not name or '$Globals' not in rid or 'rage_matrices' in rid:
+        return text, 0
+    m = re.search(r'^; cbuffer \$Globals$(.*?)^;\s+\} \$Globals;', text, re.M | re.S)
+    off = m and re.search(r' ' + name + r';\s+; Offset:\s+(\d+)', m.group(1))
+    if not off:
+        raise Refused(f'no $Globals {name}')
+    row, comp = int(off.group(1)) // 16, int(off.group(1)) % 16 // 4
+    hg = set(cb_handles(text, rid['$Globals']))
+    loads = {m.group(1) for m in re.finditer(r'(%\d+) = call %dx\.types\.CBufRet\.i32 @dx\.op\.cbufferLoadLegacy\.i32\(i32 59, '
+                                             r'%dx\.types\.Handle (%\d+), i32 (\d+)\)', text)
+             if m.group(2) in hg and int(m.group(3)) == row}
+    idx = {m.group(1) for m in re.finditer(r'^  (%\d+) = extractvalue %dx\.types\.CBufRet\.i32 (%\d+), (\d)', text, re.M)
+           if m.group(2) in loads and int(m.group(3)) == comp}
+    for m in re.finditer(r'^  (%\d+) = add i32 (%\d+), 0$', text, re.M):
+        if m.group(2) in idx:
+            idx.add(m.group(1))
+    out, n = [], 0
+    for ln in text.split(chr(10)):
+        m = re.match(r'^  (%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 0, i32 \d+, i32 (%\d+), i1', ln)
+        if m and m.group(2) in idx:
+            n += 1
+            t = f'%gd{n}.sp'
+            out.append(f'  {t} = select i1 %isv1.sp, i32 {EYE2_SLOT_BASE + DEPTH_BUFFER_SLOT}, i32 {m.group(2)}')
+            ln = ln.replace(f', i32 {m.group(2)}, i1', f', i32 {t}, i1', 1)
+        out.append(ln)
+    if not n:
+        raise Refused(f'{name} not read as a texture index')
+    return chr(10).join(out), n
 
 
 # The sky's vertex shader (vs_main: rage_matrices and rage_prev_proj, no rage_prev_world): its position is (world - the

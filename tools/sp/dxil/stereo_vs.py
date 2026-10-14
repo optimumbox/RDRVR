@@ -22,13 +22,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 # Full-screen passes in the view-instanced region that read a screen image by an index of their own (a $Globals one,
 # not a global_textures slot view 1 can be redirected by): view 1 would read eye 1's image (2026-10-13, the headset:
 # the right eye saw eye 1's scene through windows and black bushes). No twin: each eye's region draws them itself.
-# (The grass and foliage resolves have twins again: their images' indices are remapped, viewid_patch.py
-# SCREEN_INDEX_FIELDS, so the recorder skip does not lose them.)
+# (The grass and foliage resolves, the light glows and the footprints have twins again: their images' indices are
+# remapped, viewid_patch.py SCREEN_INDEX_FIELDS and GLOBALS_DEPTH_PS, so the recorder skip does not lose them.)
 NO_TWIN_PS = {
     'PS_Blit': 'the refraction copy reads FullScreenCopy through TextureSampler',
-    'PS_lightglow': 'the light glows test the scene depth through DepthBufferSampler (glows in eye 2 only)',
-    'PSFootprintCollector': 'reads the scene depth through DepthBufferSampler',
-    'PSFootprintColor': 'reads the scene depth through DepthBufferSampler',
     'PSMiragerSingle': 'the heat haze reads the scene copy through RenderMapBilinearSampler',
 }
 import os
