@@ -21,7 +21,8 @@ Upstream [Disonomouss/RDRVR](https://github.com/Disonomouss/RDRVR) 0.8.10 plus:
   and the body follows; past 0.55 m John walks after you with the game's own movement (walls still stop him).
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
-> and it contains no game files. The game sends its crash reports to Rockstar: a crash with the mod installed is
+> and it contains no game files except, in this fork's release, `RDRVR_shaders\`: shaders converted from the
+> game's own for single-pass stereo. The game sends its crash reports to Rockstar: a crash with the mod installed is
 > reported too.
 
 ## Features

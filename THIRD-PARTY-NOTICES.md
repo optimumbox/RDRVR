@@ -13,4 +13,5 @@ RDRVR.Gameplay.red links against RedHook's import library (RedHook SDK by K3rhos
 https://github.com/K3rhos/RedHookSDK). RedHook itself is not part of RDRVR and is not distributed with it.
 
 Red Dead Redemption is a trademark of Take-Two Interactive Software. RDRVR is an unofficial fan project, not affiliated
-with or endorsed by Rockstar Games or Take-Two Interactive. It contains no game files.
+with or endorsed by Rockstar Games or Take-Two Interactive. It contains no game files except RDRVR_shaders\ (this
+fork's release only): the game's own shaders, converted for single-pass stereo, remain Rockstar Games' property.
