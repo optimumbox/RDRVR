@@ -39,6 +39,11 @@ float ride_turn_deg();  // the offset now (0 on foot or steering by the head)
 // John's body's heading: the body heading less the ride's turn (the horse's while riding with the view turned): the
 // holsters' frame, the facing lock, the elbow hints
 float torso_heading_deg();
+// [Body] RoomScale: John is being walked toward the head this frame (camera_lever then moves the head's origin with the camera)
+bool room_driving();
+bool room_body();  // [Body] RoomScale is in charge on foot: the drawn body takes the neck's offset left (body.cpp)
+float body_yaw_offset_deg();  // [Body] BodyTurnsWithHead: the torso heading less the body heading (degrees)
+std::string room_status();  // pose room
 bool saddle_anchor();
 // [Horse] SaddleClimb (run 6 item 8, on): with the saddle anchor, the plugin feeds the horse's own vertical speed into
 // the height's filter (it fell behind climbs) and keeps the view above the rider's root + 0.5 m

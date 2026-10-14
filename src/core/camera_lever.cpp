@@ -1272,6 +1272,17 @@ bool head_yaw_deg(float* out) {
     return true;
 }
 
+// [Body] RoomScale: the head's origin moved by (x, z) in the recentred frame (metres), so the view's offset since
+// recentre loses that much
+bool room_shift(float x, float z) {
+    std::lock_guard lock(g_recentre_mutex);
+    if (!g_recentred) return false;
+    float r0[9];
+    quat_matrix(g_q0, r0);
+    for (int k = 0; k < 3; ++k) g_p0[k] += r0[k * 3 + 0] * x + r0[k * 3 + 2] * z;
+    return true;
+}
+
 bool head_offset(float out[3]) {
     xr::EyeView v[2];
     if (!xr::eye_views_peek(v)) return false;

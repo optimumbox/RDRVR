@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -46,6 +47,29 @@ double g_last_ms = 0;
 bool g_snap = false;
 uint64_t g_turns = 0, g_walk_frames = 0;
 float g_last_head_yaw = 0;
+// [Body] BodyTurnsWithHead (KF2VR's body yaw): the drawn body (and the holsters, the facing lock, the elbow hints: the
+// torso heading) turns toward where the head faces, smoothed (BodyYawSmoothing s) and never more than BodyYawLag degrees
+// behind; render-side only (the camera and the game's heading untouched, so the view cannot judder)
+bool g_body_turn = true;
+float g_body_lag = 30.0f, g_body_tau = 0.20f, g_body_off = 0.0f;
+std::atomic<float> g_body_off_shared{0.0f};
+// [Body] RoomScale (KF2VR's room movement): the neck more than RoomLean metres from John (on foot, the stick idle)
+// walks him toward it through the game's own movement (the left stick), and the head's origin follows the camera as he
+// moves (camera_lever's room_follow) so the view stays where the head is; past RoomMax (a wall) the view is held there
+// (RDR walks with momentum and turns John round first: a walk starts past RoomLean and stops inside RoomStop, and the
+// view keeps following the camera through the slow-down; the drawn body takes what is left of the neck's offset)
+bool g_room = true, g_room_walking = false;
+float g_room_lean = 0.55f, g_room_stop = 0.30f, g_room_max = 1.00f;
+float g_room_stall_l = 0.0f;  // a walk that made no progress for 1 s: none again until the offset grows 0.2 m past this
+double g_room_prog_ms = 0.0;
+float g_room_prog_l = 0.0f;
+double g_room_until = 0.0;
+std::atomic<bool> g_room_drive{false}, g_room_ok{false};
+std::atomic<uint64_t> g_room_ticks{0}, g_room_clamps{0};
+float g_room_last[3] = {0, 0, 0};
+bool g_room_have_last = false;
+float g_room_taken[2] = {0, 0};  // the head's origin moved so far (recentred frame x, z; "pose room")
+float wrap180(float a) { return std::fmod(a + 540.0f, 360.0f) - 180.0f; }
 // riding ([Horse]): steering by the stick (the view faces the horse, the stick steers it) or by the head (as on foot:
 // the stick turned by the head's yaw); the saddle anchor (the camera above the horse's own root, the rider's head
 // offset from it averaged over about a second, the height smoothed by the plugin)
@@ -172,6 +196,7 @@ void on_frame_end(uint64_t) {
             log::info("[pose] recentre: body heading %.1f -> %.1f deg (the head's yaw %.1f; the ride's turn %.1f cleared)", g_heading,
                       g_heading + g_last_head_yaw, g_last_head_yaw, g_ride_off);
             g_heading += g_last_head_yaw;
+            g_body_off = wrap180(g_body_off - g_last_head_yaw);
             g_last_head_yaw = 0;
             g_ride_off = 0.0f;
         }
@@ -323,6 +348,54 @@ void on_frame_end(uint64_t) {
             pad.rx = 0;  // the anchored camera is not the game's to turn
             if (lx != 0 || ly != 0) ++g_walk_frames;
         }
+        {  // [Body] BodyTurnsWithHead
+            const float target = g_body_turn && !riding ? g_last_head_yaw : 0.0f;
+            g_body_off = wrap180(g_body_off + wrap180(target - g_body_off) * (1.0f - std::exp(-dt / (g_body_tau > 0.01f ? g_body_tau : 0.01f))));
+            const float d = wrap180(target - g_body_off);
+            if (d > g_body_lag) g_body_off = wrap180(target - g_body_lag);
+            if (d < -g_body_lag) g_body_off = wrap180(target + g_body_lag);
+            g_body_off_shared.store(g_body_off, std::memory_order_relaxed);
+        }
+        {  // [Body] RoomScale
+            const bool user_stick = controllers && (pad.lx != 0 || pad.ly != 0);
+            float nk[3];
+            const bool ok = g_room && controllers && have_st && !riding &&
+                            !(st.flags & (RDRVR_ACTOR_MOUNTED | RDRVR_ACTOR_DRIVING | RDRVR_ACTOR_IN_COVER)) && camera_lever::neck_offset(nk);
+            if (ok) {
+                const float l = std::sqrt(nk[0] * nk[0] + nk[2] * nk[2]);
+                const bool was = g_room_walking;
+                g_room_walking = !user_stick && ((l > g_room_lean && l > g_room_stall_l + 0.2f) || (g_room_walking && l > g_room_stop));
+                if (g_room_walking && (!was || l < g_room_prog_l - 0.05f)) g_room_prog_ms = now, g_room_prog_l = l;
+                if (g_room_walking && now - g_room_prog_ms > 1000.0) g_room_walking = false, g_room_stall_l = l;  // stalled
+                if (l < g_room_stop) g_room_stall_l = 0.0f;
+                if (g_room_walking) {
+                    // the recentred frame faces the body heading: x right, z back; the stick's y is forward
+                    const float m = 0.35f;  // a walk
+                    pad.lx = stick(nk[0] / l * m);
+                    pad.ly = stick(-nk[2] / l * m);
+                    g_room_until = now + 700.0;
+                    g_room_ticks.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (l > g_room_max && camera_lever::room_shift(nk[0] * (1.0f - g_room_max / l), nk[2] * (1.0f - g_room_max / l)))
+                    g_room_clamps.fetch_add(1, std::memory_order_relaxed);
+            }
+            // while walked (and through the slow-down), John's move since the last tick is taken off the head's offset in
+            // the recentred frame (it faces the body heading: right (cos h, -sin h), back (sin h, cos h)): the anchored
+            // camera moves with him, so the view stays where the head is
+            if (have_st) {
+                const float d[3] = {st.pos[0] - g_room_last[0], st.pos[1] - g_room_last[1], st.pos[2] - g_room_last[2]};
+                if (g_room_have_last && g_room_drive.load(std::memory_order_relaxed) && d[0] * d[0] + d[2] * d[2] < 0.3f * 0.3f) {
+                    const float hr = g_heading * 0.0174532925f, x = std::cos(hr) * d[0] - std::sin(hr) * d[2],
+                                z = std::sin(hr) * d[0] + std::cos(hr) * d[2];
+                    if (camera_lever::room_shift(x, z)) g_room_taken[0] += x, g_room_taken[1] += z;
+                }
+                std::memcpy(g_room_last, st.pos, sizeof(g_room_last));
+                g_room_have_last = true;
+            }
+            if (!ok) g_room_walking = false;
+            g_room_ok.store(ok, std::memory_order_relaxed);
+            g_room_drive.store(ok && !user_stick && now < g_room_until, std::memory_order_relaxed);
+        }
     }
     xinput::set_source(controllers, controllers ? pad : xinput::PadState{});
     api::set_camera_job(job);
@@ -339,6 +412,13 @@ void init() {
     if (g_auto_height) g_height = 1.60f;  // until measured
     g_lift = config::get_float("Body", "SeatedLift", 0.09f);
     g_no_idles = config::get_bool("Body", "NoIdleAnims", true);
+    g_body_turn = config::get_bool("Body", "BodyTurnsWithHead", true);
+    g_body_lag = config::get_float("Body", "BodyYawLag", 30.0f);
+    g_body_tau = config::get_float("Body", "BodyYawSmoothing", 0.20f);
+    g_room = config::get_bool("Body", "RoomScale", true);
+    g_room_lean = config::get_float("Body", "RoomLean", 0.55f);
+    g_room_stop = config::get_float("Body", "RoomStop", 0.30f);
+    g_room_max = config::get_float("Body", "RoomMax", 1.00f);
     g_hide_reticle = config::get_bool("Hands", "HideReticle", true);
     g_forward = config::get_float("Body", "EyeForward", 0.05f);
     g_up_axis = config::get_int("Body", "UpAxis", 1);
@@ -395,7 +475,24 @@ void set_stick_turn_riding(bool on, bool save) {
     if (save) config::set("Horse", "StickTurn", on ? "1" : "0");
 }
 float ride_turn_deg() { return g_ride_off_shared.load(std::memory_order_relaxed); }
-float torso_heading_deg() { return g_heading_shared.load(std::memory_order_relaxed) - g_ride_off_shared.load(std::memory_order_relaxed); }
+float torso_heading_deg() {
+    return g_heading_shared.load(std::memory_order_relaxed) - g_ride_off_shared.load(std::memory_order_relaxed) +
+           g_body_off_shared.load(std::memory_order_relaxed);
+}
+bool room_driving() { return g_room_drive.load(std::memory_order_relaxed); }
+bool room_body() { return g_room_ok.load(std::memory_order_relaxed); }
+float body_yaw_offset_deg() { return g_body_off_shared.load(std::memory_order_relaxed); }
+std::string room_status() {
+    char b[300];
+    float nk[3] = {0, 0, 0};
+    camera_lever::neck_offset(nk);
+    std::snprintf(b, sizeof(b), "roomscale %s (lean %.2f, max %.2f): %llu drive ticks, %llu clamps, driving %d, neck (%.3f %.3f %.3f), taken (%.3f %.3f) | body yaw %s, %.1f deg off the heading",
+                  g_room ? "on" : "off", g_room_lean, g_room_max, static_cast<unsigned long long>(g_room_ticks.load()),
+                  static_cast<unsigned long long>(g_room_clamps.load()), g_room_drive.load() ? 1 : 0, nk[0], nk[1], nk[2],
+                  g_room_taken[0], g_room_taken[1],
+                  g_body_turn ? "with the head" : "the heading's", g_body_off_shared.load());
+    return b;
+}
 bool steer_by_head() { return g_steer_head.load(); }
 void set_steer_by_head(bool on) {
     if (g_steer_head.exchange(on) != on) log::info("[pose] horse steering by the %s", on ? "head" : "stick");

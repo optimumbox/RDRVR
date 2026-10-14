@@ -93,6 +93,8 @@ bool head_yaw_deg(float* out);
 bool head_forward(float d[3]);
 // The centre eye's position since recentre, in the recentred frame (metres: x right, y up, z back); false before.
 bool head_offset(float out[3]);
+// [Body] RoomScale: the head's origin moved by (x, z) in the recentred frame; false before recentre
+bool room_shift(float x, float z);
 // The neck's offset since recentre, in the recentred frame (metres: x right, y up, z back): a pivot 0.10 m below and
 // 0.08 m behind the centre eye in the head's own axes, less where it is at the recentre (looking level, ahead), so
 // turning or nodding the head leaves it nearly still while stepping and crouching move it. False before recentre.

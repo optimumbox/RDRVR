@@ -114,6 +114,14 @@ motion vectors) are still recorded; that is ~2.85 ms render + ~2.5 ms playback.
   in the log names the shaders to convert). Tested: all15 skips, all14 falls back.
 - The user's resolution is back on Automatic (RDRVR.user.ini RenderHeadset/RenderResolution=auto).
 - Drive C: was full (55 MB) on 2026-10-14: eye captures are ~200 MB raw (.rde); delete them after converting.
+- 2026-10-14, body/arms toward KF2VR (pose.cpp, body.cpp, camera_lever room_shift; `pose room` reports):
+  [Body] BodyTurnsWithHead: the torso heading (drawn body, holsters, elbow hints) turns toward the head's yaw, smoothed
+  (BodyYawSmoothing 0.2 s), at most BodyYawLag 30 deg behind; render-side only. [Body] RoomScale: on foot with the stick
+  idle, the neck past RoomLean 0.55 m from John walks him toward it (left stick, 0.35) until RoomStop 0.30 m; a walk
+  with no progress for 1 s stops (a wall) until the offset grows 0.2 m more; John's move is taken off the head's
+  origin (room_shift, so the view stays put); past RoomMax 1.0 m the view's origin is dragged along; the drawn body
+  takes the neck's remaining offset so the arms reach. Simulated with `xr posramp` (forward/sideways steps converge,
+  no circling); not yet tried in the headset.
 
 ## Open problems (as of 15:25; 1 and 2 addressed above, re-check in the user's next session) (the user's screenshots: `research\grab\vr3\`, eye captures; `tools\sp\eyesbs.py` views them)
 

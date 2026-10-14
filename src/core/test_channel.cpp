@@ -430,6 +430,7 @@ std::string execute(const std::vector<std::string>& t) {
     }
     if (c == "pose" && (t.size() == 1 || t[1] != "xr" && t[1] != "off")) {
         // pose | pose anchor on|off  ("pose xr" / "pose off" are the eye-camera switch above)
+        if (t.size() >= 2 && t[1] == "room") return pose::room_status();  // pose room: [Body] RoomScale, BodyTurnsWithHead
         if (t.size() >= 3 && t[1] == "anchor") pose::set_anchor(t[2] == "on");
         if (t.size() >= 3 && t[1] == "orient") pose::set_orient_mode(std::atoi(t[2].c_str()));
         // pose saddle on|off [seconds]: the saddle anchor this session (not saved); pose horse stick|head writes the ini

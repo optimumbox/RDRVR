@@ -6751,9 +6751,11 @@ void before_scene(const float* cam) {
         sw[2] -= fz / fl * back;
     }
     float off[3];
-    if (follow && camera_lever::head_offset(off)) {
-        sw[0] += std::cos(h) * off[0] + std::sin(h) * off[2];
-        sw[2] += -std::sin(h) * off[0] + std::cos(h) * off[2];
+    // (the offsets are in the recentred frame, which faces the body heading: the torso's less its turn with the head)
+    const float hb = h - pose::body_yaw_offset_deg() * 0.0174532925f;
+    if ((follow && camera_lever::head_offset(off)) || (!follow && pose::room_body() && camera_lever::neck_offset(off))) {
+        sw[0] += std::cos(hb) * off[0] + std::sin(hb) * off[2];
+        sw[2] += -std::sin(hb) * off[0] + std::cos(hb) * off[2];
     }
     for (int k = 0; k < 3; ++k) f.shift_bind[k] = sw[0] * w[k * 4 + 0] + sw[1] * w[k * 4 + 1] + sw[2] * w[k * 4 + 2];
     f.shift = sw[0] != 0 || sw[2] != 0;
