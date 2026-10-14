@@ -17,7 +17,7 @@ A session resuming this work starts here. Branch `single-pass-stereo`, repo `C:\
 
 ## State
 
-Installed for VR: the latest build, shaders `research\stereo_all14` (session.ps1's default now), `ViSkipRecord=1`
+Installed for VR: the latest build, shaders `research\stereo_all15` (session.ps1's default now), `ViSkipRecord=1`
 (session.ps1's default now: the recorder skip on).
 The user runs DLSS Quality (RDRVR.user.ini DlssQuality=5, RenderScale=100: render 1809x1790 per eye), not DLAA.
 The user's F7 menu render scale is at 200% (they tried it because 100% was blocked); 100% gives 4778x2688 (eyes
@@ -106,6 +106,13 @@ motion vectors) are still recorded; that is ~2.85 ms render + ~2.5 ms playback.
   GPU 5.56 ms (regions 3.55: eye 1's 2.94, eye 2's 0.15), DLSS 0.28 + 0.30 ms, the rest of the post/UI ~1.4 ms both
   eyes. Eye 2's post + DLSS is ~1 ms at most: not worth a risky change now; the GPU has ~5 ms of headroom here.
 - Fixed: a cut's hook name was a stack buffer (recorder_skip.cpp); the status writer read it -> crash at startup.
+- 2026-10-14, animals in the left eye only (the user's captures: chickens at MacFarlane's): under ViSkipRecord eye 2
+  records no draws, so a pipeline without a twin (a shader the dump never saw) draws in eye 1 only. 26 new shaders
+  dumped at the ranch (`vi dump`), merged into research\dump_all, set `research\stereo_all15` (session.ps1's default;
+  `vi plain` then lists only PS_Blit). Safety net: a draw in slice 0's region whose twin was refused as not converted
+  (and not in the set's new no_twin.txt) records eye 2's scene whole for 600 presents ("[vi] ... drew without a twin"
+  in the log names the shaders to convert). Tested: all15 skips, all14 falls back.
+- The user's resolution is back on Automatic (RDRVR.user.ini RenderHeadset/RenderResolution=auto).
 - Drive C: was full (55 MB) on 2026-10-14: eye captures are ~200 MB raw (.rde); delete them after converting.
 
 ## Open problems (as of 15:25; 1 and 2 addressed above, re-check in the user's next session) (the user's screenshots: `research\grab\vr3\`, eye captures; `tools\sp\eyesbs.py` views them)

@@ -51,6 +51,7 @@ def main():
     out = pathlib.Path(a.dst)
     out.mkdir(parents=True, exist_ok=True)
     report, safe = [], []
+    no_twin = []
     counts = {'ok': 0, 'safe': 0, 'refused': 0, 'failed': 0}
     with tempfile.TemporaryDirectory() as tmp:
         t = pathlib.Path(tmp)
@@ -66,6 +67,7 @@ def main():
                 # neither converted nor listed safe: no twin, so each eye's region draws it as the game's, with its own
                 # pass's constants and images
                 report.append(f'ps {h} no twin ({entry.group(1)}: {NO_TWIN_PS[entry.group(1)]})')
+                no_twin.append(h)
                 counts['no twin'] = counts.get('no twin', 0) + 1
                 continue
             try:
@@ -114,6 +116,7 @@ def main():
             (out / f'{kind}_{h}.dxil').write_bytes(signed)
             report.append(f'{kind} {h} ok ({n} row reads{"; motion vectors through D" if approx else ""})')
             counts['ok'] += 1
+    (out / 'no_twin.txt').write_text(''.join(x + '\n' for x in no_twin), encoding='utf-8')  # (the mod: drawn eye 1 only on purpose)
     (out / 'ps_safe.txt').write_text(''.join(x + '\n' for x in safe), encoding='utf-8')
     (out / 'report.txt').write_text('\n'.join(report) + '\n', encoding='utf-8')
     print(f"ok {counts['ok']}, safe {counts['safe']}, no twin {counts.get('no twin', 0)}, refused {counts['refused']}, failed {counts['failed']} -> {out}")

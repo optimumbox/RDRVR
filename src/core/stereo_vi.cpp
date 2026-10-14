@@ -84,6 +84,11 @@ std::unordered_map<ID3D12PipelineState*, Kept*> g_by_pso;
 std::atomic<uint64_t> g_by_pso_gen{0};  // records added (kept_of's caches)
 std::unordered_map<uint64_t, std::vector<uint8_t>> g_vs_conv, g_ps_conv;
 std::unordered_set<uint64_t> g_ps_safe;
+std::unordered_set<uint64_t> g_no_twin;  // <ViShaders>/no_twin.txt (stereo_vs.py NO_TWIN_PS): eye 1 only on purpose
+// [Stereo] ViSkipRecord's safety: a draw in slice 0's region with no twin (a shader not converted: one the dump never saw)
+// draws eye 1 only, and a skipped second scene records nothing for eye 2: eye 2's scene is recorded whole for a while
+std::atomic<uint64_t> g_untwinned_at{0}, g_untwinned_n{0};
+constexpr uint64_t kUntwinnedHold = 600;  // presents (~6.7 s at 90 Hz)
 std::unordered_set<uint64_t> g_no_depth;  // <ViShaders>\no_depth.txt (tools/sp/dxil/depth_readers.py): cannot read the depth
 
 std::mutex g_q_mutex;
@@ -136,6 +141,13 @@ void load_shaders(const std::string& dir) {
             if (const uint64_t x = std::strlen(line) > 3 ? std::strtoull(line + 3, nullptr, 16) : 0) no_depth.insert(x);
         std::fclose(f);
     }
+    std::unordered_set<uint64_t> no_twin;
+    if (FILE* f = nullptr; fopen_s(&f, (dir + "\\no_twin.txt").c_str(), "r") == 0 && f) {
+        char line[64];
+        while (std::fgets(line, sizeof(line), f))
+            if (const uint64_t x = std::strtoull(line, nullptr, 16)) no_twin.insert(x);
+        std::fclose(f);
+    }
     if (FILE* f = nullptr; fopen_s(&f, (dir + "\\ps_safe.txt").c_str(), "r") == 0 && f) {
         char line[64];
         while (std::fgets(line, sizeof(line), f))
@@ -147,6 +159,7 @@ void load_shaders(const std::string& dir) {
     g_ps_conv.swap(ps);
     g_ps_safe.swap(safe);
     g_no_depth.swap(no_depth);
+    g_no_twin.swap(no_twin);
     const size_t nv = g_vs_conv.size(), np = g_ps_conv.size(), ns = g_ps_safe.size(), nd = g_no_depth.size();
     ReleaseSRWLockExclusive(&g_lock);
     log::info("[vi] shaders from %s: %zu vertex, %zu pixel converted, %zu pixel listed safe, %zu that cannot read the depth", dir.c_str(),
@@ -392,6 +405,11 @@ void bind(ID3D12GraphicsCommandList* cl, ListState& s, ID3D12PipelineState* p) {
 }
 
 }  // namespace
+bool untwinned_recent() {
+    const uint64_t at = g_untwinned_at.load(std::memory_order_relaxed);
+    return at && at + kUntwinnedHold >= state::presents.load(std::memory_order_relaxed);
+}
+uint64_t untwinned_count() { return g_untwinned_n.load(std::memory_order_relaxed); }
 
 void install_rs_hooks(ID3D12GraphicsCommandList* cl) {
     if (o_SetViewports) return;
@@ -589,6 +607,20 @@ bool before_draw(ID3D12GraphicsCommandList* cl) {
     if (region == 2 && g_drawn2_on.load(std::memory_order_relaxed)) note_drawn2(s);
     if (s.game) bind(cl, s, p);  // (out of a region a twin left bound goes back to the game's)
     if (region == 1) (p != s.game ? g_draws_both : g_draws_plain).fetch_add(1, std::memory_order_relaxed);
+    if (region == 1 && p == s.game && s.kept && !s.kept->twin.load(std::memory_order_relaxed) &&
+        std::strstr(s.kept->why, "not converted")) {  // (not a twin still being made: that pipeline's first frame)
+        AcquireSRWLockShared(&g_lock);
+        const bool on_purpose = g_no_twin.count(s.kept->ps_hash) != 0;
+        ReleaseSRWLockShared(&g_lock);
+        if (!on_purpose) {
+            const uint64_t now = state::presents.load(std::memory_order_relaxed);
+            if (g_untwinned_at.exchange(now, std::memory_order_relaxed) + kUntwinnedHold < now) {
+                g_untwinned_n.fetch_add(1, std::memory_order_relaxed);
+                log::limited("vi.untwinned", 20, "[vi] vs %016llx ps %016llx drew without a twin: eye 2's scene recorded whole for a while (convert it: vi dump)",
+                             static_cast<unsigned long long>(s.kept->vs_hash), static_cast<unsigned long long>(s.kept->ps_hash));
+            }
+        }
+    }
     if (region == 1 && p == s.game && g_plain_on.load(std::memory_order_relaxed)) {
         bool arrays = false;
         prepass::vi_region(cl, &arrays);

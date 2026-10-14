@@ -25,6 +25,7 @@
 #include "core/prepass_arrays.h"
 #include "core/recorder_skip.h"
 #include "core/state.h"
+#include "core/stereo_vi.h"
 #include "core/xr.h"
 
 namespace rdrvr::camera_lever {
@@ -635,7 +636,7 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
             t_scene_vp = outer;
             return;
         }
-        if (t_vi_frame && second && g_vi_skip2.load(std::memory_order_relaxed) && recorder_skip::installed()) {
+        if (t_vi_frame && second && g_vi_skip2.load(std::memory_order_relaxed) && recorder_skip::installed() && !vi::untwinned_recent()) {
             // [Stereo] ViSkipRecord: slice 0's region drew both eyes; this scene runs for its own bookkeeping (its targets'
             // clears and binds, its copies, the region's end) but records no draws and no draw state
             recorder_skip::begin();

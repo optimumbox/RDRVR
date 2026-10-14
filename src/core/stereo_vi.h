@@ -53,6 +53,8 @@ void install_rs_hooks(ID3D12GraphicsCommandList* cl);   // RSSetViewports, RSSet
 bool main_pass();  // [Stereo] ViMain
 std::string heap_status();  // "vi heap": eye 2's views
 bool heap_ready();          // every screen image's eye-2 view written (view 1 reads them unconditionally)
+bool untwinned_recent();  // a draw without a twin (not on purpose) in slice 0's region lately: eye 2's scene recorded
+uint64_t untwinned_count();
 bool wanted();      // this frame's pre-pass may draw both eyes (configured, switched on, twins made)
 bool configured();  // [Stereo] ViPrepass on and its prerequisites met
 // The depth's planes the list's game pipeline (this thread's lists) can write: bit 0 depth, bit 1 stencil; -1 not

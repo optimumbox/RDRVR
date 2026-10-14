@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     A flat test session: deploy this tree's build with the test switches and start the game (the player loads the save); or end it
     (close the game, put the release back, remove the test files).
@@ -14,7 +14,7 @@ param(
     [switch] $Install,
     [switch] $Vr,
     [string] $GameDir = 'G:\Games\Red Dead Redemption',
-    [string] $Shaders = 'C:\Games\RDRVR-src\research\stereo_all14',
+    [string] $Shaders = 'C:\Games\RDRVR-src\research\stereo_all15',
     [string] $ExtraIni = ''
 )
 $ErrorActionPreference = 'Stop'
