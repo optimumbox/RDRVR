@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -89,6 +90,12 @@ std::unordered_set<uint64_t> g_no_twin;  // <ViShaders>/no_twin.txt (stereo_vs.p
 // draws eye 1 only, and a skipped second scene records nothing for eye 2: eye 2's scene is recorded whole for a while
 std::atomic<uint64_t> g_untwinned_at{0}, g_untwinned_n{0};
 constexpr uint64_t kUntwinnedHold = 600;  // presents (~6.7 s at 90 Hz)
+// ... and a twin still being made (queued, or made this frame: usable from the next) holds it for a few presents only
+// (2026-10-14, the players' "shaders not working in one eye": a cold driver cache makes each twin slow, so a new area's
+// pipelines drew in eye 1 only for seconds)
+std::atomic<uint64_t> g_pending_at{0}, g_pending_n{0};
+constexpr uint64_t kPendingHold = 3;
+int g_twin_delay_ms = 0;  // [Stereo] ViTwinDelayMs (a test's: each twin made that much later, as a cold driver cache)
 std::unordered_set<uint64_t> g_no_depth;  // <ViShaders>\no_depth.txt (tools/sp/dxil/depth_readers.py): cannot read the depth
 
 std::mutex g_q_mutex;
@@ -98,6 +105,48 @@ bool g_worker = false;
 
 std::atomic<uint64_t> g_kept_n{0}, g_made{0}, g_failed{0}, g_no_vs{0}, g_no_ps{0}, g_stages{0};
 std::atomic<uint64_t> g_draws_both{0}, g_draws_skipped{0}, g_draws_plain{0}, g_clears_skipped{0}, g_rebinds{0}, g_draws_queried{0};
+
+// "vi scan <dir>": every shader container in the process's memory (the game loads its effects whole at boot, though it
+// makes their pipelines only where they are drawn: the places a "vi dump" never saw). A DXBC container: "DXBC", a
+// checksum, version 1, its size, its chunks; the stage from the program chunk's version token (SHDR/SHEX: type in bits
+// 16+, 0 pixel, 1 vertex; DXIL: the same). Copied under SEH (memory can change under the scan).
+int container_stage(const uint8_t* b, size_t avail, uint32_t* size_out) {
+    __try {
+        if (avail < 32 || std::memcmp(b, "DXBC", 4) != 0) return -1;
+        uint32_t ver, size, nchunks;
+        std::memcpy(&ver, b + 20, 4);
+        std::memcpy(&size, b + 24, 4);
+        std::memcpy(&nchunks, b + 28, 4);
+        if (ver != 1 || size < 32 || size > (8u << 20) || size > avail || nchunks == 0 || nchunks > 64 || 32 + nchunks * 4 > size) return -1;
+        int stage = -1;
+        for (uint32_t c = 0; c < nchunks; ++c) {
+            uint32_t off;
+            std::memcpy(&off, b + 32 + c * 4, 4);
+            if (off + 8 > size) return -1;
+            uint32_t len;
+            std::memcpy(&len, b + off + 4, 4);
+            if (off + 8 + len > size) return -1;
+            const uint8_t* fourcc = b + off;
+            if ((!std::memcmp(fourcc, "SHDR", 4) || !std::memcmp(fourcc, "SHEX", 4) || !std::memcmp(fourcc, "DXIL", 4)) && len >= 4) {
+                uint32_t tok;
+                std::memcpy(&tok, b + off + 8, 4);
+                stage = static_cast<int>(tok >> 16);
+            }
+        }
+        *size_out = size;
+        return stage;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+bool copy_seh(void* dst, const void* src, size_t n) {
+    __try {
+        std::memcpy(dst, src, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
 
 std::string hex(uint64_t h) {
     char b[20];
@@ -270,15 +319,17 @@ void worker() {
             k = g_queue.front();
             g_queue.pop_front();
         }
+        if (g_twin_delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(g_twin_delay_ms));
         if (!k->twin.load() || k->remake.exchange(false)) make_twin(k);  // (a replaced twin is leaked: frames in flight use it)
     }
 }
 
 void enqueue(Kept* k) {
     std::lock_guard lock(g_q_mutex);
-    if (!g_worker) {
+    if (!g_worker) {  // (several: a cold driver cache takes tens of ms a pipeline)
         g_worker = true;
-        std::thread(worker).detach();
+        const unsigned n = std::thread::hardware_concurrency() / 4;
+        for (unsigned i = 0; i < (n < 2 ? 2 : n > 6 ? 6 : n); ++i) std::thread(worker).detach();
     }
     g_queue.push_back(k);
     g_q_cv.notify_one();
@@ -406,8 +457,9 @@ void bind(ID3D12GraphicsCommandList* cl, ListState& s, ID3D12PipelineState* p) {
 
 }  // namespace
 bool untwinned_recent() {
-    const uint64_t at = g_untwinned_at.load(std::memory_order_relaxed);
-    return at && at + kUntwinnedHold >= state::presents.load(std::memory_order_relaxed);
+    const uint64_t at = g_untwinned_at.load(std::memory_order_relaxed), pt = g_pending_at.load(std::memory_order_relaxed),
+                   now = state::presents.load(std::memory_order_relaxed);
+    return (at && at + kUntwinnedHold >= now) || (pt && pt + kPendingHold >= now);
 }
 uint64_t untwinned_count() { return g_untwinned_n.load(std::memory_order_relaxed); }
 
@@ -431,6 +483,7 @@ void init() {
     }
     if (!g_dir.empty()) load_shaders(g_dir);
     g_on = config::get_bool("Stereo", "ViOn", true);
+    g_twin_delay_ms = config::get_int("Stereo", "ViTwinDelayMs", 0);
     g_main = config::get_bool("Stereo", "ViMain", false);
     if (g_main) g_query_draws = false;
     g_configured = true;
@@ -612,17 +665,22 @@ bool before_draw(ID3D12GraphicsCommandList* cl) {
     if (region == 2 && g_drawn2_on.load(std::memory_order_relaxed)) note_drawn2(s);
     if (s.game) bind(cl, s, p);  // (out of a region a twin left bound goes back to the game's)
     if (region == 1) (p != s.game ? g_draws_both : g_draws_plain).fetch_add(1, std::memory_order_relaxed);
-    if (region == 1 && p == s.game && s.kept && !s.kept->twin.load(std::memory_order_relaxed) &&
-        std::strstr(s.kept->why, "not converted")) {  // (not a twin still being made: that pipeline's first frame)
+    const char* why = s.kept ? s.kept->why : "";
+    bool pend_arrays = false;  // (into the arrays only: elsewhere the game's pipeline is drawn though a twin is made)
+    if (region == 1 && p == s.game && s.kept && !why[0] && (prepass::vi_region(cl, &pend_arrays), pend_arrays)) {
+        // a twin still being made (or made this frame)
+        const uint64_t now = state::presents.load(std::memory_order_relaxed);
+        if (g_pending_at.exchange(now, std::memory_order_relaxed) != now) g_pending_n.fetch_add(1, std::memory_order_relaxed);
+    } else if (region == 1 && p == s.game && s.kept && !s.kept->twin.load(std::memory_order_relaxed)) {  // never made
         AcquireSRWLockShared(&g_lock);
-        const bool on_purpose = g_no_twin.count(s.kept->ps_hash) != 0;
+        const bool on_purpose = std::strstr(why, "not converted") && g_no_twin.count(s.kept->ps_hash) != 0;
         ReleaseSRWLockShared(&g_lock);
         if (!on_purpose) {
             const uint64_t now = state::presents.load(std::memory_order_relaxed);
             if (g_untwinned_at.exchange(now, std::memory_order_relaxed) + kUntwinnedHold < now) {
                 g_untwinned_n.fetch_add(1, std::memory_order_relaxed);
-                log::limited("vi.untwinned", 20, "[vi] vs %016llx ps %016llx drew without a twin: eye 2's scene recorded whole for a while (convert it: vi dump)",
-                             static_cast<unsigned long long>(s.kept->vs_hash), static_cast<unsigned long long>(s.kept->ps_hash));
+                log::limited("vi.untwinned", 20, "[vi] vs %016llx ps %016llx drew without a twin (%s): eye 2's scene recorded whole for a while (convert it: vi dump)",
+                             static_cast<unsigned long long>(s.kept->vs_hash), static_cast<unsigned long long>(s.kept->ps_hash), why);
             }
         }
     }
@@ -807,6 +865,44 @@ std::string command(const std::vector<std::string>& t) {
         ReleaseSRWLockShared(&g_lock);
         return "dumped " + std::to_string(n) + " shaders to " + t[2];
     }
+    if (sub == "scan" && t.size() >= 3) {  // vi scan <dir>: every vertex and pixel shader in memory (see container_stage)
+        std::unordered_set<uint64_t> seen;
+        size_t vs_n = 0, ps_n = 0, other = 0, written = 0;
+        MEMORY_BASIC_INFORMATION mbi{};
+        std::vector<uint8_t> blob;
+        for (uint8_t* a = nullptr; VirtualQuery(a, &mbi, sizeof(mbi)) == sizeof(mbi); a = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize) {
+            const DWORD rd = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE;
+            if (mbi.State != MEM_COMMIT || !(mbi.Protect & rd) || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) continue;
+            const uint8_t* base = static_cast<const uint8_t*>(mbi.BaseAddress);
+            const size_t len = mbi.RegionSize;
+            for (size_t i = 0; i + 32 <= len; i += 4) {  // (containers are 4-aligned in practice)
+                if (base[i] != 'D' || base[i + 1] != 'X' || base[i + 2] != 'B' || base[i + 3] != 'C') continue;
+                uint32_t size = 0;
+                const int stage = container_stage(base + i, len - i, &size);
+                if (stage < 0) continue;
+                if (stage != 0 && stage != 1) {
+                    ++other;
+                    continue;
+                }
+                blob.resize(size);
+                if (!copy_seh(blob.data(), base + i, size)) continue;
+                const uint64_t h = fnv(blob.data(), size);
+                if (!seen.insert(h * 2 + stage).second) continue;
+                (stage ? vs_n : ps_n)++;
+                const std::string path = t[2] + (stage ? "\\vs_" : "\\ps_") + hex(h) + ".dxbc";
+                if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+                FILE* f = nullptr;
+                if (fopen_s(&f, path.c_str(), "wb") == 0 && f) {
+                    std::fwrite(blob.data(), 1, size, f);
+                    std::fclose(f);
+                    ++written;
+                }
+                i += (size & ~3u) - 4;
+            }
+        }
+        return "scanned: " + std::to_string(vs_n) + " vertex, " + std::to_string(ps_n) + " pixel shaders (" + std::to_string(other) +
+               " other stages), " + std::to_string(written) + " new files in " + t[2];
+    }
     if (sub == "why" && t.size() >= 3) {  // vi why <vs hash>: each kept pipeline of that vertex shader and its twin's fate
         const uint64_t h = std::strtoull(t[2].c_str(), nullptr, 16);
         std::string r;
@@ -845,14 +941,15 @@ std::string command(const std::vector<std::string>& t) {
         }
         return out;
     }
-    char b[640];
+    char b[768];
     std::snprintf(b, sizeof(b),
-                  "vi %s, tier %d | pipelines kept %llu, twins %llu (refused %llu; no converted vs %llu, ps %llu; other stages %llu) | "
+                  "vi %s, tier %d | pipelines kept %llu, twins %llu (refused %llu; no converted vs %llu, ps %llu; other stages %llu) | eye 2 recorded whole: untwinned %llu, pending frames %llu | "
                   "slice 0: draws for both eyes %llu, as the game's %llu | slice 1: draws skipped %llu, drawn for their queries %llu, clears skipped %llu | rebinds %llu | %s",
                   wanted() ? "on" : g_on.load() ? "on, no twin yet" : "off", g_tier, static_cast<unsigned long long>(g_kept_n.load()),
                   static_cast<unsigned long long>(g_made.load()), static_cast<unsigned long long>(g_failed.load()),
                   static_cast<unsigned long long>(g_no_vs.load()), static_cast<unsigned long long>(g_no_ps.load()),
-                  static_cast<unsigned long long>(g_stages.load()), static_cast<unsigned long long>(g_draws_both.load()),
+                  static_cast<unsigned long long>(g_stages.load()), static_cast<unsigned long long>(g_untwinned_n.load()),
+                  static_cast<unsigned long long>(g_pending_n.load()), static_cast<unsigned long long>(g_draws_both.load()),
                   static_cast<unsigned long long>(g_draws_plain.load()), static_cast<unsigned long long>(g_draws_skipped.load()),
                   static_cast<unsigned long long>(g_draws_queried.load()),
                   static_cast<unsigned long long>(g_clears_skipped.load()), static_cast<unsigned long long>(g_rebinds.load()),
