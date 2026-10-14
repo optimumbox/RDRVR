@@ -97,6 +97,15 @@ void raw_bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIP
               const D3D12_CPU_DESCRIPTOR_HANDLE* ds);
 void raw_copy_region(ID3D12GraphicsCommandList* cl, const D3D12_TEXTURE_COPY_LOCATION* dst, const D3D12_TEXTURE_COPY_LOCATION* src,
                      const D3D12_BOX* box = nullptr);  // (box: the source's, copied to the destination's same place)
+// [Stereo] ViSlices (single-pass stereo, prepass_arrays.cpp's native kinds): while set on a thread (eye_shape's re-make
+// of the render-size targets; w x h the render size), each single 2D render-target or depth texture of that size is made
+// with two array slices, eye 1's and eye 2's. The game's views (2D) see slice 0; its barriers and copies naming a
+// subresource are rewritten for both slices, its copies between a 2-slice target and a plain one use slice 0. (0, 0) ends it.
+void set_stereo_targets(uint32_t w, uint32_t h);
+bool is_doubled(const void* res);
+// A 2-slice target's state per plane as the game's last barrier (any list, recorded order) left it; false: not one
+bool doubled_state(const void* res, unsigned plane, int* out);  // (out: a D3D12_RESOURCE_STATES)
+std::string doubled_status();
 // R5 pacing: while set, the game's Present runs with sync interval 0, so vsync does not hold the game to the desktop's
 // refresh and xrWaitFrame paces it (the game's own frame limiter still applies).
 void set_present_unsynced(bool on);

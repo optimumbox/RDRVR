@@ -54,6 +54,13 @@ std::atomic<bool> g_on{false}, g_active{false}, g_failed{false}, g_hooked{false}
 // region is copied out of its slices there (publish: the region's slice into the game's target, and in a
 // view-instanced slice-0 region slice 1 into eye 2's copy, which view 1 reads through its global_textures slot).
 std::atomic<bool> g_i2{false};
+// [Stereo] ViSlices (with ViMain): the game's render-size targets made with a slice per eye (d3d::set_stereo_targets);
+// such a kind is native: the region draws it in place (its own views of the game's resource), nothing copied out; at eye
+// 2's region's start of a view-instanced frame eye 2's slice is copied into eye 1's (the handover: the game's views
+// and eye 2's region's draws see slice 0), and view 1 reads slice 1 through an array view of it. FullScreenCopy keeps
+// eye 2's copy (a snapshot at its read: the glass is drawn into it while view 1 reads its earlier state, kSlot's note).
+std::atomic<bool> g_slices{false};
+std::atomic<uint64_t> g_handovers{0}, g_handover_copies{0}, g_handover_unknown{0}, g_snapshots{0};
 std::atomic<uint64_t> g_publishes{0}, g_depth_copies{0};
 int kind_count() { return g_i2.load(std::memory_order_relaxed) ? kKinds : kPrepassKinds; }
 std::atomic<bool> g_views{false}, g_views_write{false};  // [Stereo] PrepassViews: 1 observe, 2 also write eye 2's rows
@@ -73,6 +80,7 @@ struct Arr {
     D3D12_CPU_DESCRIPTOR_HANDLE view[3]{};  // slice 0, slice 1, both (view-instanced stereo: views 0 and 1 to slices 0 and 1)
     ID3D12Resource* e2 = nullptr;           // eye 2's copy (a kind with a global slot, ViMain), its state
     D3D12_RESOURCE_STATES e2_state = D3D12_RESOURCE_STATE_COMMON;
+    bool native = false;  // ViSlices: arr is the game's own 2-slice target (no reference held)
 };
 Arr g_arr[kKinds];
 // Eye 2's copy of the game's "Depth Resolve" (the depth the main pass reads through slot 15), made at its first copy
@@ -81,6 +89,7 @@ struct DepthResolve {
     ID3D12Resource* e2 = nullptr;
     D3D12_RESOURCE_STATES e2_state = D3D12_RESOURCE_STATE_COMMON;
     UINT planes = 1;
+    bool native = false;  // ViSlices: the game's copy of a native depth (both slices; view 1 reads its slice 1)
 } g_dr;
 struct Retired {
     ID3D12Resource* res;
@@ -104,6 +113,7 @@ struct Region {
     unsigned ds_dirty = 3;    // ... the depth's planes among them (bit 0 depth, bit 1 stencil): only those copied out
     bool depth_pending = false;  // the depth turned to read and not copied out yet: at its first possible reader (lazy)
     unsigned touched = 0, known = 0;   // bit (kind * 2 + plane): that plane's state known
+    unsigned native_touched = 0;       // ViSlices: native kinds bound or cleared (bit k; end_region drops them from touched)
     D3D12_RESOURCE_STATES state[kKinds][2]{};  // per plane (the depth's two: the game moves them one at a time)
 } g_r;
 unsigned plane_bits(int k) { return (g_arr[k].planes > 1 ? 3u : 1u) << (k * 2); }
@@ -120,6 +130,8 @@ uint64_t g_vi_frame = ~0ull;  // the frame whose slice-0 region drew both eyes (
 std::atomic<uint64_t> g_vi_regions[2]{};
 // the region's target view: slice 0's region of a view-instanced frame binds both slices
 int region_view_index() { return g_r.vi && g_r.slice == 0 ? 2 : g_r.slice; }
+// a kind's: a native one's slice 0 is the game's (eye 2's region draws there after the handover)
+int view_index(int k);
 struct LastBind {  // the list's last bind outside a region (the playback thread)
     ID3D12GraphicsCommandList* cl = nullptr;
     unsigned n = 0;
@@ -175,8 +187,13 @@ bool ensure(int k, ID3D12Resource* res, DXGI_FORMAT view_fmt) {
     Arr& a = g_arr[k];
     const D3D12_RESOURCE_DESC d = res->GetDesc();
     if (a.arr && a.game == res && a.w == d.Width && a.h == d.Height && a.res_fmt == d.Format) return true;
-    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.DepthOrArraySize != 1 || d.MipLevels != 1 || d.SampleDesc.Count != 1) {
-        fail("a pre-pass target is not a single 2D texture");
+    const bool native = g_slices.load(std::memory_order_relaxed) && d3d::is_doubled(res);
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.DepthOrArraySize != (native ? 2 : 1) || d.MipLevels != 1 || d.SampleDesc.Count != 1) {
+        char why[160];
+        std::snprintf(why, sizeof(why), "a pre-pass target is not a single 2D texture (%s %p: dim %d, %llux%u x%u, mips %u, samples %u, %s)", kNames[k],
+                      static_cast<void*>(res), static_cast<int>(d.Dimension), static_cast<unsigned long long>(d.Width), d.Height, d.DepthOrArraySize,
+                      d.MipLevels, d.SampleDesc.Count, native ? "2-slice" : "not one of the 2-slice targets");
+        fail(why);
         return false;
     }
     if (!g_dev && FAILED(res->GetDevice(IID_PPV_ARGS(&g_dev)))) return false;
@@ -184,7 +201,7 @@ bool ensure(int k, ID3D12Resource* res, DXGI_FORMAT view_fmt) {
         fail("no descriptor heaps");
         return false;
     }
-    if (a.arr) g_retired.push_back({a.arr, state::presents.load()});  // the GPU may still use it: released later
+    if (a.arr && !a.native) g_retired.push_back({a.arr, state::presents.load()});  // the GPU may still use it: released later
     if (a.e2) g_retired.push_back({a.e2, state::presents.load()});
     a = Arr{};
     D3D12_RESOURCE_DESC ad = d;
@@ -194,9 +211,10 @@ bool ensure(int k, ID3D12Resource* res, DXGI_FORMAT view_fmt) {
     D3D12_CLEAR_VALUE cv{};
     cv.Format = vf;
     cv.DepthStencil = {1.0f, 0};
-    ID3D12Resource* arr = nullptr;
-    const HRESULT hr = g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &ad, write_state(k), is_depth(k) ? &cv : nullptr,
-                                                      IID_PPV_ARGS(&arr));
+    ID3D12Resource* arr = native ? res : nullptr;
+    const HRESULT hr = native ? S_OK
+                              : g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &ad, write_state(k), is_depth(k) ? &cv : nullptr,
+                                                               IID_PPV_ARGS(&arr));
     if (FAILED(hr) || !arr) {
         char why[96];
         std::snprintf(why, sizeof(why), "the %s array not made (%#lx)", kNames[k], static_cast<unsigned long>(hr));
@@ -231,13 +249,19 @@ bool ensure(int k, ID3D12Resource* res, DXGI_FORMAT view_fmt) {
     a.res_fmt = d.Format;
     a.view_fmt = vf;
     a.arr = arr;
+    a.native = native;
     wchar_t nm[96];
-    std::swprintf(nm, 96, L"RDRVR prepass %S", kNames[k]);
-    arr->SetName(nm);
-    log::info("[prepass] %s: a 2-slice array %llux%u (format %d, view %d, %u plane(s))", kNames[k], static_cast<unsigned long long>(d.Width),
-              d.Height, static_cast<int>(d.Format), static_cast<int>(vf), a.planes);
-    if (g_i2.load(std::memory_order_relaxed) && kSlot[k] >= 0) {  // eye 2's copy, read by view 1 through the slot
+    if (!native) {
+        std::swprintf(nm, 96, L"RDRVR prepass %S", kNames[k]);
+        arr->SetName(nm);
+    }
+    log::info("[prepass] %s: %s %llux%u (format %d, view %d, %u plane(s))", kNames[k], native ? "the game's own 2-slice target" : "a 2-slice array",
+              static_cast<unsigned long long>(d.Width), d.Height, static_cast<int>(d.Format), static_cast<int>(vf), a.planes);
+    if (native && kSlot[k] >= 0 && k != kFsc) {  // view 1 reads slice 1 of the game's own (stereo_vi_heap.cpp: an array view)
+        vi::eye2_texture(kSlot[k], res, res);
+    } else if (g_i2.load(std::memory_order_relaxed) && kSlot[k] >= 0) {  // eye 2's copy, read by view 1 through the slot
         D3D12_RESOURCE_DESC ed = d;  // (a depth format keeps its depth-stencil flag)
+        ed.DepthOrArraySize = 1;
         ed.Flags &= ~(is_depth(k) ? D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE
                                   : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
         ID3D12Resource* e2 = nullptr;
@@ -252,6 +276,11 @@ bool ensure(int k, ID3D12Resource* res, DXGI_FORMAT view_fmt) {
         }
     }
     return true;
+}
+
+int view_index(int k) {
+    if (g_arr[k].native) return g_r.vi && g_r.slice == 0 ? 2 : 0;
+    return region_view_index();
 }
 
 void release_retired() {
@@ -504,6 +533,8 @@ void end_region(ID3D12GraphicsCommandList* cl) {
     g_end_pending = false;
     unsigned need = 0;
     for (int k = 0; k < kKinds; ++k)
+        if (g_arr[k].native) g_r.touched &= ~(1u << k);  // (drawn in place: nothing to copy)
+    for (int k = 0; k < kKinds; ++k)
         if (g_r.touched & (1u << k)) need |= plane_bits(k);
     if ((g_r.known & need) != need) {
         fail("a pre-pass target's state not known at the region's end");
@@ -701,6 +732,92 @@ void publish(ID3D12GraphicsCommandList* cl, int k, const D3D12_RESOURCE_STATES s
     d3d::raw_barrier(cl, n, post);
     gpu::mark(cl, gpu::kCopyEnd);
     g_publishes.fetch_add(1, std::memory_order_relaxed);
+}
+// ViSlices: eye 2's region of a view-instanced frame starts: eye 2's slice of each native kind slice 0's region drew,
+// copied into eye 1's (the game's views and this region's draws see slice 0), from the states the game's barriers left
+void handover(ID3D12GraphicsCommandList* cl, unsigned kinds) {
+    D3D12_RESOURCE_BARRIER pre[4 * kKinds], post[4 * kKinds];
+    UINT n = 0;
+    unsigned done = 0;
+    for (int k = 0; k < kKinds; ++k) {
+        const Arr& a = g_arr[k];
+        if (!(kinds & (1u << k)) || !a.native || !a.game) continue;
+        D3D12_RESOURCE_STATES st[2]{};
+        bool ok = true;
+        for (UINT p = 0; p < a.planes && p < 2; ++p) {
+            int v = 0;
+            ok = ok && d3d::doubled_state(a.game, p, &v);
+            st[p] = static_cast<D3D12_RESOURCE_STATES>(v);
+        }
+        if (!ok) {
+            g_handover_unknown.fetch_add(1, std::memory_order_relaxed);
+            log::limited("prepass.handover", 10, "[prepass] %s: its state not known (eye 2's slice not handed over)", kNames[k]);
+            continue;
+        }
+        for (UINT p = 0; p < a.planes && p < 2; ++p) {
+            if (st[p] != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+                pre[n] = transition(a.game, st[p], D3D12_RESOURCE_STATE_COPY_SOURCE);
+                post[n] = transition(a.game, D3D12_RESOURCE_STATE_COPY_SOURCE, st[p]);
+                pre[n].Transition.Subresource = post[n].Transition.Subresource = p * 2 + 1;
+                ++n;
+            }
+            if (st[p] != D3D12_RESOURCE_STATE_COPY_DEST) {
+                pre[n] = transition(a.game, st[p], D3D12_RESOURCE_STATE_COPY_DEST);
+                post[n] = transition(a.game, D3D12_RESOURCE_STATE_COPY_DEST, st[p]);
+                pre[n].Transition.Subresource = post[n].Transition.Subresource = p * 2;
+                ++n;
+            }
+        }
+        done |= 1u << k;
+    }
+    if (!done) return;
+    gpu::mark(cl, gpu::kCopyBegin);
+    if (n) d3d::raw_barrier(cl, n, pre);
+    for (int k = 0; k < kKinds; ++k) {
+        if (!(done & (1u << k))) continue;
+        const Arr& a = g_arr[k];
+        for (UINT p = 0; p < a.planes && p < 2; ++p) {
+            D3D12_TEXTURE_COPY_LOCATION dst{a.game, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            dst.SubresourceIndex = p * 2;
+            D3D12_TEXTURE_COPY_LOCATION src{a.game, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            src.SubresourceIndex = p * 2 + 1;
+            d3d::raw_copy_region(cl, &dst, &src);
+        }
+        g_handover_copies.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (n) d3d::raw_barrier(cl, n, post);
+    gpu::mark(cl, gpu::kCopyEnd);
+    g_handovers.fetch_add(1, std::memory_order_relaxed);
+}
+// ViSlices: a native kind with eye 2's copy (FullScreenCopy), turned from written to read in slice 0's region of a
+// view-instanced frame: its slice 1 into eye 2's copy (before the game's barrier; `st` the state it leaves)
+void snapshot(ID3D12GraphicsCommandList* cl, int k, D3D12_RESOURCE_STATES st) {
+    Arr& a = g_arr[k];
+    if (a.planes != 1 || !a.e2) return;
+    D3D12_RESOURCE_BARRIER pre[2], post[2];
+    UINT n = 0;
+    pre[n] = transition(a.game, st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    post[n] = transition(a.game, D3D12_RESOURCE_STATE_COPY_SOURCE, st);
+    pre[n].Transition.Subresource = post[n].Transition.Subresource = 1;
+    ++n;
+    if (a.e2_state != D3D12_RESOURCE_STATE_COPY_DEST) {
+        pre[n] = transition(a.e2, a.e2_state, D3D12_RESOURCE_STATE_COPY_DEST);
+        post[n++] = transition(a.e2, D3D12_RESOURCE_STATE_COPY_DEST, kReadable);
+    }
+    a.e2_state = kReadable;
+    gpu::mark(cl, gpu::kCopyBegin);
+    d3d::raw_barrier(cl, n, pre);
+    D3D12_TEXTURE_COPY_LOCATION src{a.game, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+    src.SubresourceIndex = 1;
+    D3D12_TEXTURE_COPY_LOCATION dst{a.e2, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+    dst.SubresourceIndex = 0;
+    D3D12_BOX box;
+    const bool boxed = copy_box(k, a.game, &box);
+    d3d::raw_copy_region(cl, &dst, &src, boxed ? &box : nullptr);
+    d3d::raw_barrier(cl, n, post);
+    gpu::mark(cl, gpu::kCopyEnd);
+    g_snapshots.fetch_add(1, std::memory_order_relaxed);
+    g_pub_kind[k][1].fetch_add(1, std::memory_order_relaxed);
 }
 UINT plane_count(ID3D12Resource* r) {
     D3D12_FEATURE_DATA_FORMAT_INFO fi{r->GetDesc().Format, 0};
@@ -1212,6 +1329,8 @@ void install() {
     g_on = arrays;
     g_i2 = arrays && config::get_bool("Stereo", "ViMain", false);
     if (g_i2) log::info("[prepass] [Stereo] ViMain on (test only: the region to the scene's end, the main pass's targets too)");
+    g_slices = g_i2 && config::get_bool("Stereo", "ViSlices", true);
+    if (g_slices) log::info("[prepass] [Stereo] ViSlices on (the render-size targets made with a slice per eye, drawn in place)");
     if (arrays) log::info("[prepass] [Stereo] PrepassArrays on (test only: each eye's pre-pass drawn into 2-slice arrays, copied back at the walk's end)");
     if (views && anchors::present(Id::HandleWorldView) && anchors::present(Id::HandleViewInverse) && anchors::present(Id::HandlePrevViewProj) &&
         anchors::present(Id::HandleViewport) && anchors::present(Id::HandlePrevWorldVP)) {
@@ -1222,6 +1341,7 @@ void install() {
     }
 }
 bool on() { return g_on.load(std::memory_order_relaxed) && !g_failed.load(std::memory_order_relaxed); }
+bool slices_wanted() { return g_slices.load(std::memory_order_relaxed); }
 bool active() { return g_active.load(std::memory_order_relaxed); }
 void set_on(bool want) {
     if (want && !g_hooked.load()) {
@@ -1254,6 +1374,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_dsv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
         return h;
     }
     if (!ensure(kDepth, res, fmt)) return h;
+    const unsigned prev_touched = g_r.touched | g_r.native_touched;
     g_r = Region{};
     if (slice == 0)
         for (int k = 0; k < kKinds; ++k) g_ext_r[k] = g_ext_b[k] = 0;
@@ -1280,13 +1401,14 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_dsv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
         // twin, drawn by this region as the game's, read eye 2's images: the refraction copy, the foliage resolve)
         g_r.dirty = (1u << kKinds) - 1;
         g_r.ds_dirty = 3;
+        handover(cl, prev_touched | (1u << kDepth));
     }
     if (g_last.cl == cl) {  // the targets bound before this clear: bound again, the six as the slices
         D3D12_CPU_DESCRIPTOR_HANDLE r2[8], d2{};
         if (bind(cl, g_last.n, g_last.rts, g_last.single, g_last.has_ds ? &g_last.ds : nullptr, r2, &d2))
             d3d::raw_bind(cl, g_last.n, r2, g_last.single, g_last.has_ds ? &d2 : nullptr);
     }
-    return g_arr[kDepth].view[region_view_index()];
+    return g_arr[kDepth].view[view_index(kDepth)];
 }
 
 void note_bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int single,
@@ -1314,9 +1436,10 @@ D3D12_CPU_DESCRIPTOR_HANDLE clear_rtv(ID3D12GraphicsCommandList* cl, D3D12_CPU_D
     }
     if (k <= kDepth || !ensure(k, res, fmt)) return h;
     g_r.touched |= 1u << k;
+    if (g_arr[k].native) g_r.native_touched |= 1u << k;
     g_r.dirty |= 1u << k;
     set_state(k, -1, D3D12_RESOURCE_STATE_RENDER_TARGET);  // (a clear needs it)
-    return g_arr[k].view[region_view_index()];
+    return g_arr[k].view[view_index(k)];
 }
 
 bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int single,
@@ -1350,8 +1473,9 @@ bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_
         }
         if (!(g_r.known & (1u << (k * 2)))) set_state(k, -1, D3D12_RESOURCE_STATE_RENDER_TARGET);  // (its barrier before the region)
         g_r.touched |= 1u << k;
+        if (g_arr[k].native) g_r.native_touched |= 1u << k;
         g_r.bound |= 1u << k;
-        out_rts[i] = g_arr[k].view[region_view_index()];
+        out_rts[i] = g_arr[k].view[view_index(k)];
         any = true;
     }
     if (ds) {
@@ -1359,7 +1483,7 @@ bool bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_
         ID3D12Resource* res = nullptr;
         DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
         if (kind_of(*ds, &res, &fmt) == kDepth && res == g_arr[kDepth].game) {
-            *out_ds = g_arr[kDepth].view[region_view_index()];
+            *out_ds = g_arr[kDepth].view[view_index(kDepth)];
             g_r.bound |= 1u << kDepth;
             any = true;
         } else {
@@ -1417,6 +1541,12 @@ void barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BAR
         if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) continue;
         const int k = kind_of_resource(b[i].Transition.pResource);
         if (k < 0) continue;
+        if (g_arr[k].native) {
+            if (g_arr[k].e2 && g_r.vi && g_r.slice == 0 && writing(k, b[i].Transition.StateBefore) && !writing(k, b[i].Transition.StateAfter) &&
+                b[i].Transition.StateAfter != D3D12_RESOURCE_STATE_COPY_DEST)
+                snapshot(cl, k, b[i].Transition.StateBefore);
+            continue;
+        }
         const UINT sub = b[i].Transition.Subresource;
         const int plane = sub == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES ? -1 : static_cast<int>(sub);
         if ((plane >= 0 && plane >= static_cast<int>(g_arr[k].planes)) || b[i].Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE) {
@@ -1488,10 +1618,21 @@ bool copy_resource(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, ID3D12Res
     if (!g_i2.load(std::memory_order_relaxed) || !g_active.load(std::memory_order_relaxed) || cl != g_r.cl || !dst ||
         src != g_arr[kDepth].game || !g_arr[kDepth].arr)
         return false;
+    const Arr& a = g_arr[kDepth];
+    if (a.native) {  // ViSlices: the game's own copy, both slices when the destination has two (view 1 reads its slice 1)
+        if (g_dr.game != dst || !g_dr.native) {
+            if (g_dr.e2) g_retired.push_back({g_dr.e2, state::presents.load()});
+            g_dr = DepthResolve{};
+            g_dr.game = dst;
+            g_dr.native = true;
+            if (d3d::is_doubled(dst)) vi::eye2_texture(kDepthSlot, dst, dst);
+            else log::warn("[prepass] Depth Resolve has one slice: view 1 reads eye 1's scene depth through slot %d", kDepthSlot);
+        }
+        return false;
+    }
     // the depth the region drew is in its array: the region's slice (and in a view-instanced slice-0 region slice 1 into
     // eye 2's copy of the destination, read by view 1 through slot 15)
-    const Arr& a = g_arr[kDepth];
-    if (g_dr.game != dst) {
+    if (g_dr.game != dst || g_dr.native) {
         if (g_dr.e2) g_retired.push_back({g_dr.e2, state::presents.load()});
         g_dr = DepthResolve{};
         g_dr.game = dst;
@@ -1802,7 +1943,18 @@ std::string status() {
                   static_cast<unsigned long long>(g_marker_ends.load()), static_cast<unsigned long long>(g_copies.load()),
                   static_cast<unsigned long long>(g_redirects.load()), static_cast<unsigned long long>(g_skipped.load()),
                   g_failed.load() ? ": " : "", g_failed.load() ? g_fail_reason : "");
-    return b;
+    std::string out = b;
+    if (g_slices.load()) {
+        int native = 0;
+        for (const Arr& a : g_arr) native += a.native ? 1 : 0;
+        char c[240];
+        std::snprintf(c, sizeof(c), " | slices: %d kinds native, handovers %llu (%llu copies, %llu states not known), snapshots %llu | ", native,
+                      static_cast<unsigned long long>(g_handovers.load()), static_cast<unsigned long long>(g_handover_copies.load()),
+                      static_cast<unsigned long long>(g_handover_unknown.load()), static_cast<unsigned long long>(g_snapshots.load()));
+        out += c;
+        out += d3d::doubled_status();
+    }
+    return out;
 }
 
 }  // namespace rdrvr::prepass

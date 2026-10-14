@@ -467,6 +467,133 @@ void watch_list_ends(ID3D12GraphicsCommandList* cl) {
         if (x.cl == cl) x.valid = false;
 }
 
+// ---- [Stereo] ViSlices: the game's render-size targets made with two array slices (set_stereo_targets). The game's
+// views (2D, no array) see slice 0; its barriers and copies naming a subresource (a plane: one mip, one slice) are
+// rewritten for the slices: subresource p is p * 2 (slice 0) and p * 2 + 1 (slice 1).
+thread_local uint32_t t_double_w = 0, t_double_h = 0;
+struct Doubled {
+    std::atomic<const void*> res{nullptr};
+    UINT planes = 1;
+    std::atomic<uint32_t> st[2]{};  // each plane's state, as the game's barriers left it (both slices)
+};
+constexpr int kMaxDoubled = 32;
+Doubled g_doubled[kMaxDoubled];
+std::atomic<int> g_doubled_n{0};
+std::mutex g_doubled_mutex;
+std::atomic<uint64_t> g_doubled_made{0}, g_doubled_failed{0}, g_doubled_barriers{0}, g_doubled_copies{0}, g_doubled_gone{0};
+Doubled* doubled(const void* r) {
+    if (!r) return nullptr;
+    const int n = g_doubled_n.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i)
+        if (g_doubled[i].res.load(std::memory_order_relaxed) == r) return &g_doubled[i];
+    return nullptr;
+}
+// A 2-slice target's entry dropped when the runtime destroys it: a sentinel in its private data, released with it (the
+// game makes the targets again several times while loading: 2026-10-14, the entries of the destroyed ones filled the list)
+void forget_doubled(const void* r) {
+    if (!r) return;
+    std::lock_guard lock(g_doubled_mutex);
+    for (int i = 0, n = g_doubled_n.load(std::memory_order_relaxed); i < n; ++i)
+        if (g_doubled[i].res.load(std::memory_order_relaxed) == r) {
+            g_doubled[i].res.store(nullptr, std::memory_order_relaxed);
+            g_doubled_gone.fetch_add(1, std::memory_order_relaxed);
+        }
+}
+constexpr GUID kGoneGuid = {0x6c1f4a52, 0x8d0b, 0x4c4e, {0x9a, 0x3e, 0x52, 0x44, 0x52, 0x56, 0x52, 0x32}};
+struct Gone final : IUnknown {
+    std::atomic<ULONG> refs{1};
+    const void* res = nullptr;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        if (riid == __uuidof(IUnknown)) {
+            *out = static_cast<IUnknown*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG n = --refs;
+        if (!n) {
+            forget_doubled(res);
+            delete this;
+        }
+        return n;
+    }
+};
+// A resource made (any): a doubled one that had its address is gone; a doubled one is recorded
+void note_made(ID3D12Device* dev, const void* r, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st, bool is_doubled) {
+    if (!r || (!is_doubled && g_doubled_n.load(std::memory_order_relaxed) == 0)) return;
+    std::lock_guard lock(g_doubled_mutex);
+    const int n = g_doubled_n.load(std::memory_order_relaxed);
+    for (int i = 0; i < n; ++i)
+        if (g_doubled[i].res.load(std::memory_order_relaxed) == r) {
+            g_doubled[i].res.store(nullptr, std::memory_order_relaxed);
+            g_doubled_gone.fetch_add(1, std::memory_order_relaxed);
+            char desc[160];
+            describe_desc(d, desc, sizeof(desc));
+            log::limited("slices.gone", 40, "[slices] %p made again at a 2-slice target's address (%s, thread %lu): that one is gone", r, desc,
+                         GetCurrentThreadId());
+        }
+    if (!is_doubled) return;
+    int slot = -1;
+    for (int i = 0; i < n && slot < 0; ++i)
+        if (!g_doubled[i].res.load(std::memory_order_relaxed)) slot = i;
+    if (slot < 0) {
+        if (n >= kMaxDoubled) return;  // (not possible: make_doubled checks)
+        slot = n;
+    }
+    Doubled& x = g_doubled[slot];
+    D3D12_FEATURE_DATA_FORMAT_INFO fi{d->Format, 0};
+    x.planes = SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &fi, sizeof(fi))) && fi.PlaneCount ? std::min<UINT>(fi.PlaneCount, 2) : 1;
+    x.st[0].store(static_cast<uint32_t>(st), std::memory_order_relaxed);
+    x.st[1].store(static_cast<uint32_t>(st), std::memory_order_relaxed);
+    x.res.store(r, std::memory_order_relaxed);
+    if (slot == n) g_doubled_n.store(n + 1, std::memory_order_release);
+    Gone* g = new Gone;
+    g->res = r;
+    if (FAILED(static_cast<ID3D12Resource*>(const_cast<void*>(r))->SetPrivateDataInterface(kGoneGuid, g)))  // (else its reference now)
+        g->res = nullptr;  // (not forgotten at its end then: no lock taken here, under g_doubled_mutex)
+    g->Release();
+}
+// The game also makes these targets again from their own desc (GetDesc: two slices) outside eye_shape's calls (2026-10-14:
+// the scene depth again at the render size, on the render thread; all of them at the game's own size when the eye shape
+// went): such a desc on the thread that made them is a 2-slice target again at the render size, else one slice again.
+std::atomic<uint32_t> g_double_tid{0}, g_double_w{0}, g_double_h{0};  // the last set_stereo_targets' (w, h not 0)
+std::atomic<uint64_t> g_inherited{0}, g_unsliced{0};
+enum Make { kPlain, kDouble, kSingle };
+Make want_double(const D3D12_RESOURCE_DESC* d, REFIID riid) {
+    if (!d || riid != __uuidof(ID3D12Resource) || d->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d->MipLevels != 1 ||
+        d->SampleDesc.Count != 1 || !(d->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) ||
+        (d->DepthOrArraySize != 1 && d->DepthOrArraySize != 2))
+        return kPlain;
+    const bool in_window = t_double_w != 0;
+    if (!in_window && (d->DepthOrArraySize != 2 || !g_double_w.load(std::memory_order_relaxed) ||
+                       GetCurrentThreadId() != g_double_tid.load(std::memory_order_relaxed)))
+        return kPlain;
+    const uint32_t w = in_window ? t_double_w : g_double_w.load(std::memory_order_relaxed);
+    const uint32_t h = in_window ? t_double_h : g_double_h.load(std::memory_order_relaxed);
+    if (d->Width == w && d->Height == h) {
+        if (g_doubled_n.load(std::memory_order_relaxed) >= kMaxDoubled) return d->DepthOrArraySize == 2 ? kSingle : kPlain;
+        if (!in_window) g_inherited.fetch_add(1, std::memory_order_relaxed);
+        return kDouble;
+    }
+    if (d->DepthOrArraySize == 2) {
+        g_unsliced.fetch_add(1, std::memory_order_relaxed);
+        return kSingle;
+    }
+    return kPlain;
+}
+// The game's target made as a committed 2-slice texture (the placed ones too: their heap's place left unused)
+HRESULT make_doubled(ID3D12Device* dev, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st,
+                     const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out);
+std::vector<D3D12_RESOURCE_BARRIER>& barrier_scratch() {
+    thread_local std::vector<D3D12_RESOURCE_BARRIER> v;
+    return v;
+}
+
 void STDMETHODCALLTYPE hk_ResourceBarrier(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_RESOURCE_BARRIER* b) {
     hookprof::Scope hp_(hookprof::kBarrier);
     replay_ops::note(replay_ops::kBarrier);
@@ -474,6 +601,37 @@ void STDMETHODCALLTYPE hk_ResourceBarrier(ID3D12GraphicsCommandList* cl, UINT n,
     if (prepass::active()) prepass::barrier(cl, n, b);  // (before the game's batch: the pre-pass copies)
     fg_count(cl, [n](ListLog& l) { l.barriers += n; });
     watch_barriers(cl, n, b);
+    if (g_doubled_n.load(std::memory_order_relaxed) && b) {
+        bool any = false;
+        for (UINT i = 0; i < n; ++i) {
+            if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) continue;
+            Doubled* x = doubled(b[i].Transition.pResource);
+            if (!x) continue;
+            const UINT sub = b[i].Transition.Subresource;
+            if (b[i].Flags != D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)
+                for (UINT p = 0; p < 2; ++p)
+                    if (sub == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES || sub == p)
+                        x->st[p].store(static_cast<uint32_t>(b[i].Transition.StateAfter), std::memory_order_relaxed);
+            if (sub != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) any = true;
+        }
+        if (any) {  // the game's subresources: both slices' each
+            auto& v = barrier_scratch();
+            v.clear();
+            for (UINT i = 0; i < n; ++i) {
+                v.push_back(b[i]);
+                if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || b[i].Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES ||
+                    !doubled(b[i].Transition.pResource))
+                    continue;
+                const UINT sub = b[i].Transition.Subresource;
+                v.back().Transition.Subresource = sub * 2;
+                v.push_back(b[i]);
+                v.back().Transition.Subresource = sub * 2 + 1;
+            }
+            g_doubled_barriers.fetch_add(1, std::memory_order_relaxed);
+            HP_ORIG(hp_, o_ResourceBarrier(cl, static_cast<UINT>(v.size()), v.data()));
+            return;
+        }
+    }
     HP_ORIG(hp_, o_ResourceBarrier(cl, n, b));
 }
 HRESULT STDMETHODCALLTYPE hk_Close(ID3D12GraphicsCommandList* cl) {
@@ -524,7 +682,21 @@ void STDMETHODCALLTYPE hk_CopyResource(ID3D12GraphicsCommandList* cl, ID3D12Reso
     }
     if (prepass::active()) prepass::flush_reads(cl);
     if (prepass::copy_resource(cl, dst, src)) return;  // [Stereo] ViMain: the depth from the region's arrays
-    HP_ORIG(hp_, o_CopyResource(cl, dst, src));
+    Doubled* xd = g_doubled_n.load(std::memory_order_relaxed) ? doubled(dst) : nullptr;
+    Doubled* xs = g_doubled_n.load(std::memory_order_relaxed) ? doubled(src) : nullptr;
+    if ((xd != nullptr) != (xs != nullptr)) {  // [Stereo] ViSlices: one side 2-slice: slice 0 and the other's one
+        const UINT planes = (xd ? xd : xs)->planes;
+        for (UINT p = 0; p < planes; ++p) {
+            D3D12_TEXTURE_COPY_LOCATION d{dst, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            d.SubresourceIndex = xd ? p * 2 : p;
+            D3D12_TEXTURE_COPY_LOCATION s{src, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            s.SubresourceIndex = xs ? p * 2 : p;
+            o_CopyTextureRegion(cl, &d, 0, 0, 0, &s, nullptr);
+        }
+        g_doubled_copies.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        HP_ORIG(hp_, o_CopyResource(cl, dst, src));
+    }
     for (auto& t : g_copy_tap)
         if (CopyTapFn tap = t.load(std::memory_order_relaxed)) tap(cl, dst, src);
 }
@@ -543,6 +715,23 @@ void STDMETHODCALLTYPE hk_CopyTextureRegion(ID3D12GraphicsCommandList* cl, const
         fg_event(cl, "CopyTextureRegion %s <- %s", d.c_str(), s.c_str());
     }
     if (prepass::active()) prepass::flush_reads(cl);
+    if (g_doubled_n.load(std::memory_order_relaxed) && dst && src) {  // [Stereo] ViSlices: a plane of a 2-slice target
+        Doubled* xd = dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ? doubled(dst->pResource) : nullptr;
+        Doubled* xs = src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ? doubled(src->pResource) : nullptr;
+        if (xd || xs) {
+            D3D12_TEXTURE_COPY_LOCATION d = *dst, s = *src;
+            if (xd) d.SubresourceIndex *= 2;
+            if (xs) s.SubresourceIndex *= 2;
+            o_CopyTextureRegion(cl, &d, x, y, z, &s, box);
+            if (xd && xs) {  // (both: slice 1 too)
+                ++d.SubresourceIndex;
+                ++s.SubresourceIndex;
+                o_CopyTextureRegion(cl, &d, x, y, z, &s, box);
+            }
+            g_doubled_copies.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
     HP_ORIG(hp_, o_CopyTextureRegion(cl, dst, x, y, z, src, box));
 }
 void STDMETHODCALLTYPE hk_ClearRTV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE h, const FLOAT c[4], UINT n,
@@ -660,8 +849,21 @@ void fg_on_frame_end(uint64_t frame) {
 HRESULT STDMETHODCALLTYPE hk_CreateCommittedResource(ID3D12Device* dev, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf,
                                                      const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st,
                                                      const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
-    HRESULT hr = o_CreateCommittedResource(dev, hp, hf, d, st, cv, riid, out);
-    if (SUCCEEDED(hr) && out && *out && riid == __uuidof(ID3D12Resource)) vi::forget_resource(static_cast<ID3D12Resource*>(*out));
+    HRESULT hr = E_FAIL;
+    bool two = false;
+    const Make mk = hp && hp->Type == D3D12_HEAP_TYPE_DEFAULT ? want_double(d, riid) : kPlain;
+    if (mk == kDouble) two = SUCCEEDED(hr = make_doubled(dev, hf, d, st, cv, riid, out));
+    D3D12_RESOURCE_DESC one;
+    if (mk == kSingle) {  // (a desc taken from a 2-slice target: the game's single one)
+        one = *d;
+        one.DepthOrArraySize = 1;
+        d = &one;
+    }
+    if (!two) hr = o_CreateCommittedResource(dev, hp, hf, d, st, cv, riid, out);
+    if (SUCCEEDED(hr) && out && *out && riid == __uuidof(ID3D12Resource)) {
+        vi::forget_resource(static_cast<ID3D12Resource*>(*out));
+        note_made(dev, *out, d, st, two);
+    }
     if (SUCCEEDED(hr) && out && *out && hp && hp->Type == D3D12_HEAP_TYPE_UPLOAD && ring_probe::enabled()) {
         ID3D12Resource* r = nullptr;
         if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&r))) && r) {
@@ -679,8 +881,21 @@ HRESULT STDMETHODCALLTYPE hk_CreateCommittedResource(ID3D12Device* dev, const D3
 
 HRESULT STDMETHODCALLTYPE hk_CreatePlacedResource(ID3D12Device* dev, ID3D12Heap* heap, UINT64 off, const D3D12_RESOURCE_DESC* d,
                                                   D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
-    HRESULT hr = o_CreatePlacedResource(dev, heap, off, d, st, cv, riid, out);
-    if (SUCCEEDED(hr) && out && *out && riid == __uuidof(ID3D12Resource)) vi::forget_resource(static_cast<ID3D12Resource*>(*out));
+    HRESULT hr = E_FAIL;
+    bool two = false;
+    const Make mk = want_double(d, riid);
+    if (mk == kDouble) two = SUCCEEDED(hr = make_doubled(dev, D3D12_HEAP_FLAG_NONE, d, st, cv, riid, out));
+    D3D12_RESOURCE_DESC one;
+    if (mk == kSingle) {
+        one = *d;
+        one.DepthOrArraySize = 1;
+        d = &one;
+    }
+    if (!two) hr = o_CreatePlacedResource(dev, heap, off, d, st, cv, riid, out);
+    if (SUCCEEDED(hr) && out && *out && riid == __uuidof(ID3D12Resource)) {
+        vi::forget_resource(static_cast<ID3D12Resource*>(*out));
+        note_made(dev, *out, d, st, two);
+    }
     if (SUCCEEDED(hr) && out && *out && heap && ring_probe::enabled() && heap->GetDesc().Properties.Type == D3D12_HEAP_TYPE_UPLOAD) {
         ID3D12Resource* r = nullptr;
         if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&r))) && r) {
@@ -693,6 +908,25 @@ HRESULT STDMETHODCALLTYPE hk_CreatePlacedResource(ID3D12Device* dev, ID3D12Heap*
         describe_desc(d, desc, sizeof(desc));
         log::limited("d3d.placed.rt", 400, "[res] placed %p heap %p+%#llx %s", out ? *out : nullptr, static_cast<void*>(heap),
                      static_cast<unsigned long long>(off), desc);
+    }
+    return hr;
+}
+
+HRESULT make_doubled(ID3D12Device* dev, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st,
+                     const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
+    D3D12_RESOURCE_DESC dd = *d;
+    dd.DepthOrArraySize = 2;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    hf &= D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;  // (a heap's flags for a placed one's heap: not a committed one's)
+    const HRESULT hr = o_CreateCommittedResource(dev, &hp, hf, &dd, st, cv, riid, out);
+    char desc[160];
+    describe_desc(d, desc, sizeof(desc));
+    if (FAILED(hr)) {
+        g_doubled_failed.fetch_add(1, std::memory_order_relaxed);
+        log::warn("[slices] a 2-slice target not made (%#lx): %s (the game's own)", static_cast<unsigned long>(hr), desc);
+    } else {
+        g_doubled_made.fetch_add(1, std::memory_order_relaxed);
+        log::info("[slices] %p made with two slices: %s", out ? *out : nullptr, desc);
     }
     return hr;
 }
@@ -1444,6 +1678,35 @@ int rtv_handles_of(const void* res, uint64_t* out, int max) {
 }
 
 void set_rtv_substitute(RtvSubstFn fn) { g_rtv_subst = fn; }
+
+void set_stereo_targets(uint32_t w, uint32_t h) {
+    t_double_w = w;
+    t_double_h = h;
+    if (w && h) {
+        g_double_w = w;
+        g_double_h = h;
+        g_double_tid = GetCurrentThreadId();
+    }
+}
+bool is_doubled(const void* res) { return g_doubled_n.load(std::memory_order_relaxed) && doubled(res); }
+bool doubled_state(const void* res, unsigned plane, int* out) {
+    Doubled* x = g_doubled_n.load(std::memory_order_relaxed) ? doubled(res) : nullptr;
+    if (!x || plane > 1) return false;
+    *out = static_cast<int>(x->st[plane < x->planes ? plane : 0].load(std::memory_order_relaxed));
+    return true;
+}
+std::string doubled_status() {
+    int live = 0;
+    for (int i = 0, n = g_doubled_n.load(); i < n; ++i)
+        if (g_doubled[i].res.load()) ++live;
+    char b[300];
+    std::snprintf(b, sizeof(b), "2-slice targets %d (made %llu, %llu of them from a 2-slice desc, %llu made single again; failed %llu, gone %llu; barriers rewritten %llu, copies %llu)", live,
+                  static_cast<unsigned long long>(g_doubled_made.load()), static_cast<unsigned long long>(g_inherited.load()),
+                  static_cast<unsigned long long>(g_unsliced.load()), static_cast<unsigned long long>(g_doubled_failed.load()),
+                  static_cast<unsigned long long>(g_doubled_gone.load()), static_cast<unsigned long long>(g_doubled_barriers.load()),
+                  static_cast<unsigned long long>(g_doubled_copies.load()));
+    return b;
+}
 
 void set_present_unsynced(bool on) {
     if (g_present_unsynced.exchange(on) != on)

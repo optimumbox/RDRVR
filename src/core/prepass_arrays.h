@@ -51,6 +51,10 @@ int last_slice();
 bool vi_frame_now();  // the playback thread: this frame's slice-0 region drew both eyes
 // [Stereo] ViMain: the render thread, after each SceneRender of a double frame: the region's end marker
 void scene_end();
+// [Stereo] ViMain with [Stereo] ViSlices (on by default): the game's render-size targets made with a slice per eye
+// (d3d::set_stereo_targets), drawn by the regions in place: no copies out but eye 2's slice into eye 1's at eye 2's
+// region's start
+bool slices_wanted();
 // [Stereo] ViMain: the game's CopyResource in a region (the depth into "Depth Resolve"): true when made from the arrays
 bool copy_resource(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, ID3D12Resource* src);
 // [Stereo] PrepassViews (milestone 3, test only; stageVI-prepass.md): eye 2's per-view constants for pass 1.

@@ -20,6 +20,7 @@
 #include "core/dlss.h"
 #include "core/hooks.h"
 #include "core/log.h"
+#include "core/prepass_arrays.h"
 #include "core/render_settings.h"
 #include "core/state.h"
 #include "core/xr.h"
@@ -324,6 +325,10 @@ bool shape(char* r, int W, int H) {
     // the calls, in FUN_1405c26a0's order (its render size first)
     *reinterpret_cast<int*>(r + 0x554) = rw;
     *reinterpret_cast<int*>(r + 0x558) = rh;
+    // [Stereo] ViSlices: the render-size targets made in these calls get a slice per eye (d3d_hooks.h); the eye-size
+    // DLSS output below is not of that size
+    const bool slices = prepass::slices_wanted();
+    if (slices) d3d::set_stereo_targets(static_cast<uint32_t>(rw), static_cast<uint32_t>(rh));
     if (light_on) rt_call(light_rt, rw, rh, W, H);
     rt_call(depth_resolve, rw, rh, W, H);
     rt_call(r548, rw, rh, W, H);
@@ -332,6 +337,7 @@ bool shape(char* r, int W, int H) {
     rt_call(sc[1], rw, rh, W, H);
     if (grass) reinterpret_cast<GrassSize_t>(anchors::addr(Id::GrassSetSize))(grass, rw, rh, W, H);
     if (extra) rt_call(extra, rw, rh, W, H);
+    if (slices) d3d::set_stereo_targets(0, 0);
     if (up) {  // after PostFxSetSizes (which set it W x H); the game's own resize sets it back (o_DrsSub at the unapply)
         rt_call(up, static_cast<int>(ew), static_cast<int>(eh), W, H);
         uint32_t uw = 0, uh = 0, tw = 0, th = 0;

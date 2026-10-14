@@ -22,6 +22,7 @@
 
 #include "core/anchors.h"
 #include "core/config.h"
+#include "core/d3d_hooks.h"
 #include "core/hooks.h"
 #include "core/log.h"
 #include "core/replay_ops.h"
@@ -82,6 +83,14 @@ char g_why[300] = "no table seen yet";
 int g_logged_bases = 0;
 
 void STDMETHODCALLTYPE hk_CreateSrv(ID3D12Device* dev, ID3D12Resource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC plain{};
+    if (r && !d && d3d::is_doubled(r)) {  // ([Stereo] ViSlices: the game's default view of its 2-slice target, slice 0 as a 2D one)
+        plain.Format = r->GetDesc().Format;
+        plain.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        plain.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        plain.Texture2D.MipLevels = 1;
+        d = &plain;
+    }
     o_CreateSrv(dev, r, d, h);
     if (r && d) {
         std::lock_guard lock(g_mutex);
@@ -203,6 +212,11 @@ void write_pending(ID3D12DescriptorHeap* heap) {  // under g_mutex
             d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             d.Texture2D.MipLevels = 1;
+        }
+        if (d3d::is_doubled(p.e2) && d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {  // ([Stereo] ViSlices: eye 2's slice)
+            const D3D12_TEX2D_SRV t = d.Texture2D;
+            d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            d.Texture2DArray = {t.MostDetailedMip, t.MipLevels, 1, 1, t.PlaneSlice, t.ResourceMinLODClamp};
         }
         const D3D12_CPU_DESCRIPTOR_HANDLE c{h.cpu + static_cast<SIZE_T>(index) * h.inc};
         if (o_CreateSrv) o_CreateSrv(dev, p.e2, &d, c);
