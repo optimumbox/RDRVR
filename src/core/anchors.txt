@@ -228,6 +228,7 @@ MeleeTrackStart          func   0xd54900   # MeleeAnimationTrack's start (self):
 RecorderDraw             func   0xecd690   # (recorder, topology, index count): records draw packet 0x2c, replayed by RenderThread as DrawIndexedInstanced(count, 1, 0, 0, 0); the recorder's vtable +0x190 (research\run3\deferred_draw.md)
 RecorderDrawAt           func   0xecd4f0   # (recorder, topology, start, count, base vertex): records packet 0x2b, replayed as DrawIndexedInstanced(count, 1, start, base, 0); vtable +0x188
 RecorderVtbl             global 0x105abb8  # the draw recorder's vtable (FUN_140eca8e0's): TLS +0x30 on the recording threads (the game's own D3D thread mode)
+SceneDrawWalk            func   0x706050   # a vtable method (.rdata 0x1cee0d0) under FUN_1405cbfd0 in SceneRender: the scene's draw-list walk, ~55% of a pass's render-thread time; void (recorder_skip.cpp ViSkipWalk cuts it in the skipped second scene)
 DrawModelGeometry        func   0x167720   # (shader, model, geometry index, matrix set, ?, byte): one geometry's passes (FUN_1401672d0 begin, the geometry's vtable +8 draw, FUN_1400bfa10 end); FUN_14087f2a0 calls it per geometry of a drawable's model
 MuzzleFxMatrix           func   0x301680   # (W, &matrix ptr, &local): the muzzle flash's followed matrix (FUN_1406b6280 keeps the pointer at fx +0x170): the prop's muzzle bone, else W +0x80 (run 4 item 3: the copy's flash)
 # --- run 7 item 4: eyes in the headset's own shape (research\run7\eye-shape.md 7; Ghidra 2026-10-08, every func a .pdata entry)

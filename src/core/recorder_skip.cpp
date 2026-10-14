@@ -9,6 +9,7 @@
 #include "core/anchors.h"
 #include "core/camera_lever.h"
 #include "core/config.h"
+#include "core/hooks.h"
 #include "core/log.h"
 
 namespace rdrvr::recorder_skip {
@@ -35,11 +36,30 @@ Block* g_b = nullptr;
 bool g_installed = false;
 std::atomic<uint64_t> g_scenes{0};
 
+// The cuts ("vi pass2 cut <rva> on|off", [Stereo] ViSkipWalk): a game function that returns at once (a void one: its
+// caller reads nothing back) while the second scene runs with the switch on, on the render thread; each through a
+// thunk like the recorder's, so the arguments reach the original untouched otherwise.
+//   thunk: mov eax, gs:[48h]; cmp eax, [tid]; jne orig; cmp byte [on], 0; je orig; cmp byte [cut], 0; je orig;
+//          lock inc qword [n]; ret; orig: jmp [original]
+struct Cut {
+    uintptr_t rva;
+    volatile uint8_t enabled;
+    uint8_t pad[7];
+    volatile uint64_t n;
+    void* orig;
+    uint8_t code[64];
+};
+constexpr int kMaxCuts = 8;
+Cut* g_cuts = nullptr;  // (in the block's page: executable)
+int g_ncuts = 0;
+
 int32_t rel(const uint8_t* next, const volatile void* target) {
     return static_cast<int32_t>(reinterpret_cast<intptr_t>(target) - reinterpret_cast<intptr_t>(next));
 }
 
 }  // namespace
+
+std::string cut(uintptr_t rva, bool on);
 
 void install() {
     if (g_installed || !config::get_bool("Stereo", "ViMain", false) || !config::get_bool("Stereo", "ViSkipRecord", false) ||
@@ -86,9 +106,79 @@ void install() {
     g_installed = true;
     camera_lever::set_vi_skip2(true);  // (on from the start: "vi pass2 draw" records the second scene whole again)
     log::info("[recskip] %zu recorder methods through the second-scene switch (on; vi pass2 draw|skip)", kN);
+    // [Stereo] ViSkipWalk (default on): the skipped scene's draw-list walk (SceneDrawWalk) returns at once. It recorded
+    // nothing under the skip; its walk was ~55% of the second scene's render-thread time (2026-10-14, headset on the desk:
+    // pass 2 1.61 -> 0.78 ms, both eyes' images unchanged). (Its caller FUN_1405cbfd0 cut instead lost eye 2's image.)
+    if (config::get_bool("Stereo", "ViSkipWalk", true) && anchors::present(anchors::Id::SceneDrawWalk)) {
+        const uintptr_t rva = anchors::addr(anchors::Id::SceneDrawWalk) - reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        log::info("[recskip] [Stereo] ViSkipWalk: %s", cut(rva, true).c_str());
+    }
 }
 
 bool installed() { return g_installed; }
+
+std::string cut(uintptr_t rva, bool on) {
+    if (!g_installed) return "ERROR the recorder skip is not installed";
+    for (int i = 0; i < g_ncuts; ++i)
+        if (g_cuts[i].rva == rva) {
+            g_cuts[i].enabled = on ? 1 : 0;
+            return std::string("cut +") + std::to_string(rva) + (on ? " on" : " off") + " (decimal rva)";
+        }
+    if (!on) return "not cut";
+    if (!g_cuts) {
+        g_cuts = static_cast<Cut*>(VirtualAlloc(nullptr, sizeof(Cut) * kMaxCuts, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+        if (!g_cuts) return "ERROR no memory";
+        std::memset(g_cuts, 0, sizeof(Cut) * kMaxCuts);
+    }
+    if (g_ncuts >= kMaxCuts) return "ERROR too many cuts";
+    Cut& c = g_cuts[g_ncuts];
+    c.rva = rva;
+    c.enabled = 1;
+    uint8_t* p = c.code;
+    const uint8_t gs_tid[] = {0x65, 0x8b, 0x04, 0x25, 0x48, 0x00, 0x00, 0x00};  // mov eax, gs:[48h]
+    std::memcpy(p, gs_tid, sizeof(gs_tid));
+    p += sizeof(gs_tid);
+    *p++ = 0x3b, *p++ = 0x05;  // cmp eax, [rip+tid]
+    int32_t r = rel(p + 4, &g_b->tid);
+    std::memcpy(p, &r, 4);
+    p += 4;
+    uint8_t* j1 = p;
+    *p++ = 0x75, *p++ = 0;     // jne orig
+    *p++ = 0x80, *p++ = 0x3d;  // cmp byte [rip+on], 0
+    r = rel(p + 5, &g_b->on);
+    std::memcpy(p, &r, 4);
+    p += 4;
+    *p++ = 0x00;
+    uint8_t* j2 = p;
+    *p++ = 0x74, *p++ = 0;     // je orig
+    *p++ = 0x80, *p++ = 0x3d;  // cmp byte [rip+enabled], 0
+    r = rel(p + 5, &c.enabled);
+    std::memcpy(p, &r, 4);
+    p += 4;
+    *p++ = 0x00;
+    uint8_t* j3 = p;
+    *p++ = 0x74, *p++ = 0;                // je orig
+    *p++ = 0xf0, *p++ = 0x48, *p++ = 0xff, *p++ = 0x05;  // lock inc qword [rip+n]
+    r = rel(p + 4, &c.n);
+    std::memcpy(p, &r, 4);
+    p += 4;
+    *p++ = 0xc3;  // ret
+    uint8_t* orig = p;
+    *p++ = 0xff, *p++ = 0x25;  // orig: jmp [rip+orig]
+    r = rel(p + 4, &c.orig);
+    std::memcpy(p, &r, 4);
+    p += 4;
+    j1[1] = static_cast<uint8_t>(orig - (j1 + 2));
+    j2[1] = static_cast<uint8_t>(orig - (j2 + 2));
+    j3[1] = static_cast<uint8_t>(orig - (j3 + 2));
+    FlushInstructionCache(GetCurrentProcess(), &c, sizeof(Cut));
+    void* target = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + rva);
+    char name[64];
+    std::snprintf(name, sizeof(name), "RDR second-scene cut +%#llx", static_cast<unsigned long long>(rva));
+    if (!hooks::install(name, target, c.code, &c.orig)) return "ERROR the hook failed";
+    ++g_ncuts;
+    return std::string("cut ") + name + " on";
+}
 
 void begin() {
     if (!g_installed) return;
@@ -106,7 +196,13 @@ std::string status() {
     char b[160];
     std::snprintf(b, sizeof(b), "recorder skip %s: %llu second scenes recorded without draws", g_installed ? "installed" : "not installed",
                   static_cast<unsigned long long>(g_scenes.load()));
-    return b;
+    std::string o = b;
+    for (int i = 0; i < g_ncuts; ++i) {
+        std::snprintf(b, sizeof(b), " | cut +%#llx %s, %llu returns", static_cast<unsigned long long>(g_cuts[i].rva),
+                      g_cuts[i].enabled ? "on" : "off", static_cast<unsigned long long>(g_cuts[i].n));
+        o += b;
+    }
+    return o;
 }
 
 }  // namespace rdrvr::recorder_skip

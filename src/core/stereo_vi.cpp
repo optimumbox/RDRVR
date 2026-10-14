@@ -677,6 +677,8 @@ std::string command(const std::vector<std::string>& t) {
         }
         return o;
     }
+    if (sub == "pass2" && t.size() >= 5 && t[2] == "cut")  // vi pass2 cut <rva hex> on|off (recorder_skip.h)
+        return recorder_skip::cut(static_cast<uintptr_t>(std::strtoull(t[3].c_str(), nullptr, 16)), t[4] == "on");
     if (sub == "pass2" && t.size() >= 3) {  // vi pass2 skip|draw: a view-instanced frame's second scene not walked / walked
         camera_lever::set_vi_skip2(t[2] == "skip");
         return std::string("second scenes of view-instanced frames: ") + (t[2] == "skip" ? "recorded without draws" : "recorded whole") +

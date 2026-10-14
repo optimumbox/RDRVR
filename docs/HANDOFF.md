@@ -88,6 +88,21 @@ motion vectors) are still recorded; that is ~2.85 ms render + ~2.5 ms playback.
 - Still without a twin: PSMiragerSingle (heat haze; has rage_matrices, could take a SCREEN_INDEX_FIELDS field), PS_Blit
   (unused by eye 2).
 
+- 2026-10-14 03:40, the user's "1, 2 and 3" (headset on the desk, DLSS Quality, the town edge):
+  1. The mod's hooks (`hookprof`): ~0.7 ms of CPU a frame across threads once the profiler's own ~40 ns a call is taken
+     off (descriptor tables 24k calls a frame, draws 8k). The playback thread's "busy" includes its xrWaitFrame and
+     xrEndFrame waits (3.5-4.4 ms of ~8): its own work is ~4.5 ms.
+  2. Eye 2's skipped scene still walked its draw lists: `[Stereo] ViSkipWalk` (default on, with ViSkipRecord) returns
+     from SceneDrawWalk (RDR.exe+0x706050, a vtable method; new anchor) in it (recorder_skip.cpp cuts; test:
+     `vi pass2 cut <rva hex> on|off`). Same spot, three rounds: pass 2 1.00 -> 0.46 ms, render busy 4.09 -> 3.54,
+     playback 5.24 -> 4.75; a heavier view 1.61 -> 0.78. Both eyes' images unchanged (`research\grabr28`,
+     base_cut_LR.png); walking, grass and bushes in both eyes (vr30). Cutting its caller FUN_1405cbfd0 instead gave eye 2
+     eye 1's image: not that one. prepass's motion-vector check now reads 1.0 (it compares pass 2's last draw, which
+     the cut removes): not an error.
+  3. Bigscreen Beyond (2560 an eye, 4552x2560) vs Automatic (SteamVR's recommended 2688, 4778x2688): GPU 8.04 vs 8.30
+     ms, late frames 0.64 vs 1.37 %. The GPU's p95 (10.4-11 ms) is now the limit: most remaining late frames are GPU.
+- Drive C: was full (55 MB) on 2026-10-14: eye captures are ~200 MB raw (.rde); delete them after converting.
+
 ## Open problems (as of 15:25; 1 and 2 addressed above, re-check in the user's next session) (the user's screenshots: `research\grab\vr3\`, eye captures; `tools\sp\eyesbs.py` views them)
 
 1. **Glass in the right eye is hazy/grey**: through a window the left eye sees the room clearly, the right eye a grey

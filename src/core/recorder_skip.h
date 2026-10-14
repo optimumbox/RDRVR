@@ -21,6 +21,8 @@ void install();               // with [Stereo] ViMain and ViSkipRecord (default 
 bool installed();
 void begin();                 // the render thread: its recorder's draw and state methods return at once
 void end();
+std::string cut(uintptr_t rva, bool on);  // test ("vi pass2 cut <rva hex> on|off"): a void game function returned from
+                                          // at once in the skipped second scene
 std::string status();
 
 }  // namespace rdrvr::recorder_skip
