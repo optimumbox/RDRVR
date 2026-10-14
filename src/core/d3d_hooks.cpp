@@ -1,10 +1,13 @@
 #include "core/d3d_hooks.h"
+#include "core/hook_prof.h"
 
 #include <windows.h>
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
+#include <dbghelp.h>
 #include <dxgi1_6.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <map>
@@ -126,6 +129,8 @@ std::once_flag g_device_once, g_queue_once, g_factory_once, g_swapchain_once;
 // ------------------------------------------------------------------------------------------ listeners
 constexpr int kMaxListeners = 32;  // 18 frame-end listeners by run 4: at 16 the last two (render_settings' forced AA, pso) were dropped
 FrameEndFn g_end_listeners[kMaxListeners];
+double g_end_ms[kMaxListeners];  // the presenting thread's, with the probe on ("perf ends"; read racily: a diagnostic)
+uint64_t g_end_frames = 0;
 FrameStartFn g_start_listeners[kMaxListeners];
 std::atomic<int> g_end_count{0}, g_start_count{0};
 std::atomic<bool> g_frame_started{false};
@@ -328,6 +333,7 @@ std::atomic<uint64_t> g_unsynced_presents{0};
 
 void STDMETHODCALLTYPE hk_OMSetRenderTargets(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts,
                                              BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* ds) {
+    hookprof::Scope hp_(hookprof::kTargets);
     replay_ops::note(replay_ops::kTargets);
     for (auto& slot : g_bind_tap)
         if (BindTapFn tap = slot.load(std::memory_order_relaxed)) tap(cl, n, rts, single, ds);
@@ -362,11 +368,11 @@ void STDMETHODCALLTYPE hk_OMSetRenderTargets(ID3D12GraphicsCommandList* cl, UINT
         D3D12_CPU_DESCRIPTOR_HANDLE repl[8];
         if (sub(cl, n, rts, ds, &repl[0])) {
             for (UINT i = 1; i < n; ++i) repl[i] = rts[i];
-            o_OMSetRenderTargets(cl, n, repl, single, ds);
+            HP_ORIG(hp_, o_OMSetRenderTargets(cl, n, repl, single, ds));
             return;
         }
     }
-    o_OMSetRenderTargets(cl, n, rts, single, ds);
+    HP_ORIG(hp_, o_OMSetRenderTargets(cl, n, rts, single, ds));
 }
 
 thread_local uint64_t t_draws = 0, t_queries = 0;
@@ -383,6 +389,7 @@ void fg_draw(ID3D12GraphicsCommandList* cl) {
 }
 
 void STDMETHODCALLTYPE hk_DrawInstanced(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, UINT d) {
+    hookprof::Scope hp_(hookprof::kDraw);
     replay_ops::note(replay_ops::kDraw);
     if (prepass::active()) prepass::before_draw(cl);
     if (vi::before_draw(cl)) return;  // view-instanced stereo: drawn for both eyes already
@@ -391,9 +398,10 @@ void STDMETHODCALLTYPE hk_DrawInstanced(ID3D12GraphicsCommandList* cl, UINT a, U
     ++t_draws;
     fg_draw(cl);
     pso::on_draw_args(cl, c, a);
-    o_DrawInstanced(cl, a, b, c, d);
+    HP_ORIG(hp_, o_DrawInstanced(cl, a, b, c, d));
 }
 void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, INT d, UINT e) {
+    hookprof::Scope hp_(hookprof::kDraw);
     replay_ops::note(replay_ops::kDraw);
     if (prepass::active()) prepass::before_draw(cl);
     if (vi::before_draw(cl)) return;
@@ -402,7 +410,7 @@ void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D12GraphicsCommandList* cl, UI
     ++t_draws;
     fg_draw(cl);
     pso::on_draw_args(cl, d, a);
-    o_DrawIndexedInstanced(cl, a, b, c, d, e);
+    HP_ORIG(hp_, o_DrawIndexedInstanced(cl, a, b, c, d, e));
 }
 void STDMETHODCALLTYPE hk_Dispatch(ID3D12GraphicsCommandList* cl, UINT x, UINT y, UINT z) {
     fg_count(cl, [](ListLog& l) { ++l.dispatches; });
@@ -411,12 +419,13 @@ void STDMETHODCALLTYPE hk_Dispatch(ID3D12GraphicsCommandList* cl, UINT x, UINT y
 }
 void STDMETHODCALLTYPE hk_ExecuteIndirect(ID3D12GraphicsCommandList* cl, ID3D12CommandSignature* s, UINT n, ID3D12Resource* a,
                                           UINT64 b, ID3D12Resource* c, UINT64 d) {
+    hookprof::Scope hp_(hookprof::kDraw);
     replay_ops::note(replay_ops::kIndirect);
     fg_count(cl, [](ListLog& l) { ++l.indirect; });
     if (prepass::active()) prepass::before_draw(cl);
     if (vi::before_draw(cl)) return;
     if (prepass::active()) prepass::drawn(cl);
-    o_ExecuteIndirect(cl, s, n, a, b, c, d);
+    HP_ORIG(hp_, o_ExecuteIndirect(cl, s, n, a, b, c, d));
 }
 // ---- barrier watch (d3d::watch_add)
 constexpr int kWatchSlots = 4;
@@ -459,41 +468,49 @@ void watch_list_ends(ID3D12GraphicsCommandList* cl) {
 }
 
 void STDMETHODCALLTYPE hk_ResourceBarrier(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_RESOURCE_BARRIER* b) {
+    hookprof::Scope hp_(hookprof::kBarrier);
     replay_ops::note(replay_ops::kBarrier);
     if (prepass::tracing()) prepass::trace_barrier(cl, n, b);
     if (prepass::active()) prepass::barrier(cl, n, b);  // (before the game's batch: the pre-pass copies)
     fg_count(cl, [n](ListLog& l) { l.barriers += n; });
     watch_barriers(cl, n, b);
-    o_ResourceBarrier(cl, n, b);
+    HP_ORIG(hp_, o_ResourceBarrier(cl, n, b));
 }
 HRESULT STDMETHODCALLTYPE hk_Close(ID3D12GraphicsCommandList* cl) {
     watch_list_ends(cl);
     return o_Close(cl);
 }
 HRESULT STDMETHODCALLTYPE hk_Reset(ID3D12GraphicsCommandList* cl, ID3D12CommandAllocator* a, ID3D12PipelineState* ps) {
+    hookprof::Scope hp_(hookprof::kReset);
     watch_list_ends(cl);
     vi::on_reset(cl, ps);
-    return o_Reset(cl, a, ps);
+    HRESULT hr_ = S_OK;
+    HP_ORIG(hp_, hr_ = o_Reset(cl, a, ps));
+    return hr_;
 }
 void STDMETHODCALLTYPE hk_BeginQuery(ID3D12GraphicsCommandList* cl, ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) {
+    hookprof::Scope hp_(hookprof::kQuery);
     replay_ops::note(replay_ops::kQuery);
     vi::on_query(cl, 0, t, i, nullptr, 0, 1);
-    o_BeginQuery(cl, h, t, i);
+    HP_ORIG(hp_, o_BeginQuery(cl, h, t, i));
 }
 void STDMETHODCALLTYPE hk_ResolveQuery(ID3D12GraphicsCommandList* cl, ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT start, UINT n,
                                        ID3D12Resource* dst, UINT64 off) {
+    hookprof::Scope hp_(hookprof::kQuery);
     replay_ops::note(replay_ops::kQuery);
     vi::on_query(cl, 2, t, start, dst, off, n);
-    o_ResolveQuery(cl, h, t, start, n, dst, off);
+    HP_ORIG(hp_, o_ResolveQuery(cl, h, t, start, n, dst, off));
 }
 void STDMETHODCALLTYPE hk_EndQuery(ID3D12GraphicsCommandList* cl, ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) {
+    hookprof::Scope hp_(hookprof::kQuery);
     replay_ops::note(replay_ops::kQuery);
     vi::on_query(cl, 1, t, i, nullptr, 0, 1);
     ++t_queries;
     fg_count(cl, [](ListLog& l) { ++l.queries; });
-    o_EndQuery(cl, h, t, i);
+    HP_ORIG(hp_, o_EndQuery(cl, h, t, i));
 }
 void STDMETHODCALLTYPE hk_CopyResource(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, ID3D12Resource* src) {
+    hookprof::Scope hp_(hookprof::kCopy);
     replay_ops::note(replay_ops::kCopy);
     if (g_fg_armed.load(std::memory_order_relaxed)) {
         char a[32], b[32];
@@ -507,12 +524,13 @@ void STDMETHODCALLTYPE hk_CopyResource(ID3D12GraphicsCommandList* cl, ID3D12Reso
     }
     if (prepass::active()) prepass::flush_reads(cl);
     if (prepass::copy_resource(cl, dst, src)) return;  // [Stereo] ViMain: the depth from the region's arrays
-    o_CopyResource(cl, dst, src);
+    HP_ORIG(hp_, o_CopyResource(cl, dst, src));
     for (auto& t : g_copy_tap)
         if (CopyTapFn tap = t.load(std::memory_order_relaxed)) tap(cl, dst, src);
 }
 void STDMETHODCALLTYPE hk_CopyTextureRegion(ID3D12GraphicsCommandList* cl, const D3D12_TEXTURE_COPY_LOCATION* dst, UINT x, UINT y,
                                             UINT z, const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box) {
+    hookprof::Scope hp_(hookprof::kCopy);
     replay_ops::note(replay_ops::kCopy);
     if (g_fg_armed.load(std::memory_order_relaxed)) {
         char a[32], b[32];
@@ -525,10 +543,11 @@ void STDMETHODCALLTYPE hk_CopyTextureRegion(ID3D12GraphicsCommandList* cl, const
         fg_event(cl, "CopyTextureRegion %s <- %s", d.c_str(), s.c_str());
     }
     if (prepass::active()) prepass::flush_reads(cl);
-    o_CopyTextureRegion(cl, dst, x, y, z, src, box);
+    HP_ORIG(hp_, o_CopyTextureRegion(cl, dst, x, y, z, src, box));
 }
 void STDMETHODCALLTYPE hk_ClearRTV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE h, const FLOAT c[4], UINT n,
                                    const D3D12_RECT* r) {
+    hookprof::Scope hp_(hookprof::kClear);
     replay_ops::note(replay_ops::kClear);
     if (g_fg_armed.load(std::memory_order_relaxed)) {
         char a[32];
@@ -545,10 +564,11 @@ void STDMETHODCALLTYPE hk_ClearRTV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESC
         h = prepass::clear_rtv(cl, h);
         if (h.ptr != game.ptr && vi::skip_clear(cl)) return;  // slice 1 drawn with slice 0 (view-instanced): kept
     }
-    o_ClearRTV(cl, h, c, n, r);
+    HP_ORIG(hp_, o_ClearRTV(cl, h, c, n, r));
 }
 void STDMETHODCALLTYPE hk_ClearDSV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE h, D3D12_CLEAR_FLAGS f, FLOAT d,
                                    UINT8 s, UINT n, const D3D12_RECT* r) {
+    hookprof::Scope hp_(hookprof::kClear);
     replay_ops::note(replay_ops::kClear);
     if (g_fg_armed.load(std::memory_order_relaxed)) {
         char a[32];
@@ -565,7 +585,7 @@ void STDMETHODCALLTYPE hk_ClearDSV(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESC
         h = prepass::clear_dsv(cl, h);  // (the pre-pass's start: its depth's clear)
         if (h.ptr != game.ptr && vi::skip_clear(cl)) return;
     }
-    o_ClearDSV(cl, h, f, d, s, n, r);
+    HP_ORIG(hp_, o_ClearDSV(cl, h, f, d, s, n, r));
 }
 void STDMETHODCALLTYPE hk_BeginEvent(ID3D12GraphicsCommandList* cl, UINT meta, const void* data, UINT size) {
     if (g_fg_armed.load(std::memory_order_relaxed) && data && size) {
@@ -577,11 +597,15 @@ void STDMETHODCALLTYPE hk_BeginEvent(ID3D12GraphicsCommandList* cl, UINT meta, c
     o_BeginEvent(cl, meta, data, size);
 }
 void STDMETHODCALLTYPE hk_SetPredication(ID3D12GraphicsCommandList* cl, ID3D12Resource* r, UINT64 off, D3D12_PREDICATION_OP op) {
+    hookprof::Scope hp_(hookprof::kPredication);
     replay_ops::note(replay_ops::kPredication);
     vi::on_query(cl, 3, static_cast<D3D12_QUERY_TYPE>(op), 0, r, off, 1);
-    if (r && vi::drop_predication(cl)) return o_SetPredication(cl, nullptr, 0, op);  // (the A/B: everything drawn)
+    if (r && vi::drop_predication(cl)) {
+        HP_ORIG(hp_, o_SetPredication(cl, nullptr, 0, op));
+        return;
+    }  // (the A/B: everything drawn)
     fg_count(cl, [](ListLog& l) { ++l.queries; });
-    o_SetPredication(cl, r, off, op);
+    HP_ORIG(hp_, o_SetPredication(cl, r, off, op));
 }
 
 void fg_on_execute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) {
@@ -978,7 +1002,17 @@ void on_frame_end() {
     state::frame_ecl_present = t_ecl_present.exchange(0, std::memory_order_relaxed);
     uint64_t frame = state::presents.load() + 1;
     int c = g_end_count.load();
-    for (int i = 0; i < c; ++i) g_end_listeners[i](frame);
+    const bool probe = frame_probe::on();
+    double t = probe ? log::now_ms() : 0;
+    for (int i = 0; i < c; ++i) {
+        g_end_listeners[i](frame);
+        if (probe) {
+            const double t2 = log::now_ms();
+            g_end_ms[i] += t2 - t;
+            t = t2;
+        }
+    }
+    if (probe) ++g_end_frames;
     fg_on_frame_end(frame);
     g_frame_started = false;
 }
@@ -1162,6 +1196,37 @@ bool install_startup_hooks() {
 
 // Registration happens at startup, from one thread. A full list is an error, never a silent drop (cycle 23: a ninth
 // frame-end listener pushed the AA forcing out, so technique 2 could not be selected).
+std::string frame_end_status(bool reset) {  // "perf ends": the listeners' times a frame, most first, named from the PDB
+    static bool s_sym = false;
+    if (!s_sym) {
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        s_sym = SymInitialize(GetCurrentProcess(), nullptr, TRUE) != FALSE;
+    }
+    const int c = g_end_count.load();
+    const double n = g_end_frames ? static_cast<double>(g_end_frames) : 1.0;
+    std::vector<std::pair<double, int>> order;
+    for (int i = 0; i < c; ++i) order.emplace_back(g_end_ms[i] / n, i);
+    std::sort(order.rbegin(), order.rend());
+    char b[400];
+    std::snprintf(b, sizeof(b), "frame-end listeners over %llu frames (ms a frame):", static_cast<unsigned long long>(g_end_frames));
+    std::string out = b;
+    for (auto [ms, i] : order) {
+        alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256] = {};
+        auto* si = reinterpret_cast<SYMBOL_INFO*>(buf);
+        si->SizeOfStruct = sizeof(SYMBOL_INFO);
+        si->MaxNameLen = 255;
+        DWORD64 disp = 0;
+        const bool named = s_sym && SymFromAddr(GetCurrentProcess(), reinterpret_cast<DWORD64>(g_end_listeners[i]), &disp, si);
+        std::snprintf(b, sizeof(b), " | %.3f %s", ms, named ? si->Name : "?");
+        out += b;
+    }
+    if (reset) {
+        for (double& v : g_end_ms) v = 0;
+        g_end_frames = 0;
+    }
+    return out;
+}
+
 void add_frame_end_listener(FrameEndFn fn) {
     int i = g_end_count.load();
     if (i >= kMaxListeners) {

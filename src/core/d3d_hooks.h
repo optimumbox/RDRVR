@@ -10,6 +10,7 @@
 // Each vtable method is hooked once, at its implementation, so every object of that class is covered.
 
 #include <cstdint>
+#include <string>
 
 struct ID3D12CommandQueue;
 struct ID3D12CommandList;
@@ -29,6 +30,7 @@ bool install_startup_hooks();   // from the bootstrap thread, after MTLX has unl
 using FrameEndFn = void (*)(uint64_t frame);
 using FrameStartFn = void (*)(ID3D12CommandQueue* queue);
 void add_frame_end_listener(FrameEndFn fn);
+std::string frame_end_status(bool reset);  // "perf ends": each listener's time a frame (the probe on)
 void add_frame_start_listener(FrameStartFn fn);
 
 // Lets one module wrap each game ExecuteCommandLists on the present queue with two command lists of its own, sent

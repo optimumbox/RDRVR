@@ -27,6 +27,9 @@ enum Slot {
     kPlayIdle,    // the playback loop's wait for a recorded chunk
     kFrameEnd,    // the mod's frame end before Present (xrWaitFrame, the eye copies, xrEndFrame, the listeners)
     kXrWait,      // the xrWaitFrame block inside it
+    kXrEnd,       // the previous XR frame's end inside it (the eye blits, the layers, xrEndFrame)
+    kXrEndCall,   // xrEndFrame itself
+    kXrImages,    // the eye images' acquire and wait
     kPresent,     // the game's Present
     // the main thread
     kMainWait,    // PreRender's wait on +0x18 for the render thread's frame

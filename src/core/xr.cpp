@@ -1305,7 +1305,9 @@ void end_open_frame() {
     ei.layerCount = cinema ? nquad : (full ? nlayers : 0);
     ei.layers = cinema ? quad_layers : layers;
     if (cinema) g_cinema_frames.fetch_add(1, std::memory_order_relaxed);
+    const double e0 = frame_probe::on() ? log::now_ms() : 0;
     XrResult r = xrEndFrame(g_session, &ei);
+    if (e0 > 0) frame_probe::add(frame_probe::kXrEndCall, log::now_ms() - e0);
     if (XR_FAILED(r)) log::limited("xr.endframe", 8, "[xr] xrEndFrame -> %s", result_name(g_inst, r));
     if (g_open_ms > 0) {  // the timing window: how long this XR frame was open, and its wait
         const double open = log::now_ms() - g_open_ms;
@@ -1411,7 +1413,11 @@ void submit_frame_end() {
         if (!make_swapchains()) return;
         g_submit = true;
     }
-    if (g_frame_open) end_open_frame();
+    if (g_frame_open) {
+        const double e0 = frame_probe::on() ? log::now_ms() : 0;
+        end_open_frame();
+        if (e0 > 0) frame_probe::add(frame_probe::kXrEnd, log::now_ms() - e0);
+    }
     XrFrameState fs{XR_TYPE_FRAME_STATE};
     XrFrameWaitInfo wi{XR_TYPE_FRAME_WAIT_INFO};
     const double w0 = log::now_ms();
@@ -1494,6 +1500,7 @@ void submit_frame_end() {
     controllers::sync(g_space, fs.predictedDisplayTime);
     g_filled = 0;
     g_eyes_acquired = !g_resized.load(std::memory_order_acquire);  // the live-resize guard: no eye images from then on
+    const double a0 = frame_probe::on() ? log::now_ms() : 0;
     for (int e = 0; e < 2; ++e) {
         if (!g_eyes_acquired) {
             g_dst[e] = nullptr;
@@ -1510,6 +1517,7 @@ void submit_frame_end() {
         }
         g_dst[e] = g_chain[e].images[index];
     }
+    if (a0 > 0) frame_probe::add(frame_probe::kXrImages, log::now_ms() - a0);
     g_frame_open = true;
 }
 

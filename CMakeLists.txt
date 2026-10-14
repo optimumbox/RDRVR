@@ -93,6 +93,7 @@ add_library(rdrvr_core SHARED
     src/core/prepass_arrays.cpp
     src/core/stereo_vi.cpp
     src/core/stereo_vi_heap.cpp
+    src/core/hook_prof.cpp
     src/core/dinput8.def
 )
 set_target_properties(rdrvr_core PROPERTIES OUTPUT_NAME dinput8)
@@ -103,7 +104,7 @@ target_include_directories(rdrvr_core PRIVATE src)
 target_link_options(rdrvr_core PRIVATE /DEBUG /OPT:REF /OPT:ICF "/PDBALTPATH:%_PDB%")
 target_link_libraries(rdrvr_core PRIVATE
     safetyhook::safetyhook OpenXR::openxr_loader OpenXR::headers imgui::imgui
-    d3d12 dxgi dxguid bcrypt version shlwapi ole32)
+    d3d12 dxgi dxguid bcrypt version shlwapi ole32 dbghelp)
 
 # The gameplay plugin needs the RedHook SDK (K3rhos/RedHookSDK, MIT), which this repository does not include: put its
 # headers in <sdk>/include and RedHook.lib in <sdk>/lib (README, "Building"). Without it only dinput8.dll is built.

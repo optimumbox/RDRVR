@@ -9,6 +9,7 @@
 // they copy, once each slot is checked to lie inside the heap and past what the game's descriptor partition has used.
 
 #include "core/stereo_vi.h"
+#include "core/hook_prof.h"
 
 #include <windows.h>
 
@@ -71,6 +72,12 @@ struct Pending {
 };
 std::vector<Pending> g_pending;
 std::atomic<uint64_t> g_written{0}, g_refused{0}, g_table_binds{0}, g_outside{0};
+// The binds are counted only until a heap's table base settles: the game binds the table ~37000 times a frame and the
+// lock and the maps cost the playback thread ~1.8 ms a frame (2026-10-14, hookprof); a cache of settled handles did not
+// help (most binds are of handles outside the list's heap, thousands of them). Learning again when a new heap is seen.
+constexpr uint64_t kSettleBinds = 20000;  // a heap's binds before its base is taken as settled
+std::atomic<bool> g_learning{true};
+std::atomic<int> g_settles{0};
 char g_why[300] = "no table seen yet";
 int g_logged_bases = 0;
 
@@ -210,7 +217,8 @@ void write_pending(ID3D12DescriptorHeap* heap) {  // under g_mutex
 }
 
 void STDMETHODCALLTYPE hk_SetHeaps(ID3D12GraphicsCommandList* cl, UINT n, ID3D12DescriptorHeap* const* heaps) {
-    o_SetHeaps(cl, n, heaps);
+    hookprof::Scope hp_(hookprof::kHeaps);
+    HP_ORIG(hp_, o_SetHeaps(cl, n, heaps));
     replay_ops::note(replay_ops::kHeaps);
     for (UINT i = 0; i < n && heaps; ++i) {
         const D3D12_DESCRIPTOR_HEAP_DESC d = heaps[i]->GetDesc();
@@ -227,15 +235,17 @@ void STDMETHODCALLTYPE hk_SetHeaps(ID3D12GraphicsCommandList* cl, UINT n, ID3D12
         h.count = d.NumDescriptors;
         dev->Release();
         g_heaps[heaps[i]] = h;
+        g_learning.store(true, std::memory_order_relaxed);  // (a new heap: its base learnt)
         log::info("[vi] a shader-visible heap %p (%u descriptors, GPU %#llx)", static_cast<void*>(heaps[i]), d.NumDescriptors,
                   static_cast<unsigned long long>(h.gpu));
     }
 }
 
 void STDMETHODCALLTYPE hk_SetTable(ID3D12GraphicsCommandList* cl, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE gh) {
-    o_SetTable(cl, param, gh);
+    hookprof::Scope hp_(hookprof::kTable);
+    HP_ORIG(hp_, o_SetTable(cl, param, gh));
     replay_ops::note(replay_ops::kTable);
-    if (param != kSrvTableParam) return;
+    if (param != kSrvTableParam || !g_learning.load(std::memory_order_relaxed)) return;
     g_table_binds.fetch_add(1, std::memory_order_relaxed);
     auto lh = t_list_heap.find(cl);
     if (lh == t_list_heap.end()) return;
@@ -253,6 +263,8 @@ void STDMETHODCALLTYPE hk_SetTable(ID3D12GraphicsCommandList* cl, UINT param, D3
     // often, taken once 2000 binds are counted and kept unless another base overtakes it by far.
     const int64_t base = static_cast<int64_t>((gh.ptr - h.gpu) / h.inc);
     const uint64_t c = ++h.counts[base];
+    if (h.base >= 0 && h.binds > kSettleBinds && g_learning.exchange(false, std::memory_order_relaxed))
+        g_settles.fetch_add(1, std::memory_order_relaxed);  // (this bind still checked below)
     if (h.binds < 2000 || base == h.base) return;
     if (h.base >= 0 && c < 2 * h.counts[h.base]) return;
     if (h.base >= 0) ++h.moves;
@@ -344,10 +356,11 @@ bool heap_ready() {
 std::string heap_status() {
     std::lock_guard lock(g_mutex);
     char b[400];
-    std::snprintf(b, sizeof(b), "eye 2's views: %llu written, %llu refused, %llu plain (no fitting game view), %zu images, %llu records dropped (new resources) | table binds %llu (outside their heap %llu) | %s",
+    std::snprintf(b, sizeof(b), "eye 2's views: %llu written, %llu refused, %llu plain (no fitting game view), %zu images, %llu records dropped (new resources) | table binds counted %llu (outside their heap %llu; %s, settled %d times) | %s",
                   static_cast<unsigned long long>(g_written.load()), static_cast<unsigned long long>(g_refused.load()),
                   static_cast<unsigned long long>(g_mismatched.load()), g_pending.size(), static_cast<unsigned long long>(g_forgotten.load()),
-                  static_cast<unsigned long long>(g_table_binds.load()), static_cast<unsigned long long>(g_outside.load()), g_why);
+                  static_cast<unsigned long long>(g_table_binds.load()), static_cast<unsigned long long>(g_outside.load()),
+                  g_learning.load() ? "learning" : "settled: not counted", g_settles.load(), g_why);
     std::string out = b;
     for (auto& [heap, h] : g_heaps) {
         std::snprintf(b, sizeof(b), " | heap %p: %u descriptors, table base %lld, binds %llu, moves %llu", static_cast<void*>(heap), h.count,

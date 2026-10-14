@@ -1,4 +1,5 @@
 #include "core/test_channel.h"
+#include "core/hook_prof.h"
 
 #include <windows.h>
 
@@ -666,9 +667,15 @@ std::string execute(const std::vector<std::string>& t) {
     if (c == "probe" && t.size() >= 2) {  // probe on|off: the single-pass probe's timers (frame_probe.h)
         return frame_probe::set_on(t[1] == "on") ? "probe " + t[1] : "ERROR the probe is not installed ([XR] TimingProbe=0)";
     }
+    if (c == "hookprof") {  // the hooks' own time against D3D12's (hook_prof.h); the full line is logged too
+        std::string r = hookprof::command(t.size() >= 2 ? t[1] : "status");
+        log::info("[hookprof] %s", r.c_str());
+        return r;
+    }
+    if (c == "perf" && t.size() >= 2 && t[1] == "ends") return d3d::frame_end_status(t.size() >= 3 && t[2] == "reset");
     if (c == "perf") {
         if (t.size() >= 2 && t[1] == "reset") xr::perf_reset();
-        char st[400], pr[768];
+        char st[400], pr[1024];
         xr::perf_status(st, sizeof(st));
         xr::perf_probe(pr, sizeof(pr));
         return std::string(st) + " || " + pr;

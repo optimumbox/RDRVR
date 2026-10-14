@@ -1,4 +1,5 @@
 #include "core/pso.h"
+#include "core/hook_prof.h"
 
 #include <windows.h>
 
@@ -310,9 +311,13 @@ HRESULT STDMETHODCALLTYPE hk_CreateStream(ID3D12Device* dev, const D3D12_PIPELIN
 }
 
 void STDMETHODCALLTYPE hk_SetPipelineState(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* game) {
+    hookprof::Scope hp_(hookprof::kPso);
     replay_ops::note(replay_ops::kPso);
     ID3D12PipelineState* ps = vi::on_set_pso(cl, game);  // the game's, or its view-instanced twin (stereo_vi.h)
-    if (!g_census.load(std::memory_order_relaxed)) return o_SetPipelineState(cl, ps);
+    if (!g_census.load(std::memory_order_relaxed)) {
+        HP_ORIG(hp_, o_SetPipelineState(cl, ps));
+        return;
+    }
     uint64_t h = 0;
     PsoInfo in;
     {
@@ -325,7 +330,7 @@ void STDMETHODCALLTYPE hk_SetPipelineState(ID3D12GraphicsCommandList* cl, ID3D12
     t_cl = cl;
     t_vs = h;
     t_info = in;
-    o_SetPipelineState(cl, ps);
+    HP_ORIG(hp_, o_SetPipelineState(cl, ps));
 }
 
 void STDMETHODCALLTYPE hk_SetVB(ID3D12GraphicsCommandList* cl, UINT start, UINT n, const D3D12_VERTEX_BUFFER_VIEW* v) {

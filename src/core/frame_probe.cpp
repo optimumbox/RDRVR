@@ -134,12 +134,12 @@ void format(const Snap& a, const Snap& b, char* out, size_t len) {
                   "probe %llu frames (stereo %llu, mono %llu), render period %.2f | scene %.2f: pre %.2f, pass 1 %.2f "
                   "(+0x88 wait %.2f), between %.2f (+0x38 wait %.2f), pass 2 %.2f, mono %.2f | RenderFrame: +0x38 wait "
                   "%.2f, +0x40 waits %.2f, +0x80 wait %.2f, playback wait %.2f, rest %.2f | playback: idle %.2f, frame "
-                  "end %.2f (xrWaitFrame %.2f), present %.2f, draws %.0f | busy: render %.2f, playback %.2f, main %.2f | "
+                  "end %.2f (xrWaitFrame %.2f, last frame's end %.2f with xrEndFrame %.2f, images %.2f), present %.2f, draws %.0f | busy: render %.2f, playback %.2f, main %.2f | "
                   "main: +0x18 wait %.2f ms",
                   static_cast<unsigned long long>(n), static_cast<unsigned long long>(b.stereo - a.stereo),
                   static_cast<unsigned long long>(b.mono - a.mono), period, scene, m(kPre), m(kPass1), m(kDataWait),
                   m(kMid), m(kUiWaitMid), m(kPass2), m(kMono), m(kUiWait), m(kLockWait), m(kFrameWait), m(kPlayWait),
-                  rest, m(kPlayIdle), m(kFrameEnd), m(kXrWait), m(kPresent),
+                  rest, m(kPlayIdle), m(kFrameEnd), m(kXrWait), m(kXrEnd), m(kXrEndCall), m(kXrImages), m(kPresent),
                   static_cast<double>(b.draws - a.draws) / static_cast<double>(n), busy(kRender), busy(kPlayback),
                   busy(kMain), m(kMainWait));
 }

@@ -1,4 +1,5 @@
 #include "core/stereo_vi.h"
+#include "core/hook_prof.h"
 
 #include <windows.h>
 
@@ -80,6 +81,7 @@ std::string g_dir;
 SRWLOCK g_lock = SRWLOCK_INIT;  // g_kept, g_by_pso, the shader maps
 std::vector<std::unique_ptr<Kept>> g_kept;
 std::unordered_map<ID3D12PipelineState*, Kept*> g_by_pso;
+std::atomic<uint64_t> g_by_pso_gen{0};  // records added (kept_of's caches)
 std::unordered_map<uint64_t, std::vector<uint8_t>> g_vs_conv, g_ps_conv;
 std::unordered_set<uint64_t> g_ps_safe;
 std::unordered_set<uint64_t> g_no_depth;  // <ViShaders>\no_depth.txt (tools/sp/dxil/depth_readers.py): cannot read the depth
@@ -269,22 +271,33 @@ void enqueue(Kept* k) {
     g_q_cv.notify_one();
 }
 
-// The twin to draw with now (made in an earlier frame, so both regions of a frame agree), or null.
-int ds_writes_of(ID3D12PipelineState* game) {
-    if (!game) return -1;
-    AcquireSRWLockShared(&g_lock);
-    auto it = g_by_pso.find(game);
-    const int r = it == g_by_pso.end() ? -1 : it->second->ds_writes;
-    ReleaseSRWLockShared(&g_lock);
-    return r;
-}
-
-ID3D12PipelineState* twin_of(ID3D12PipelineState* game) {
+// Each thread's cache of g_by_pso (the playback thread sets ~1700 pipelines a frame; the lock and the map cost ~60 ns
+// each): direct-mapped by address, emptied when any record is added (a pipeline made at a released one's address).
+constexpr size_t kPsoCache = 512;
+struct PsoCacheEntry {
+    ID3D12PipelineState* game = nullptr;
+    Kept* kept = nullptr;
+};
+thread_local PsoCacheEntry t_pso_cache[kPsoCache];
+thread_local uint64_t t_pso_gen = ~0ull;
+Kept* kept_of(ID3D12PipelineState* game) {  // (Kept records are never freed: a list may keep the pointer)
     if (!game) return nullptr;
+    const uint64_t gen = g_by_pso_gen.load(std::memory_order_acquire);
+    if (gen != t_pso_gen) {
+        for (PsoCacheEntry& e : t_pso_cache) e = PsoCacheEntry{};
+        t_pso_gen = gen;
+    }
+    PsoCacheEntry& e = t_pso_cache[(reinterpret_cast<uintptr_t>(game) >> 6) % kPsoCache];
+    if (e.game == game) return e.kept;
     AcquireSRWLockShared(&g_lock);
     auto it = g_by_pso.find(game);
     Kept* k = it == g_by_pso.end() ? nullptr : it->second;
     ReleaseSRWLockShared(&g_lock);
+    e = PsoCacheEntry{game, k};  // (a pipeline without a record too: null)
+    return k;
+}
+// The twin to draw with now (made in an earlier frame, so both regions of a frame agree), or null.
+ID3D12PipelineState* twin_of_kept(const Kept* k) {
     if (!k) return nullptr;
     ID3D12PipelineState* t = k->twin.load(std::memory_order_acquire);
     return t && k->made_frame.load(std::memory_order_relaxed) < state::presents.load(std::memory_order_relaxed) ? t : nullptr;
@@ -296,6 +309,7 @@ struct PlainStat {
 };
 std::mutex g_plain_mutex;
 std::unordered_map<ID3D12PipelineState*, PlainStat> g_plain;
+std::atomic<bool> g_plain_on{false};  // (counted from the first "vi plain": a lock a draw costs the playback thread)
 void note_plain(ID3D12PipelineState* game, bool arrays) {
     std::lock_guard lock(g_plain_mutex);
     PlainStat& st = g_plain[game];
@@ -308,6 +322,7 @@ struct ListState {
     ID3D12PipelineState* game = nullptr;   // the game's pipeline (set or the Reset's)
     ID3D12PipelineState* bound = nullptr;  // what is bound: the game's or its twin
     ID3D12GraphicsCommandList1* cl1 = nullptr;
+    Kept* kept = nullptr;                  // the game pipeline's record (its twin), looked up as it is set
     int queries_open = 0;  // occlusion queries begun and not ended on this list
     D3D12_VIEWPORT vp{};   // the game's viewport 0 and scissor 0 since the list's Reset (kLocations: view 1's are index 1)
     D3D12_RECT sc{};
@@ -315,9 +330,13 @@ struct ListState {
 };
 thread_local std::unordered_map<ID3D12GraphicsCommandList*, ListState> t_lists;
 
+thread_local ID3D12GraphicsCommandList* t_last_cl = nullptr;  // the last list's state (unordered_map nodes do not move)
+thread_local ListState* t_last_s = nullptr;
 ListState& list(ID3D12GraphicsCommandList* cl) {
+    if (cl == t_last_cl) return *t_last_s;
     ListState& s = t_lists[cl];
     if (!s.cl1) cl->QueryInterface(IID_PPV_ARGS(&s.cl1));  // (a reference kept for the list's life)
+    t_last_cl = cl, t_last_s = &s;
     return s;
 }
 
@@ -341,24 +360,26 @@ void rs_for_twin(ID3D12GraphicsCommandList* cl, const ListState& s) {
 }
 ListState& list(ID3D12GraphicsCommandList* cl);
 void STDMETHODCALLTYPE hk_SetViewports(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_VIEWPORT* v) {
+    hookprof::Scope hp_(hookprof::kViewport);
     ListState& s = list(cl);
     if (n >= 1 && v) s.vp = v[0], s.have_vp = true;
     if (n == 1 && s.bound && s.bound != s.game) return rs_for_twin(cl, s);
-    o_SetViewports(cl, n, v);
+    HP_ORIG(hp_, o_SetViewports(cl, n, v));
 }
 void STDMETHODCALLTYPE hk_SetScissors(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_RECT* r) {
+    hookprof::Scope hp_(hookprof::kScissor);
     ListState& s = list(cl);
     if (n >= 1 && r) s.sc = r[0], s.have_sc = true;
     if (n == 1 && s.bound && s.bound != s.game && s.have_vp) return rs_for_twin(cl, s);
-    o_SetScissors(cl, n, r);
+    HP_ORIG(hp_, o_SetScissors(cl, n, r));
 }
 
 // What the draw needs bound: the twin in slice 0's region (all targets the arrays), else the game's.
-ID3D12PipelineState* wanted_for(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* game, int* region, ID3D12PipelineState** twin) {
+ID3D12PipelineState* wanted_for(ID3D12GraphicsCommandList* cl, const ListState& s, int* region, ID3D12PipelineState** twin) {
     bool arrays = false;
     *region = prepass::vi_region(cl, &arrays);
-    *twin = *region && arrays ? twin_of(game) : nullptr;
-    return *region == 1 && *twin ? *twin : game;
+    *twin = *region && arrays ? twin_of_kept(s.kept) : nullptr;
+    return *region == 1 && *twin ? *twin : s.game;
 }
 
 void bind(ID3D12GraphicsCommandList* cl, ListState& s, ID3D12PipelineState* p) {
@@ -395,6 +416,7 @@ void init() {
 
 void on_pipeline(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, ID3D12PipelineState* pso) {
     if (!g_configured.load(std::memory_order_relaxed) || !d || !pso) return;
+    g_by_pso_gen.fetch_add(1, std::memory_order_release);  // (any new pipeline, recorded or not: kept_of's caches)
     if (!g_dev) {
         D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3{};
         if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&g_dev))) ||
@@ -451,6 +473,7 @@ void on_pipeline(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d,
     Kept* raw = k.get();
     AcquireSRWLockExclusive(&g_lock);
     g_by_pso[pso] = raw;
+    g_by_pso_gen.fetch_add(1, std::memory_order_release);  // (the threads' caches of g_by_pso start again)
     g_kept.push_back(std::move(k));
     ReleaseSRWLockExclusive(&g_lock);
     g_kept_n.fetch_add(1, std::memory_order_relaxed);
@@ -461,9 +484,9 @@ bool configured() { return g_configured.load(std::memory_order_relaxed); }
 
 bool viewport_extent(ID3D12GraphicsCommandList* cl, uint32_t* right, uint32_t* bottom) {
     if (!g_configured.load(std::memory_order_relaxed)) return false;
-    auto it = t_lists.find(cl);
-    if (it == t_lists.end() || !it->second.have_vp) return false;
-    const D3D12_VIEWPORT& v = it->second.vp;
+    const ListState& s = list(cl);
+    if (!s.have_vp) return false;
+    const D3D12_VIEWPORT& v = s.vp;
     if (v.TopLeftX < 0 || v.TopLeftY < 0 || v.Width <= 0 || v.Height <= 0) return false;
     *right = static_cast<uint32_t>(std::ceil(v.TopLeftX + v.Width));
     *bottom = static_cast<uint32_t>(std::ceil(v.TopLeftY + v.Height));
@@ -472,19 +495,18 @@ bool viewport_extent(ID3D12GraphicsCommandList* cl, uint32_t* right, uint32_t* b
 
 bool may_read_depth(ID3D12GraphicsCommandList* cl) {
     if (!g_configured.load(std::memory_order_relaxed)) return true;
-    auto it = t_lists.find(cl);
-    if (it == t_lists.end() || !it->second.game) return true;
+    const Kept* k = list(cl).kept;
+    if (!k) return true;
     AcquireSRWLockShared(&g_lock);
-    auto k = g_by_pso.find(it->second.game);
-    const bool r = k == g_by_pso.end() || !g_no_depth.count(k->second->vs_hash) || (k->second->ps_hash && !g_no_depth.count(k->second->ps_hash));
+    const bool r = !g_no_depth.count(k->vs_hash) || (k->ps_hash && !g_no_depth.count(k->ps_hash));
     ReleaseSRWLockShared(&g_lock);
     return r;
 }
 
 int writes_depth(ID3D12GraphicsCommandList* cl) {
     if (!g_configured.load(std::memory_order_relaxed)) return -1;
-    auto it = t_lists.find(cl);
-    return it == t_lists.end() ? -2 : ds_writes_of(it->second.game);
+    const ListState& s = list(cl);
+    return !s.game ? -1 : s.kept ? s.kept->ds_writes : -1;  // (the list's cached record: no lock a draw)
 }
 
 bool wanted() {
@@ -495,10 +517,11 @@ bool wanted() {
 ID3D12PipelineState* on_set_pso(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps) {
     if (!g_configured.load(std::memory_order_relaxed)) return ps;
     ListState& s = list(cl);
+    if (s.game != ps || !s.kept) s.kept = kept_of(ps);
     s.game = ps;
     int region = 0;
     ID3D12PipelineState* twin = nullptr;
-    ID3D12PipelineState* p = wanted_for(cl, ps, &region, &twin);
+    ID3D12PipelineState* p = wanted_for(cl, s, &region, &twin);
     if (p != ps && s.cl1) s.cl1->SetViewInstanceMask(3);
     if (p != ps && s.bound != p) rs_for_twin(cl, s);
     s.bound = p;
@@ -509,6 +532,7 @@ void on_reset(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps) {
     if (!g_configured.load(std::memory_order_relaxed)) return;
     ListState& s = list(cl);
     s.game = s.bound = ps;
+    s.kept = kept_of(ps);
     s.queries_open = 0;
     s.have_vp = s.have_sc = false;  // (a Reset clears them)
 }
@@ -544,7 +568,7 @@ bool before_draw(ID3D12GraphicsCommandList* cl) {
     }
     int region = 0;
     ID3D12PipelineState* twin = nullptr;
-    ID3D12PipelineState* p = wanted_for(cl, s.game, &region, &twin);
+    ID3D12PipelineState* p = wanted_for(cl, s, &region, &twin);
     if (region == 2 && twin && !g_skip.load(std::memory_order_relaxed)) {  // the A/B: eye 2 draws it itself
         if (s.game) bind(cl, s, s.game);
         return false;
@@ -565,7 +589,7 @@ bool before_draw(ID3D12GraphicsCommandList* cl) {
     if (region == 2 && g_drawn2_on.load(std::memory_order_relaxed)) note_drawn2(s);
     if (s.game) bind(cl, s, p);  // (out of a region a twin left bound goes back to the game's)
     if (region == 1) (p != s.game ? g_draws_both : g_draws_plain).fetch_add(1, std::memory_order_relaxed);
-    if (region == 1 && p == s.game) {
+    if (region == 1 && p == s.game && g_plain_on.load(std::memory_order_relaxed)) {
         bool arrays = false;
         prepass::vi_region(cl, &arrays);
         note_plain(s.game, arrays);
@@ -581,7 +605,9 @@ struct QStat {
 std::mutex g_qmutex;
 QStat g_q[5][4];  // 0 before any region this frame, 1 in slice 0's, 2 in slice 1's, 3 after slice 0's, 4 after slice 1's
 std::unordered_map<ID3D12Resource*, int> g_pred_res;  // predicate buffers seen (by region bits)
+std::atomic<bool> g_qprobe_on{false};  // (from the first "vi queries": a lock a query costs the playback thread)
 void on_query_impl(ID3D12GraphicsCommandList* cl, int kind, UINT index, ID3D12Resource* res, UINT64 off, UINT n) {
+    if (!g_qprobe_on.load(std::memory_order_relaxed)) return;
     bool arrays = false;
     int region = prepass::vi_region(cl, &arrays);
     if (!region) region = prepass::last_slice() < 0 ? 0 : 3 + prepass::last_slice();
@@ -656,7 +682,8 @@ std::string command(const std::vector<std::string>& t) {
         return std::string("second scenes of view-instanced frames: ") + (t[2] == "skip" ? "recorded without draws" : "recorded whole") +
                " (" + std::to_string(camera_lever::vi_skipped2()) + " so far) | " + recorder_skip::status();
     }
-    if (sub == "plain") {  // vi plain [reset]: slice 0's region's eye-1-only draws, most first
+    if (sub == "plain") {  // vi plain [reset]: slice 0's region's eye-1-only draws, most first (counted from the first ask)
+        if (!g_plain_on.exchange(true)) return "slice 0's eye-1-only draws counted from now: ask again";
         std::vector<std::pair<ID3D12PipelineState*, PlainStat>> v;
         {
             std::lock_guard lock(g_plain_mutex);
@@ -751,6 +778,7 @@ std::string command(const std::vector<std::string>& t) {
         return r.empty() ? "no pipeline of that vertex shader" : r;
     }
     if (sub == "queries") {  // the query probe: per region, Begin/End/Resolve/Predicate counts and ranges; "queries reset"
+        if (!g_qprobe_on.exchange(true)) return "the query probe counts from now: ask again";
         std::lock_guard lock(g_qmutex);
         if (t.size() >= 3 && t[2] == "reset") {
             for (auto& r : g_q)
