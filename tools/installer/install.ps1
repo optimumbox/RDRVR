@@ -177,6 +177,7 @@ $record = @()
 foreach ($f in $Files) {
     $src = Join-Path $Payload $f
     $dst = Join-Path $GameDir $f
+    New-Item -ItemType Directory -Force (Split-Path -Parent $dst) | Out-Null  # (RDRVR_shaders\)
     if (-not (Copy-Retry $src $dst)) {
         Say "  $f is in use by another program (the game, its crash reporter, or a virus scan)."
         Say '  Close it (or restart the PC) and run the installer again; the files copied so far are replaced then.'
@@ -185,8 +186,10 @@ foreach ($f in $Files) {
     $h = Sha $dst
     if ($h -ne (Sha $src)) { Say "  copy of $f does not match; the install is incomplete"; Done 1 }
     $record += [pscustomobject]@{ file = $f; sha256 = $h }
-    Say "  installed $f"
+    if ($f -notlike 'RDRVR_shaders\*') { Say "  installed $f" }
 }
+$nsh = @($Files | Where-Object { $_ -like 'RDRVR_shaders\*' }).Count
+if ($nsh) { Say "  installed RDRVR_shaders\ ($nsh files)" }
 foreach ($f in $Leftovers) {
     $p = Join-Path $GameDir $f
     if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force; Say "  removed $f (a test setting)" }
@@ -212,6 +215,6 @@ try {
     Say 'or WMR) and make it the active OpenXR runtime before starting the game.'
 }
 $ui = Join-Path $env:LOCALAPPDATA 'RDRVR\RDRVR.user.ini'
-if (Test-Path -LiteralPath $ui) { Say "Your in-game settings are kept: $ui" }
+if (Test-Path -LiteralPath $ui) { Say "Your in-game settings: $ui (a release that starts everyone from new defaults keeps the old file beside it as RDRVR.user.ini.before-<version>.bak on its first start)" }
 Say "To remove it: RDRVR_Uninstall.cmd in the game folder."
 Done 0

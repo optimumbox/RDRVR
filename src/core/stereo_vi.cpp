@@ -424,6 +424,11 @@ void init() {
         return;
     }
     g_dir = config::get_string("Stereo", "ViShaders", "");
+    if (!g_dir.empty() && g_dir.find(':') == std::string::npos && g_dir[0] != '\\' && g_dir[0] != '/') {
+        char gd[MAX_PATH * 2] = {};  // a relative folder (the release's RDRVR_shaders) is in the game's folder
+        WideCharToMultiByte(CP_ACP, 0, log::game_dir(), -1, gd, sizeof(gd), nullptr, nullptr);
+        g_dir = std::string(gd) + g_dir;
+    }
     if (!g_dir.empty()) load_shaders(g_dir);
     g_on = config::get_bool("Stereo", "ViOn", true);
     g_main = config::get_bool("Stereo", "ViMain", false);

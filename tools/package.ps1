@@ -28,7 +28,16 @@ foreach ($k in $map.Keys) {
     if (-not (Test-Path $map[$k])) { throw "missing $($map[$k]) (build with the RedHook SDK first: README)" }
     Copy-Item -LiteralPath $map[$k] -Destination (Join-Path $pay $k)
 }
-Set-Content -LiteralPath (Join-Path $pay 'RDRVR_files.txt') -Value ($map.Keys -join "`r`n") -Encoding ascii
+# the single-pass stereo's converted shaders (session.ps1's set), in RDRVR_shaders\
+$shaders = Join-Path $root 'research\stereo_all15'
+if (-not (Test-Path (Join-Path $shaders 'no_twin.txt'))) { throw "missing $shaders (tools\sp\dxil\stereo_vs.py)" }
+New-Item -ItemType Directory -Force (Join-Path $pay 'RDRVR_shaders') | Out-Null
+$files = @($map.Keys)
+foreach ($f in Get-ChildItem -LiteralPath $shaders -File) {
+    Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $pay "RDRVR_shaders\$($f.Name)")
+    $files += "RDRVR_shaders\$($f.Name)"
+}
+Set-Content -LiteralPath (Join-Path $pay 'RDRVR_files.txt') -Value ($files -join "`r`n") -Encoding ascii
 Set-Content -LiteralPath (Join-Path $pay 'RDRVR_version.txt') -Value $version -Encoding ascii
 foreach ($f in 'install.ps1', 'uninstall.ps1', 'Install.cmd', 'Uninstall.cmd') { Copy-Item -LiteralPath (Join-Path $PSScriptRoot "installer\$f") -Destination $stage }
 (Get-Content -Raw (Join-Path $PSScriptRoot 'installer\README.txt')).Replace('@VERSION@', $version) | Set-Content -LiteralPath (Join-Path $stage 'README.txt') -NoNewline

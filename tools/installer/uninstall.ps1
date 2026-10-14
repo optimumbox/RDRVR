@@ -56,8 +56,13 @@ $m = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 Say "Removing RDRVR $($m.version) from $GameDir"
 foreach ($f in @($m.files)) {
     $p = Join-Path $GameDir $f.file
-    if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force; Say "  removed $($f.file)" }
+    if (Test-Path -LiteralPath $p) {
+        Remove-Item -LiteralPath $p -Force
+        if ($f.file -notlike 'RDRVR_shaders\*') { Say "  removed $($f.file)" }
+    }
 }
+$sd = Join-Path $GameDir 'RDRVR_shaders'  # (the single-pass stereo's shaders: the folder once empty)
+if ((Test-Path -LiteralPath $sd) -and -not @(Get-ChildItem -LiteralPath $sd -Force).Count) { Remove-Item -LiteralPath $sd -Force; Say '  removed RDRVR_shaders' }
 foreach ($f in $Runtime) {
     $p = Join-Path $GameDir $f
     if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force; Say "  removed $f" }
