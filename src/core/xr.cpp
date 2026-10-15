@@ -41,6 +41,7 @@
 #include "core/menu.h"
 #include "core/xinput.h"
 #include "core/wheel.h"
+#include "core/scope.h"
 #include "core/zone_rings.h"
 
 namespace rdrvr::xr {
@@ -358,6 +359,7 @@ std::atomic<uint32_t> g_rect_w{0}, g_rect_h{0};  // the last layer's imageRect
 std::atomic<ID3D12Resource*> g_target[2]{};
 uint64_t g_target_rtv[2][8];
 int g_target_nrtv[2] = {};
+DXGI_FORMAT g_eye_fmt = DXGI_FORMAT_UNKNOWN;  // the eye swapchains' (the colour blit's): the scope's lens copies from them
 DXGI_FORMAT g_target_fmt = DXGI_FORMAT_UNKNOWN;  // the post output's (both targets'), checked before each copy
 bool g_blit = false;                     // eye images through the colour blit (sRGB swapchains), else raw copies
 bool g_raw_refused = false;              // raw copies of a frame larger than the runtime's largest image: no submission
@@ -726,6 +728,7 @@ bool make_swapchains() {
             xr_blit::init(state::device.load(), static_cast<uint32_t>(d.Width), d.Height, d.Format, want)) {
             fmt = want;
             g_blit = true;
+            g_eye_fmt = want;
             xr_blit::set_dst_size(sw, sh);
         } else {
             log::error("[xr] colour blit unavailable: raw copies (colours wrong)");
@@ -1231,6 +1234,9 @@ void end_open_frame() {
     }
     g_rect_w.store(iw, std::memory_order_relaxed);
     g_rect_h.store(ih, std::memory_order_relaxed);
+    // [Scope]: the lens copied from an eye image while it is still acquired (after the blit, on its queue)
+    const bool lens = g_blit && q && g_filled.load() == 3 && g_eyes_acquired && !g_cinema.load() &&
+                      scope::prepare(g_frame_views, g_session, q, acquired, iw, ih, g_eye_fmt);
     XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     if (g_eyes_acquired)
         for (auto& c : g_chain) xrReleaseSwapchainImage(c.sc, &ri);
@@ -1250,7 +1256,8 @@ void end_open_frame() {
     XrCompositionLayerQuad ui_quad{XR_TYPE_COMPOSITION_LAYER_QUAD}, menu_quad{XR_TYPE_COMPOSITION_LAYER_QUAD},
         wrist_quad{XR_TYPE_COMPOSITION_LAYER_QUAD}, wheel_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     XrCompositionLayerQuad ring_quads[holster::kMaxMarkers];
-    XrCompositionLayerQuad reticle_quad{XR_TYPE_COMPOSITION_LAYER_QUAD}, reticle2_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    XrCompositionLayerQuad reticle_quad{XR_TYPE_COMPOSITION_LAYER_QUAD}, reticle2_quad{XR_TYPE_COMPOSITION_LAYER_QUAD},
+        lens_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     constexpr uint32_t kLayerArray = 16;
     const XrCompositionLayerBaseHeader* layers[kLayerArray] = {reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer)};
     uint32_t nlayers = 1;
@@ -1262,7 +1269,7 @@ void end_open_frame() {
     if (full && !cinema_on) {
         const uint32_t cap = g_max_layers.load(std::memory_order_relaxed) < kLayerArray ? g_max_layers.load(std::memory_order_relaxed) : kLayerArray;
         const int room = static_cast<int>(cap) - static_cast<int>(nlayers) - (wheel::wheel_mode() ? 4 : 3);
-        const int keep = dual::state().on ? 2 : 1;  // run 10 item 8: a second reticle only while dual wielding
+        const int keep = (dual::state().on ? 2 : 1) + (lens ? 1 : 0);  // run 10 item 8: a second reticle only while dual wielding; the scope's lens
         const int nr = zone_rings::frame(g_frame_views, g_session, g_space, ring_quads,
                                          room - keep < holster::kMaxMarkers ? room - keep : holster::kMaxMarkers);  // kept for the reticles
         for (int i = 0; i < nr; ++i) layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&ring_quads[i]);
@@ -1270,6 +1277,8 @@ void end_open_frame() {
             layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&reticle_quad);
         if (room - nr >= 2 && zone_rings::reticle_frame(g_frame_views, g_session, g_space, &reticle2_quad, 1))  // run 10 item 8: dual wield
             layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&reticle2_quad);
+        if (lens && static_cast<int>(nlayers) - 1 < room && scope::layer(g_space, &lens_quad))  // over the reticle
+            layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&lens_quad);
     }
     const bool wheel_q = full && !cinema_on && fill_wheel(wheel_quad);  // first: the floating quad leaves its rect out
     bool ui = full && !cinema_on && fill_ui(ui_quad);

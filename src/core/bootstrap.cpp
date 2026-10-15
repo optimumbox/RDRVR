@@ -54,6 +54,7 @@
 #include "core/wheel.h"
 #include "core/whistle.h"
 #include "core/xr.h"
+#include "core/scope.h"
 #include "core/zone_rings.h"
 #include "core/round_draw.h"
 #include "core/render_res.h"
@@ -166,6 +167,7 @@ DWORD WINAPI bootstrap_thread(void*) {
     physics::init();
     menu::init();  // before the XR frame end, which reads the cinema switch
     zone_rings::init();
+    scope::init();
     round_draw::init();  // the second copy tap (frame_grab::init sets the first)
     xr::init();
     diag::start_watchdog();

@@ -62,6 +62,7 @@
 #include "core/round_draw.h"
 #include "core/held_prop.h"
 #include "core/render_res.h"
+#include "core/scope.h"
 #include "core/zone_rings.h"
 
 namespace rdrvr::test_channel {
@@ -561,6 +562,11 @@ std::string execute(const std::vector<std::string>& t) {
         std::string line;
         for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
         return gestures::gun_melee_command(line);
+    }
+    if (c == "scope") {  // scope [on|off] [zoom x] [size m] [offset x y z] [eye auto|left|right] [all on|off]: the scoped rifles' lens (the session)
+        std::string line;
+        for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
+        return scope::command(line);
     }
     if (c == "rings") {  // the holster rings' layers; rings atlas <path.bmp>: the atlas (the rings, the dots, the reticles)
         if (t.size() >= 3 && t[1] == "atlas") {

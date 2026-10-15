@@ -74,6 +74,7 @@ add_library(rdrvr_core SHARED
     src/core/body.cpp
     src/core/holster.cpp
     src/core/zone_rings.cpp
+    src/core/scope.cpp
     src/core/round_draw.cpp
     src/core/held_prop.cpp
     src/core/aim.cpp
