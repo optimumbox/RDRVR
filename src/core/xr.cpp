@@ -1305,6 +1305,7 @@ void end_open_frame() {
     ei.layerCount = cinema ? nquad : (full ? nlayers : 0);
     ei.layers = cinema ? quad_layers : layers;
     if (cinema) g_cinema_frames.fetch_add(1, std::memory_order_relaxed);
+    if (!cinema && full) controllers::submit_probe(g_space, ei.displayTime);  // [handlag]: how late the drawn hands are
     const double e0 = frame_probe::on() ? log::now_ms() : 0;
     XrResult r = xrEndFrame(g_session, &ei);
     if (e0 > 0) frame_probe::add(frame_probe::kXrEndCall, log::now_ms() - e0);
