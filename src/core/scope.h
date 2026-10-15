@@ -4,7 +4,8 @@
 // at is copied into the lens image and shown as a quad at the scope's eyepiece, the patch's angle `Zoom` times smaller
 // than the lens's. The source eye is the one farther from the barrel's line: the rifle's own scope model covers the
 // target in the sighting eye's image, not in the other's (its parallax at the eyepiece is ~10 degrees). The lens is
-// framed by a mask quad over it (filled once): black round it and a crosshair. The presenting thread.
+// framed by a mask quad over it (filled once): black round it and a crosshair. It lies parallel to the source eye's
+// image (upright as that eye saw it) and shows only with the rifle at the face ([Scope] RaiseDistance, RaiseAngle). The presenting thread.
 
 #include <d3d12.h>
 
@@ -30,7 +31,7 @@ bool prepare(const XrView* views, XrSession session, ID3D12CommandQueue* queue, 
              DXGI_FORMAT fmt);
 // This frame's lens quads (after a true prepare): the lens and its mask (black round it, the crosshair). Returns 2, or 0.
 int layers(XrSpace space, XrCompositionLayerQuad out[2]);
-// scope [on|off] [zoom x] [size m] [offset x y z] [eye auto|left|right] [all on|off]: the session's settings; no args: status
+// scope [on|off] [zoom x] [size m] [offset x y z] [raise m deg] [eye auto|left|right] [all on|off]: the session's settings; no args: status
 std::string command(const std::string& line);
 
 }  // namespace rdrvr::scope

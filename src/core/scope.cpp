@@ -32,6 +32,10 @@ std::mutex g_mutex;  // the settings: the commands write, the presenting thread 
 bool g_on = true, g_all = false;  // g_all: every long gun, not only the scoped ones (tests)
 float g_zoom = 4.0f, g_size = 0.045f, g_off[3] = {0.0f, 0.07f, -0.10f};
 int g_eye = -1;  // -1 automatic (the eye off the barrel's line), 0 left, 1 right
+// [Scope] RaiseDistance / RaiseAngle: the lens only with the rifle at the face: the eyepiece within this of the sighting
+// eye and the barrel within this angle of the eye's view (degrees); off again 4 cm / 10 degrees past them
+float g_raise_dist = 0.15f, g_raise_deg = 25.0f;
+std::atomic<bool> g_raised{false};  // the presenting thread's (the hysteresis)
 bool g_weapon[64] = {};
 
 XrSwapchain g_sc = XR_NULL_HANDLE;
@@ -53,7 +57,7 @@ XrPosef g_pose{};
 uint32_t g_patch = 0;
 std::atomic<uint64_t> g_frames{0}, g_busy{0}, g_off_image{0};
 std::atomic<int> g_last_eye{-1}, g_last_patch{0};
-std::atomic<float> g_last_dist{0.0f};
+std::atomic<float> g_last_dist{0.0f}, g_last_near{0.0f}, g_last_ang{0.0f};
 
 // The mask's texel at (u, v), both -kMaskScale/2..kMaskScale/2 in lens diameters from the centre (premultiplied black):
 // clear inside the lens but for the crosshair (a thin cross, thick posts from the edge), a soft dark rim, black out past
@@ -215,13 +219,6 @@ bool ensure(XrSession session, DXGI_FORMAT fmt) {
     return true;
 }
 
-// The shortest turn from +z (a quad's front) onto n.
-XrQuaternionf facing(const float n[3]) {
-    const float w = 1.0f + n[2];
-    if (w < 1e-4f) return {0, 1, 0, 0};
-    const float l = std::sqrt(n[0] * n[0] + n[1] * n[1] + w * w);
-    return {-n[1] / l, n[0] / l, 0.0f, w / l};
-}
 // v rotated by the inverse of q
 void unrotate(const XrQuaternionf& q, const float v[3], float o[3]) {
     const float x = -q.x, y = -q.y, z = -q.z, w = q.w;
@@ -276,14 +273,16 @@ void init() {
             if (_stricmp(t, tok.c_str()) == 0) g_weapon[w] = true;
         }
     }
-    log::info("[scope] %s, zoom %.1f, lens %.3f m at (%.3f %.3f %.3f) in the gun's axes", g_on ? "on" : "off", g_zoom, g_size, g_off[0], g_off[1],
-              g_off[2]);
+    g_raise_dist = std::clamp(config::get_float("Scope", "RaiseDistance", 0.15f), 0.02f, 1.0f);
+    g_raise_deg = std::clamp(config::get_float("Scope", "RaiseAngle", 25.0f), 1.0f, 90.0f);
+    log::info("[scope] %s, zoom %.1f, lens %.3f m at (%.3f %.3f %.3f) in the gun's axes; at the face within %.2f m and %.0f deg", g_on ? "on" : "off",
+              g_zoom, g_size, g_off[0], g_off[1], g_off[2], g_raise_dist, g_raise_deg);
 }
 
 bool prepare(const XrView* views, XrSession session, ID3D12CommandQueue* queue, ID3D12Resource* const eyes[2], uint32_t iw, uint32_t ih,
              DXGI_FORMAT fmt) {
     g_have = false;
-    float zoom, size, off[3];
+    float zoom, size, off[3], raise_dist, raise_deg;
     int force_eye;
     {
         std::lock_guard lock(g_mutex);
@@ -294,7 +293,15 @@ bool prepare(const XrView* views, XrSession session, ID3D12CommandQueue* queue, 
         size = g_size;
         std::memcpy(off, g_off, sizeof(off));
         force_eye = g_eye;
+        raise_dist = g_raise_dist;
+        raise_deg = g_raise_deg;
     }
+    struct Unraise {  // every return before the lens is made leaves it lowered, but the raised one below
+        bool keep = false;
+        ~Unraise() {
+            if (!keep) g_raised = false;
+        }
+    } unraise;
     if (!queue || !eyes[0] || !eyes[1] || !camera_lever::eyes_follow_head()) return false;
     body::BodyPoints bp;
     if (!body::body_points(&bp) || !bp.cam_ok || !bp.gun_frame_ok) return false;
@@ -316,6 +323,25 @@ bool prepare(const XrView* views, XrSession session, ID3D12CommandQueue* queue, 
     float ep[2][3];
     for (int e = 0; e < 2; ++e) ep[e][0] = views[e].pose.position.x, ep[e][1] = views[e].pose.position.y, ep[e][2] = views[e].pose.position.z;
     const int src = force_eye >= 0 ? force_eye : (dist_to_line(ep[0], l, dir) > dist_to_line(ep[1], l, dir) ? 0 : 1);
+    // at the face: the sighting eye (the other) near the eyepiece, looking along the barrel
+    {
+        const int se = 1 - src;
+        const float dx = ep[se][0] - l[0], dy = ep[se][1] - l[1], dz = ep[se][2] - l[2];
+        const float near_m = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const float fwd_in[3] = {0, 0, -1};
+        float fwd[3];
+        const XrQuaternionf& o = views[se].pose.orientation;
+        const XrQuaternionf inv{-o.x, -o.y, -o.z, o.w};
+        unrotate(inv, fwd_in, fwd);  // the inverse of the inverse: the eye's forward in LOCAL
+        const float cosang = std::clamp(fwd[0] * dir[0] + fwd[1] * dir[1] + fwd[2] * dir[2], -1.0f, 1.0f);
+        const float ang = std::acos(cosang) * 57.29578f;
+        const bool raised = g_raised ? near_m < raise_dist + 0.04f && ang < raise_deg + 10.0f : near_m < raise_dist && ang < raise_deg;
+        g_last_near.store(near_m, std::memory_order_relaxed);
+        g_last_ang.store(ang, std::memory_order_relaxed);
+        if (!raised) return false;
+        g_raised = true;
+        unraise.keep = true;
+    }
     const float mid[3] = {0.5f * (ep[0][0] + ep[1][0]), 0.5f * (ep[0][1] + ep[1][1]), 0.5f * (ep[0][2] + ep[1][2])};
     float to_eye[3] = {mid[0] - l[0], mid[1] - l[1], mid[2] - l[2]};
     const float de = std::sqrt(to_eye[0] * to_eye[0] + to_eye[1] * to_eye[1] + to_eye[2] * to_eye[2]);
@@ -384,7 +410,7 @@ bool prepare(const XrView* views, XrSession session, ID3D12CommandQueue* queue, 
         ok = XR_SUCCEEDED(xrReleaseSwapchainImage(g_sc, &ri)) && ok;
     }
     if (!ok) return false;
-    g_pose.orientation = facing(to_eye);
+    g_pose.orientation = v.pose.orientation;  // parallel to the source eye's image: the patch as upright as it saw it
     g_pose.position = {l[0], l[1], l[2]};
     g_patch = S;
     g_have = true;
@@ -392,6 +418,7 @@ bool prepare(const XrView* views, XrSession session, ID3D12CommandQueue* queue, 
     g_last_eye.store(src, std::memory_order_relaxed);
     g_last_patch.store(static_cast<int>(S), std::memory_order_relaxed);
     g_last_dist.store(tl, std::memory_order_relaxed);
+    unraise.keep = true;
     return true;
 }
 
@@ -430,22 +457,24 @@ std::string command(const std::string& line) {
         else if (w == "zoom") in >> g_zoom, g_zoom = std::clamp(g_zoom, 1.0f, 20.0f);
         else if (w == "size") in >> g_size, g_size = std::clamp(g_size, 0.01f, 0.2f);
         else if (w == "offset") in >> g_off[0] >> g_off[1] >> g_off[2];
+        else if (w == "raise") in >> g_raise_dist >> g_raise_deg;
         else if (w == "all") {
             in >> w;
             g_all = w == "on";
         } else if (w == "eye") {
             in >> w;
             g_eye = w == "left" ? 0 : w == "right" ? 1 : -1;
-        } else return "ERROR scope [on|off] [zoom x] [size m] [offset x y z] [eye auto|left|right] [all on|off]";
+        } else return "ERROR scope [on|off] [zoom x] [size m] [offset x y z] [raise m deg] [eye auto|left|right] [all on|off]";
     }
-    char b[400];
+    char b[600];
     std::snprintf(b, sizeof(b),
                   "scope %s%s, zoom %.1f, lens %.3f m at (%.3f %.3f %.3f), eye %s | gun in hand %d (%s) | lens frames %llu, busy %llu, off image %llu; "
-                  "last: eye %d, patch %d px, target %.1f m",
+                  "last: eye %d, patch %d px, target %.1f m | at the face within %.2f m %.0f deg: now %.2f m %.0f deg (%s)",
                   g_on ? "on" : "off", g_all ? " (all long guns)" : "", g_zoom, g_size, g_off[0], g_off[1], g_off[2],
                   g_eye < 0 ? "auto" : g_eye == 0 ? "left" : "right", holster::gun_in_hand(), holster::weapon_token(holster::gun_in_hand()),
                   static_cast<unsigned long long>(g_frames.load()), static_cast<unsigned long long>(g_busy.load()),
-                  static_cast<unsigned long long>(g_off_image.load()), g_last_eye.load(), g_last_patch.load(), g_last_dist.load());
+                  static_cast<unsigned long long>(g_off_image.load()), g_last_eye.load(), g_last_patch.load(), g_last_dist.load(), g_raise_dist, g_raise_deg, g_last_near.load(),
+                  g_last_ang.load(), g_raised ? "raised" : "lowered");
     return b;
 }
 
