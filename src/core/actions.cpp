@@ -118,6 +118,7 @@ std::atomic<bool> g_lever_parts{false};
 // [Reload] LeverSteady: a lever gun held two-handed is carried by the front hand while its lever is worked (body.cpp);
 // g_lever_pend: a shot not cycled (or the lever open), with when it was last set (the frame-end listener)
 std::atomic<bool> g_lever_steady{true}, g_lever_pend{false};
+std::atomic<double> g_steady_hold_ms{500.0};  // [Reload] SteadyHoldMs: the gun kept steady this long after its action is worked
 std::atomic<double> g_lever_pend_ms{0.0};
 // [Reload] RifleSteady (2026-10-15, the user: "the left hand can still stabilize the gun while the right hand performs
 // the reload without the weapon moving"): the bolt guns and the hand-worked breeches held two-handed, their action to be
@@ -1133,6 +1134,7 @@ void init() {
     g_open_cyl = config::get_bool("Reload", "OpenCylinder", false);
     g_lever_parts = config::get_bool("Reload", "LeverParts", false);
     g_lever_steady = config::get_bool("Reload", "LeverSteady", true);
+    g_steady_hold_ms = std::fmin(std::fmax(config::get_float("Reload", "SteadyHoldMs", 500.0f), 0.0f), 3000.0f);
     g_rifle_steady = config::get_bool("Reload", "RifleSteady", false);
     g_pump_parts = config::get_bool("Reload", "PumpParts", false);
     g_bolt_parts = config::get_bool("Reload", "BoltParts", false);
@@ -1355,6 +1357,7 @@ float pump_drawn() {
     return g_pump_amt.load(std::memory_order_relaxed);
 }
 bool lever_steady() { return g_lever_steady.load(std::memory_order_relaxed); }
+double steady_hold_ms() { return g_steady_hold_ms.load(std::memory_order_relaxed); }
 bool rifle_pending() {
     return g_on.load(std::memory_order_relaxed) && g_rifle_pend.load(std::memory_order_relaxed) &&
            log::now_ms() - g_rifle_pend_ms.load(std::memory_order_relaxed) < 200.0;

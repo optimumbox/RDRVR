@@ -7733,8 +7733,13 @@ void before_scene(const float* cam) {
         std::memcpy(f.free_r, f.ik_r[gj], sizeof(f.free_r));
         f.steady = false;
         // [Reload] RifleSteady (2026-10-15): a bolt gun or a hand-worked breech with its action to be worked, the same
-        const bool want = f.ik[0] && f.ik[1] && ((actions::lever_steady() && actions::lever_pending()) || actions::rifle_pending()) &&
-                          holster::two_hand_blend() > 0.5f;
+        // held on for [Reload] SteadyHoldMs after the action is worked (the user: "stable in the left hand the whole time and
+        // for maybe half a second after the gun is charged"): the flick that closes it is not followed by the gun
+        static double want_ms = -1e9;
+        const bool held = f.ik[0] && f.ik[1] && holster::two_hand_blend() > 0.5f;
+        const bool act = (actions::lever_steady() && actions::lever_pending()) || actions::rifle_pending();
+        if (held && act) want_ms = log::now_ms();
+        const bool want = held && (act || (locked && log::now_ms() - want_ms < actions::steady_hold_ms()));
         auto to_q = [](const float* m, float* q) {  // row-major rotation -> x y z w
             const float tr = m[0] + m[4] + m[8];
             if (tr > 0.0f) {

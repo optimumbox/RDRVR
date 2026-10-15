@@ -87,6 +87,8 @@ bool lever_drawn(int* weapon, float* lever, float* hammer);
 bool lever_pending();
 // [Reload] LeverSteady: held two-handed, the gun stays in the front hand while the gun hand works the lever
 bool lever_steady();
+// [Reload] SteadyHoldMs (default 500): the gun stays steady in the front hand this long after its action is worked
+double steady_hold_ms();
 // [Reload] RifleSteady: a bolt gun or a hand-worked breech (the Springfield, the Rolling Block) held two-handed with its
 // action to be worked (a shot, the bolt back, the breech open): the gun stays in the front hand and the gun hand's
 // controller works the part and brings the round from the chest. Any thread.
