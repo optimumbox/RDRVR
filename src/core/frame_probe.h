@@ -33,6 +33,16 @@ enum Slot {
     kPresent,     // the game's Present
     // the main thread
     kMainWait,    // PreRender's wait on +0x18 for the render thread's frame
+    // kPre's steps (2026-10-15: a player's runs held kPre at 55-85 ms a frame, whole sessions long)
+    kPreHands,    // xr::latch_hands
+    kPreBody,     // body::before_scene
+    kPreTaa,      // taa::frame_start
+    kPreLatch,    // xr::late_latch
+    kPreBegin,    // dual_pass::begin_frame (with the union viewport)
+    kPreVi,       // prepass::latch_vi
+    // not a time: 1 for each view-instanced frame whose second scene was recorded whole (a twin still being made, or a
+    // shader without one: vi::untwinned_recent), so its mean is the share of such frames
+    kEye2Whole,
     kSlotCount
 };
 enum Thread { kMain, kRender, kPlayback, kThreadCount };

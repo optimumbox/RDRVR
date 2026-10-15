@@ -453,9 +453,19 @@ void hk_SceneRender(void* renderer, void* vp, const float* cam_game, void* a4) {
         g_scene_near = f32(vp, 0x340);
         g_scene_far = f32(vp, 0x344);
     }
+    double tp = probe ? log::now_ms() : 0;  // (kPre's steps)
+    auto step = [&](frame_probe::Slot s) {
+        if (!probe) return;
+        const double t = log::now_ms();
+        frame_probe::add(s, t - tp);
+        tp = t;
+    };
     if (g_xr_pose.load(std::memory_order_relaxed)) xr::latch_hands();  // the hands' poses for the IK, as late as the head's
+    step(frame_probe::kPreHands);
     body::before_scene(cam);
+    step(frame_probe::kPreBody);
     taa::frame_start();
+    step(frame_probe::kPreTaa);
     g_scene_vp = g_double.load(std::memory_order_relaxed) && g_xr_pose.load(std::memory_order_relaxed) ? vp : nullptr;
     if (cam) {
         std::memcpy(g_game_cam, cam, sizeof(g_game_cam));
@@ -463,11 +473,14 @@ void hk_SceneRender(void* renderer, void* vp, const float* cam_game, void* a4) {
     }
     if (g_double.load(std::memory_order_relaxed) && vp) {
         if (g_xr_pose.load(std::memory_order_relaxed)) xr::late_latch();
+        step(frame_probe::kPreLatch);
         int first = g_swap.load(std::memory_order_relaxed) ? 1 : 0;
         std::memcpy(g_saved_vp, vp, kViewportSize);
         g_union_ok = dual_pass::shadows_wanted() && g_xr_pose.load(std::memory_order_relaxed) && build_union_vp(vp, cam);
         dual_pass::begin_frame(renderer);
+        step(frame_probe::kPreBegin);
         t_vi_frame = prepass::latch_vi();
+        step(frame_probe::kPreVi);
         if (t_vi_frame && g_push_log.load() == 1) {
             g_push_scene_vp = vp;
             g_push_log = 2;
@@ -646,6 +659,9 @@ void scene_once(void* renderer, void* vp, const float* cam_in, void* a4, int pas
             t_scene_vp = outer;
             return;
         }
+        if (t_vi_frame && second && g_vi_skip2.load(std::memory_order_relaxed) && recorder_skip::installed() && vi::untwinned_recent() &&
+            frame_probe::on())
+            frame_probe::add(frame_probe::kEye2Whole, 1.0);  // (the probe line's "eye 2 recorded whole")
         if (t_vi_frame && second && g_vi_skip2.load(std::memory_order_relaxed) && recorder_skip::installed() && !vi::untwinned_recent()) {
             // [Stereo] ViSkipRecord: slice 0's region drew both eyes; this scene runs for its own bookkeeping (its targets'
             // clears and binds, its copies, the region's end) but records no draws and no draw state
