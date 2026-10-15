@@ -16,6 +16,7 @@
 #include "core/anchors.h"
 #include "core/api.h"
 #include "core/body.h"
+#include "core/camera_lever.h"
 #include "core/gestures.h"
 #include "core/gun_melee.h"
 #include "core/config.h"
@@ -29,6 +30,7 @@
 #include "core/pose.h"
 #include "core/reload.h"
 #include "core/xinput.h"
+#include "core/xr.h"
 
 namespace rdrvr::aim {
 namespace {
@@ -36,6 +38,7 @@ namespace {
 std::atomic<bool> g_barrel{true};  // [Hands] BarrelAim
 std::atomic<bool> g_fire{true};    // [Hands] FireInFirstPerson
 std::atomic<bool> g_reticle{false};      // [Hands] Reticle (off by default)
+std::atomic<bool> g_sight_log{true};     // [Aim] SightLog: a line per player shot against the sights (log_sight)
 std::atomic<float> g_reticle_deg{1.2f};  // [Hands] ReticleSize (degrees across)
 std::atomic<bool> g_reticle_dot{false};    // [Hands] ReticleStyle=dot: a dot only
 std::atomic<bool> g_ret_smooth{true};   // [Hands] ReticleSmooth (run 10 item 8)
@@ -348,7 +351,7 @@ void reticle_tick() {
             g_rp_lost.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    if (pending || !g_reticle.load(std::memory_order_relaxed) || !g_barrel.load(std::memory_order_relaxed)) return;
+    if (pending || !(g_reticle.load(std::memory_order_relaxed) || g_sight_log.load(std::memory_order_relaxed)) || !g_barrel.load(std::memory_order_relaxed)) return;
     RdrvrActorState st{};
     if (!api::actor_state(&st) || !st.valid || !reload::is_gun(st.weapon)) {
         g_rp_nogun.fetch_add(1, std::memory_order_relaxed);
@@ -554,6 +557,73 @@ using Spawn_t = void (*)(uintptr_t W, uintptr_t proj, int32_t count, const float
                          uint32_t seed, uint8_t turret);
 Spawn_t o_spawn = nullptr;
 
+// [Aim] SightLog (on for now: the iron-sight misses, a TODO): each player shot against the drawn gun and the eye. The
+// sight line is taken parallel to the drawn barrel through the sighting eye (the eye nearer the bore line): "seen" is
+// where the bullet is at the target's distance (the probe's, else 25 m) from that line, as the eye sees it. "drawn" is
+// the bullet against the drawn barrel now (a stale aim ray); "eye" the sighting eye from the bore (cm: right, up, back)
+void log_sight(const float start[3], const float d[3]) {
+    if (!g_sight_log.load(std::memory_order_relaxed)) return;
+    float m[3], g[3];
+    body::BodyPoints bp;
+    xr::EyeView ev[2];
+    if (!barrel_ray(m, g) || !body::body_points(&bp) || !bp.cam_ok || !xr::eye_views_peek(ev)) {
+        log::info("[aim] sight: no drawn gun, body points or eyes");
+        return;
+    }
+    const auto dot = [](const float* x, const float* y) { return x[0] * y[0] + x[1] * y[1] + x[2] * y[2]; };
+    // the gun's level axes: right = g x up, up' = right x g (world, y up)
+    float rt[3] = {-g[2], 0.0f, g[0]};
+    const float rl = std::sqrt(rt[0] * rt[0] + rt[2] * rt[2]);
+    if (rl < 1e-3f) return;
+    rt[0] /= rl, rt[2] /= rl;
+    const float up[3] = {rt[1] * g[2] - rt[2] * g[1], rt[2] * g[0] - rt[0] * g[2], rt[0] * g[1] - rt[1] * g[0]};
+    const float deg = 57.29578f;
+    const float dg = dot(d, g);
+    const float drawn_r = std::atan2(dot(d, rt), dg) * deg, drawn_u = std::atan2(dot(d, up), dg) * deg;
+    // the eyes in the world: LOCAL to world by the inverse of world_to_local (the frame is rigid): three points' images
+    float o[3] = {0, 0, 0}, ex[3] = {1, 0, 0}, ey[3] = {0, 1, 0}, ez[3] = {0, 0, 1}, lo[3], lx[3], ly[3], lz[3];
+    if (!camera_lever::world_to_local(bp.cam, o, lo) || !camera_lever::world_to_local(bp.cam, ex, lx) ||
+        !camera_lever::world_to_local(bp.cam, ey, ly) || !camera_lever::world_to_local(bp.cam, ez, lz)) {
+        log::info("[aim] sight: no LOCAL frame");
+        return;
+    }
+    float M[9];  // columns: world x, y, z in LOCAL; the inverse is its transpose (scaled by the world scale's square)
+    for (int k = 0; k < 3; ++k) M[k * 3] = lx[k] - lo[k], M[k * 3 + 1] = ly[k] - lo[k], M[k * 3 + 2] = lz[k] - lo[k];
+    float eye[2][3], bore[2] = {};
+    for (int e = 0; e < 2; ++e) {
+        float v[3];
+        for (int k = 0; k < 3; ++k) v[k] = ev[e].position[k] - lo[k];
+        float n2 = 0.0f;
+        for (int k = 0; k < 3; ++k) n2 += M[k * 3] * M[k * 3];
+        for (int c = 0; c < 3; ++c) eye[e][c] = (M[c] * v[0] + M[3 + c] * v[1] + M[6 + c] * v[2]) / n2;
+        float w[3];
+        for (int k = 0; k < 3; ++k) w[k] = eye[e][k] - m[k];
+        const float t = dot(w, g);
+        float pq = 0.0f;
+        for (int k = 0; k < 3; ++k) pq += (w[k] - g[k] * t) * (w[k] - g[k] * t);
+        bore[e] = std::sqrt(pq);
+    }
+    const int se = bore[0] <= bore[1] ? 0 : 1;
+    float w[3];
+    for (int k = 0; k < 3; ++k) w[k] = eye[se][k] - m[k];
+    // the target's distance: the probe's when fresh (the reticle on), else 25 m
+    float dist = 25.0f;
+    bool probe = false;
+    {
+        std::lock_guard lock(g_rp_mutex);
+        if (log::now_ms() - g_rp.ms < 250.0 && g_rp.hit) dist = g_rp.dist, probe = true;
+    }
+    float to[3];
+    for (int k = 0; k < 3; ++k) to[k] = start[k] + d[k] * dist - eye[se][k];
+    const float tg = dot(to, g);
+    const float seen_r = std::atan2(dot(to, rt), tg) * deg, seen_u = std::atan2(dot(to, up), tg) * deg;
+    log::info("[aim] sight: seen %+.2f right %+.2f up deg (%+.0f %+.0f cm at %.1f m%s) | drawn %+.2f %+.2f deg | eye %d at %+.1f %+.1f %+.1f "
+              "cm (the other %.1f cm off the bore) | two-hand %.2f%s, aim ray %.0f ms, points %.0f ms old",
+              seen_r, seen_u, std::tan(seen_r / deg) * dist * 100.0f, std::tan(seen_u / deg) * dist * 100.0f, dist, probe ? ", the probe's" : "",
+              drawn_r, drawn_u, se, dot(w, rt) * 100.0f, dot(w, up) * 100.0f, -dot(w, g) * 100.0f, bore[1 - se] * 100.0f, holster::two_hand_blend(),
+              bp.steady ? " steady" : "", log::now_ms() - g_last_override_ms.load(std::memory_order_relaxed), log::now_ms() - bp.ms);
+}
+
 std::atomic<double> g_mounted_shot_ms{-1e12};  // the player's last mounted gun shot (mounted_gun_fired)
 void hk_spawn(uintptr_t W, uintptr_t proj, int32_t count, const float* pellets, float speed, uint32_t u6, uint8_t no_bloom, uint32_t seed,
               uint8_t turret) {
@@ -693,6 +763,7 @@ void hk_spawn(uintptr_t W, uintptr_t proj, int32_t count, const float* pellets, 
                   t_first_start[0], t_first_start[1], t_first_start[2], t_first_dir[0], t_first_dir[1], t_first_dir[2], t_first_speed,
                   t_first_fresh ? "on" : "off", t_first_err, extra, wtype, sigma * 57.29578f, off[0], off[1], pa ? 1 : 0, block_fixed ? 1 : 0,
                   aligned_deg, vel_zeroed ? dropped : 0.0f, straight ? 0 : 1);
+        if (!second) log_sight(t_first_start, t_first_dir);
     }
 }
 
@@ -768,6 +839,7 @@ void init() {
     g_perfect = config::get_bool("Aim", "PerfectAccuracy", true);
     g_pattern = config::get_bool("Aim", "ShotgunPattern", true);
     g_reticle = config::get_bool("Hands", "Reticle", false);
+    g_sight_log = config::get_bool("Aim", "SightLog", true);
     g_ret_smooth = config::get_bool("Hands", "ReticleSmooth", true);  // run 10 item 8
     g_reticle_dot = config::get_string("Hands", "ReticleStyle", "ring") == "dot";
     {
