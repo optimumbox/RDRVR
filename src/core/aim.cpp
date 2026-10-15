@@ -655,10 +655,10 @@ void log_sight(const float start[3], const float d[3]) {
         if (off_cm > 20.0f) std::snprintf(hit, sizeof(hit), " | no target actor: OFF THE SIGHTS by %.0f cm at %.1f m", off_cm, dist);
     }
     log::info("[aim] sight%s: seen %+.2f right %+.2f up deg (%+.0f %+.0f cm at %.1f m%s) | drawn %+.2f %+.2f deg | eye %d at %+.1f %+.1f %+.1f "
-              "cm (the other %.1f cm off the bore) | two-hand %.2f, aim ray %.0f ms, points %.0f ms old%s",
+              "cm (the other %.1f cm off the bore) | two-hand %.2f%s, aim ray %.0f ms, points %.0f ms old%s",
               sighted ? " (sighted)" : "", seen_r, seen_u, std::tan(seen_r / deg) * dist * 100.0f, std::tan(seen_u / deg) * dist * 100.0f, dist, probe ? ", the probe's" : "",
               drawn_r, drawn_u, se, dot(w, rt) * 100.0f, dot(w, up) * 100.0f, -dot(w, g) * 100.0f, bore[1 - se] * 100.0f, holster::two_hand_blend(),
-              log::now_ms() - g_last_override_ms.load(std::memory_order_relaxed), log::now_ms() - bp.ms, hit);
+              bp.steady ? " steady" : "", log::now_ms() - g_last_override_ms.load(std::memory_order_relaxed), log::now_ms() - bp.ms, hit);
 }
 
 std::atomic<double> g_mounted_shot_ms{-1e12};  // the player's last mounted gun shot (mounted_gun_fired)

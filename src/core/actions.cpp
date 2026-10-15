@@ -119,6 +119,12 @@ std::atomic<bool> g_lever_parts{false};
 // g_lever_pend: a shot not cycled (or the lever open), with when it was last set (the frame-end listener)
 std::atomic<bool> g_lever_steady{true}, g_lever_pend{false};
 std::atomic<double> g_lever_pend_ms{0.0};
+// [Reload] RifleSteady (2026-10-15, the user: "the left hand can still stabilize the gun while the right hand performs
+// the reload without the weapon moving"): the bolt guns and the hand-worked breeches held two-handed, their action to be
+// worked: the gun carried by the front hand (body.cpp, as LeverSteady), the gun hand's controller working the part and
+// bringing the round from the chest (holster.cpp); John's drawn gun hand stays on the grip (the gun is drawn from it)
+std::atomic<bool> g_rifle_steady{false}, g_rifle_pend{false};
+std::atomic<double> g_rifle_pend_ms{0.0};
 bool g_lever_open = false, g_hammer_down = false;
 std::atomic<float> g_lever_amt{0.0f}, g_hammer_amt{1.0f};
 std::atomic<int> g_lever_weapon{-1};
@@ -173,6 +179,7 @@ std::atomic<int> g_breech_weapon{-1};
 std::atomic<bool> g_breech_round{true};  // a live round chambered (holster.cpp's round in sets it)
 std::atomic<bool> g_breech_want[2] = {false, false};
 bool g_breech_open = false, g_breech_grip = false, g_breech_grip_was = false;
+int g_breech_ctrl = -1;  // the controller gripping the part
 double g_breech_ms = 0, g_breech_shut_ms = 0;
 int g_breech_flicks = 0;  // the Buffalo's down flick: consecutive two-frame steps past the speed
 float g_breech_s0 = 0.0f, g_breech_d = 1e9f, g_breech_zone[3] = {};
@@ -399,6 +406,7 @@ void frame() {
         g_bolt_slide.store(0.0f, std::memory_order_relaxed);
         g_breech_weapon.store(-1, std::memory_order_relaxed);
         g_breech_want[0] = g_breech_want[1] = false;
+        g_rifle_pend.store(false, std::memory_order_relaxed);
         g_semi_weapon.store(-1, std::memory_order_relaxed);
         g_semi_want[0] = g_semi_want[1] = false;
         g_barrel_want[0] = g_barrel_want[1] = false;
@@ -556,6 +564,22 @@ void frame() {
         if (ul > 1e-4f)
             for (float& x : up) x /= ul;
     }
+    // [Reload] RifleSteady: the controller working the parts (the gun hand's while the gun is steady in the front hand,
+    // else the off hand's) and its interaction spot (the gun hand's controller's own, not its carried wrist's)
+    const Breech* wbr = k == kBreech ? breech_of(w) : nullptr;
+    const bool rifle_kind = g_rifle_steady.load(std::memory_order_relaxed) && (k == kBolt || (wbr && wbr->gesture != 0));
+    const bool rifle_held = rifle_kind && pts && !deadeye && holster::two_hand_blend() > 0.5f && g_rifle_pend.load(std::memory_order_relaxed);
+    const int wk = rifle_held ? gun_h : off_h;
+    float wgb[3];
+    std::memcpy(wgb, ogb, sizeof(wgb));
+    if (rifle_held) {
+        body::BodyPoints fb = bp;
+        if (bp.free_ok) {
+            std::memcpy(fb.hand[gj], bp.free_hand, sizeof(fb.hand[gj]));
+            std::memcpy(fb.target_rot[gj], bp.free_rot, sizeof(fb.target_rot[gj]));
+        }
+        holster::grab_point(fb, gj, wgb);
+    }
     // bolt actions: the other hand grips at the bolt, pulls it back, then forward ([Reload] BoltParts: the handle turned
     // up by the hand's rise first and down again after; the bolt drawn where the hand has it)
     g_bolt_want[0] = g_bolt_want[1] = false;
@@ -566,23 +590,23 @@ void frame() {
         for (int i = 0; i < 3; ++i)
             g_bolt_zone[i] = bp.hand[gj][i] + rgt[i] * g_bolt_off[0] + up[i] * g_bolt_off[1] + u[i] * g_bolt_off[2] +
                              (bparts ? up[i] * blift * kBoltRise - u[i] * bslide * kBoltStroke : 0.0f);
-        const float* oh = ogb;
+        const float* oh = wgb;
         const float dx = oh[0] - g_bolt_zone[0], dy = oh[1] - g_bolt_zone[1], dz = oh[2] - g_bolt_zone[2];
         g_bolt_d = std::sqrt(dx * dx + dy * dy + dz * dz);
         const bool in = g_bolt_d < g_bolt_r;
-        const bool grip = hands::get(off_h).grip > 0.6f;
+        const bool grip = hands::get(wk).grip > 0.6f;
         // the travel along the gun's back axis (-u), from the gun hand: the gun's own motion does not count
         const float s = -((oh[0] - bp.hand[gj][0]) * u[0] + (oh[1] - bp.hand[gj][1]) * u[1] + (oh[2] - bp.hand[gj][2]) * u[2]);
         const float hgt = (oh[0] - bp.hand[gj][0]) * up[0] + (oh[1] - bp.hand[gj][1]) * up[1] + (oh[2] - bp.hand[gj][2]) * up[2];
-        g_bolt_want[off_h] = in || g_bolt_grip;
+        g_bolt_want[wk] = in || g_bolt_grip;
         if (grip && !g_grip_was && in) {
             g_bolt_grip = true;
-            g_bolt_ctrl = off_h;
+            g_bolt_ctrl = wk;
             // a bolt already back stays back (BoltParts: where it is drawn, its handle as turned)
             g_bolt_s0 = bparts ? s - bslide * kBoltStroke : g_bolt_back ? s - g_bolt_travel : s;
             g_bolt_h0 = hgt - blift * kBoltRise;
             g_ooo = false;
-            controllers::pulse(off_h, 0.35f, 30);
+            controllers::pulse(wk, 0.35f, 30);
             log::info("[actions] bolt (%d): gripped (%.3f m from its zone)%s", w, g_bolt_d, g_needs ? "" : ", the action already worked");
         }
         if (bparts && g_needs && !g_bolt_back && bslide >= 0.9f) g_bolt_back = true;  // loaded from empty with it back
@@ -597,12 +621,12 @@ void frame() {
                     g_bolt_s0 = s;  // the pull counted from here
                     g_bolt_s = 0.0f;
                     if (gs) play_at(gs->open, oh);
-                    controllers::pulse(off_h, 0.3f, 10);
+                    controllers::pulse(wk, 0.3f, 10);
                     log::info("[actions] bolt (%d): the handle up", w);
                 } else if (g_bolt_up && blift <= 0.05f) {
                     g_bolt_up = false;
                     if (gs) play_at(gs->close2, oh);
-                    controllers::pulse(off_h, 0.5f, 15);
+                    controllers::pulse(wk, 0.5f, 15);
                     if (g_bolt_cycled) {
                         g_bolt_cycled = false;
                         g_needs = false;
@@ -622,7 +646,7 @@ void frame() {
                     if (g_needs) {
                         g_bolt_back = true;
                         if (gs) play_at(gs->open2, oh);
-                        controllers::pulse(off_h, 0.5f, 15);
+                        controllers::pulse(wk, 0.5f, 15);
                         controllers::pulse(gun_h, 0.3f, 10);
                         log::info("[actions] bolt (%d): back %.3f m", w, g_bolt_s);
                     } else if (!g_ooo) {  // drawn back while chambered: nothing (counted once a stroke)
@@ -634,7 +658,7 @@ void frame() {
                     g_bolt_back = false;
                     g_bolt_cycled = true;
                     if (gs) play_at(gs->close, oh);
-                    controllers::pulse(off_h, 0.5f, 15);
+                    controllers::pulse(wk, 0.5f, 15);
                     log::info("[actions] bolt (%d): forward (the handle down chambers it)", w);
                 } else if (g_bolt_s <= 0.015f) {
                     g_ooo = false;
@@ -645,7 +669,7 @@ void frame() {
             if (!g_bolt_back && g_bolt_s >= g_bolt_travel) {
                 if (g_needs) {
                     g_bolt_back = true;
-                    controllers::pulse(off_h, 0.5f, 15);
+                    controllers::pulse(wk, 0.5f, 15);
                     controllers::pulse(gun_h, 0.3f, 10);
                     log::info("[actions] bolt (%d): back %.3f m", w, g_bolt_s);
                 } else if (!g_ooo) {  // pulled back while chambered: nothing (counted once a stroke)
@@ -657,7 +681,7 @@ void frame() {
                 g_bolt_back = false;
                 g_needs = false;
                 g_cycles.fetch_add(1, std::memory_order_relaxed);
-                controllers::pulse(off_h, 0.6f, 20);
+                controllers::pulse(wk, 0.6f, 20);
                 controllers::pulse(gun_h, 0.6f, 20);
                 log::info("[actions] bolt (%d): forward, chambered", w);
             }
@@ -666,7 +690,7 @@ void frame() {
         g_grip_was = grip;
     } else {
         g_bolt_grip = false;
-        g_grip_was = hands::get(off_h).grip > 0.6f;
+        g_grip_was = hands::get(wk).grip > 0.6f;
     }
     // [Reload] BoltParts: the drawn bolt (a hand away or not tracked: as it was left)
     g_bolt_lift.store(bparts ? blift : 0.0f, std::memory_order_relaxed);
@@ -695,19 +719,20 @@ void frame() {
             for (int i = 0; i < 3; ++i)
                 g_breech_zone[i] = bp.gun_frame_ok ? bp.gun_frame_o[i] + bp.gun_frame_R[i * 3] * hz[0] + bp.gun_frame_R[i * 3 + 1] * hz[1] + bp.gun_frame_R[i * 3 + 2] * hz[2]
                                                    : bp.hand[gj][i] + u[i] * (0.08f - hz[2]) + rgt[i] * hz[0] + up[i] * hz[1];
-            const float* oh = ogb;
+            const float* oh = wgb;
             const float dx = oh[0] - g_breech_zone[0], dy = oh[1] - g_breech_zone[1], dz = oh[2] - g_breech_zone[2];
             g_breech_d = std::sqrt(dx * dx + dy * dy + dz * dz);
             const bool in = g_breech_d < g_bolt_r;
-            const bool grip = hands::get(off_h).grip > 0.6f;
+            const bool grip = hands::get(wk).grip > 0.6f;
             // the hand's travel from the gun hand: back along the barrel (the Rolling Block's spur), or up (the trapdoor)
             float rel[3] = {oh[0] - bp.hand[gj][0], oh[1] - bp.hand[gj][1], oh[2] - bp.hand[gj][2]};
             const float s = brz->gesture == 1 ? -(rel[0] * u[0] + rel[1] * u[1] + rel[2] * u[2]) : rel[0] * up[0] + rel[1] * up[1] + rel[2] * up[2];
-            g_breech_want[off_h] = in || g_breech_grip;
+            g_breech_want[wk] = in || g_breech_grip;
             if (grip && !g_breech_grip_was && in) {
                 g_breech_grip = true;
+                g_breech_ctrl = wk;
                 g_breech_s0 = s - bdrawn * brz->travel;  // taken where it is drawn
-                controllers::pulse(off_h, 0.35f, 25);
+                controllers::pulse(wk, 0.35f, 25);
                 log::info("[actions] breech (%d): gripped (%.3f m from its zone, drawn %.2f)", w, g_breech_d, bdrawn);
             }
             if (g_breech_grip && grip) {
@@ -721,7 +746,7 @@ void frame() {
             g_breech_grip_was = grip;
         } else {  // the hands not tracked: the part let go where it is
             g_breech_grip = false;
-            g_breech_grip_was = hands::get(off_h).grip > 0.6f;
+            g_breech_grip_was = hands::get(wk).grip > 0.6f;
         }
         if (want_open != g_breech_open) {
             g_breech_open = want_open;
@@ -921,7 +946,7 @@ void frame() {
                 for (int j = 0; j < 3; ++j)
                     for (int i = 0; i < 3; ++i) pg[j] += bp.gun_frame_R[i * 3 + j] * (g_bolt_zone[i] - bp.gun_frame_o[i]);
                 held = true;
-            } else if (k == kBreech && g_breech_grip) {
+            } else if (k == kBreech && g_breech_grip && g_breech_ctrl == off_h) {  // (the gun hand's grip: not drawn on it)
                 std::memcpy(pg, g_breech_hz, sizeof(pg));
                 held = true;
             } else if (k == kSemi && g_semi_grip) {
@@ -994,7 +1019,8 @@ void frame() {
             wmax = std::fmax(wmax, std::sqrt(g_w[0] * g_w[0] + g_w[1] * g_w[1] + g_w[2] * g_w[2]));
             if (now - wait_ms >= 3000.0) {
                 log::info("[actions] lever (%d) waiting (%s): the gun hand's pitch rate %.1f down to %.1f up rad/s, any axis %.1f (needs %.1f), "
-                          "valid %d", w, g_lever_open ? "open" : "shut", lo, hi, wmax, g_lever_speed, gh.valid ? 1 : 0);
+                          "valid %d, the gun steady %d", w, g_lever_open ? "open" : "shut", lo, hi, wmax, g_lever_speed, gh.valid ? 1 : 0,
+                          pts && bp.steady ? 1 : 0);
                 wait_ms = now, lo = hi = wmax = 0.0f;
             }
         } else {
@@ -1003,6 +1029,15 @@ void frame() {
     }
     g_lever_pend.store(k == kLever && kind_on(k) && !deadeye && (g_needs || g_lever_open), std::memory_order_relaxed);
     g_lever_pend_ms.store(now, std::memory_order_relaxed);
+    {  // RifleSteady: a shot to work off, the bolt back (or not home), the breech open or empty, or the gun hand on the part
+        bool pend = false;
+        if (k == kBolt)
+            pend = g_needs || g_bolt_back || g_bolt_slide.load(std::memory_order_relaxed) > 0.0f || (g_bolt_grip && g_bolt_ctrl == gun_h);
+        else if (k == kBreech)
+            pend = g_needs || g_breech_open || !g_breech_round.load(std::memory_order_relaxed) || (g_breech_grip && g_breech_ctrl == gun_h);
+        g_rifle_pend.store(rifle_kind && !deadeye && pend, std::memory_order_relaxed);
+        g_rifle_pend_ms.store(now, std::memory_order_relaxed);
+    }
     {  // the lever and hammer as drawn: the lever over 80 ms either way, the hammer with it
         static double last = 0;
         const float step = last > 0 ? static_cast<float>((now - last) / 80.0) : 1.0f;
@@ -1098,6 +1133,7 @@ void init() {
     g_open_cyl = config::get_bool("Reload", "OpenCylinder", false);
     g_lever_parts = config::get_bool("Reload", "LeverParts", false);
     g_lever_steady = config::get_bool("Reload", "LeverSteady", true);
+    g_rifle_steady = config::get_bool("Reload", "RifleSteady", false);
     g_pump_parts = config::get_bool("Reload", "PumpParts", false);
     g_bolt_parts = config::get_bool("Reload", "BoltParts", false);
     g_breech_parts = config::get_bool("Reload", "BreechParts", false);
@@ -1319,6 +1355,10 @@ float pump_drawn() {
     return g_pump_amt.load(std::memory_order_relaxed);
 }
 bool lever_steady() { return g_lever_steady.load(std::memory_order_relaxed); }
+bool rifle_pending() {
+    return g_on.load(std::memory_order_relaxed) && g_rifle_pend.load(std::memory_order_relaxed) &&
+           log::now_ms() - g_rifle_pend_ms.load(std::memory_order_relaxed) < 200.0;
+}
 void set_lever_steady(bool on) {
     g_lever_steady = on;
     config::set("Reload", "LeverSteady", on ? "1" : "0");
