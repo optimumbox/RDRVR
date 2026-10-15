@@ -1311,7 +1311,16 @@ void hook_debug_messages(ID3D12Device* dev) {
 }
 
 HRESULT WINAPI hk_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl, REFIID riid, void** out) {
-    if (out && !state::dred_enabled && config::get_bool("Debug", "Dred", true)) enable_dred();
+    // [Debug] Dred is load-bearing under single-pass stereo (2026-10-15): without DRED the game's command lists ran
+    // D3D12Core code the mod's draw hooks are not on (zero draws seen), so the pre-pass never started and both eyes were
+    // drawn two-pass with no error. On whenever [Stereo] ViMain is.
+    if (out && !state::dred_enabled) {
+        const bool dred = config::get_bool("Debug", "Dred", true);
+        if (dred || config::get_bool("Stereo", "ViMain", false)) {
+            if (!dred) log::warn("[d3d] [Debug] Dred=0 ignored: single-pass stereo ([Stereo] ViMain) needs it (its draw hooks see nothing without it)");
+            enable_dred();
+        }
+    }
     if (out && !g_debug_layer.load() && config::get_bool("Debug", "D3D12DebugLayer", false)) enable_debug_layer();
     HRESULT hr = o_D3D12CreateDevice(adapter, fl, riid, out);
     log::info("[d3d] D3D12CreateDevice(adapter %p, fl %#x, %s) -> %#lx", static_cast<void*>(adapter), static_cast<unsigned>(fl),
