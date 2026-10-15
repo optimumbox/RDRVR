@@ -54,7 +54,7 @@ bool g_ready = false, g_failed = false;
 // this frame's lens (prepare -> layer)
 bool g_have = false;
 XrPosef g_pose{};
-XrQuaternionf g_mask_q{0, 0, 0, 1};  // the mask (the crosshair): the lens turned about its normal to the rifle's up
+XrQuaternionf g_mask_q{0, 0, 0, 1};  // the mask (the crosshair): the lens turned about its normal, level with the horizon
 uint32_t g_patch = 0;
 std::atomic<uint64_t> g_frames{0}, g_busy{0}, g_off_image{0};
 std::atomic<int> g_last_eye{-1}, g_last_patch{0};
@@ -413,18 +413,16 @@ bool prepare(const XrView* views, XrSession session, ID3D12CommandQueue* queue, 
     if (!ok) return false;
     g_pose.orientation = v.pose.orientation;  // parallel to the source eye's image: the patch as upright as it saw it
     g_pose.position = {l[0], l[1], l[2]};
-    {  // the crosshair with the rifle's roll: the gun's up (its y) in the source eye's image plane
-        const float uw[3] = {lw[0] + R[1] * 0.1f, lw[1] + R[4] * 0.1f, lw[2] + R[7] * 0.1f};
-        float ul[3], e[3];
+    {  // the crosshair level with the horizon: LOCAL's up (gravity) in the source eye's image plane (2026-10-15: the
+       // gun frame's y as up left it turned to 2-3 o'clock)
+        const float d[3] = {0.0f, 1.0f, 0.0f};
+        float e[3];
         g_mask_q = g_pose.orientation;
-        if (camera_lever::world_to_local(bp.cam, uw, ul)) {
-            const float d[3] = {ul[0] - l[0], ul[1] - l[1], ul[2] - l[2]};
-            unrotate(v.pose.orientation, d, e);
-            if (e[0] * e[0] + e[1] * e[1] > 1e-8f) {
-                const float a = std::atan2(-e[0], e[1]), sz = std::sin(a * 0.5f), cw = std::cos(a * 0.5f);
-                const XrQuaternionf& o = g_pose.orientation;  // o * (0, 0, sz, cw)
-                g_mask_q = {o.x * cw + o.y * sz, o.y * cw - o.x * sz, o.z * cw + o.w * sz, o.w * cw - o.z * sz};
-            }
+        unrotate(v.pose.orientation, d, e);
+        if (e[0] * e[0] + e[1] * e[1] > 1e-6f) {
+            const float a = std::atan2(-e[0], e[1]), sz = std::sin(a * 0.5f), cw = std::cos(a * 0.5f);
+            const XrQuaternionf& o = g_pose.orientation;  // o * (0, 0, sz, cw)
+            g_mask_q = {o.x * cw + o.y * sz, o.y * cw - o.x * sz, o.z * cw + o.w * sz, o.w * cw - o.z * sz};
         }
     }
     g_patch = S;

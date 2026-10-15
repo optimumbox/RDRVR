@@ -123,7 +123,7 @@ std::atomic<double> g_lever_pend_ms{0.0};
 // the reload without the weapon moving"): the bolt guns and the hand-worked breeches held two-handed, their action to be
 // worked: the gun carried by the front hand (body.cpp, as LeverSteady), the gun hand's controller working the part and
 // bringing the round from the chest (holster.cpp); John's drawn gun hand stays on the grip (the gun is drawn from it)
-std::atomic<bool> g_rifle_steady{true}, g_rifle_pend{false};
+std::atomic<bool> g_rifle_steady{false}, g_rifle_pend{false};
 std::atomic<double> g_rifle_pend_ms{0.0};
 bool g_lever_open = false, g_hammer_down = false;
 std::atomic<float> g_lever_amt{0.0f}, g_hammer_amt{1.0f};
@@ -1115,7 +1115,7 @@ void init() {
     g_open_cyl = config::get_bool("Reload", "OpenCylinder", false);
     g_lever_parts = config::get_bool("Reload", "LeverParts", false);
     g_lever_steady = config::get_bool("Reload", "LeverSteady", true);
-    g_rifle_steady = config::get_bool("Reload", "RifleSteady", true);
+    g_rifle_steady = config::get_bool("Reload", "RifleSteady", false);
     g_pump_parts = config::get_bool("Reload", "PumpParts", false);
     g_bolt_parts = config::get_bool("Reload", "BoltParts", false);
     g_breech_parts = config::get_bool("Reload", "BreechParts", false);
