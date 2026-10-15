@@ -609,19 +609,56 @@ void log_sight(const float start[3], const float d[3]) {
     // the target's distance: the probe's when fresh (the reticle on), else 25 m
     float dist = 25.0f;
     bool probe = false;
+    int32_t tgt = 0;
+    float tp[3] = {};
     {
         std::lock_guard lock(g_rp_mutex);
         if (log::now_ms() - g_rp.ms < 250.0 && g_rp.hit) dist = g_rp.dist, probe = true;
+        if (g_rp.tgt != 0 && g_rp.tgt != -1 && log::now_ms() - g_rp.tgt_ms < 500.0) tgt = g_rp.tgt, std::memcpy(tp, g_rp.tgt_pos, sizeof(tp));
+    }
+    // the game's target actor (its handle while it aims, and its position: the feet): where a line passes it, across
+    // (horizontal) and the height above its feet; on it: within 35 cm across, 0.2 m below to 2 m above (a body)
+    const auto pass = [&](const float* o, const float* dir, float* across, float* above, float* range) {
+        float q[3];
+        for (int k = 0; k < 3; ++k) q[k] = tp[k] - o[k];
+        const float hl2 = dir[0] * dir[0] + dir[2] * dir[2];
+        if (hl2 < 1e-6f) return false;
+        const float t = (q[0] * dir[0] + q[2] * dir[2]) / hl2;
+        const float px = o[0] + dir[0] * t - tp[0], pz = o[2] + dir[2] * t - tp[2];
+        *across = std::sqrt(px * px + pz * pz);
+        *above = o[1] + dir[1] * t - tp[1];
+        *range = t * std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+        return t > 0.0f;
+    };
+    const auto on_body = [](float across, float above) { return across < 0.35f && above > -0.2f && above < 2.0f; };
+    // sighting: the eye behind the sights (within 5 cm across the bore, 0 to 10 cm above it: the sights' height)
+    const float ex_cm = dot(w, rt) * 100.0f, ey_cm = dot(w, up) * 100.0f;
+    const bool sighted = std::fabs(ex_cm) < 5.0f && ey_cm > -1.0f && ey_cm < 10.0f && -dot(w, g) > 0.0f;
+    char hit[256] = " | no target actor";
+    float ba = 0, bu = 0, br = 0, sa = 0, su = 0, sr = 0;
+    if (tgt && pass(start, d, &ba, &bu, &br) && pass(eye[se], g, &sa, &su, &sr)) {
+        const bool b_on = on_body(ba, bu), s_on = on_body(sa, su);
+        const char* verdict = !sighted ? (b_on ? "hit, not sighted" : "miss, not sighted")
+                              : s_on   ? (b_on ? "hit" : "MISS WITH THE SIGHTS ON")
+                                       : (b_on ? "hit with the sights off" : "miss, the sights off");
+        std::snprintf(hit, sizeof(hit), " | target %d at %.1f m: sights pass %.0f cm across %.2f m up, bullet %.0f cm across %.2f m up: %s", tgt, br,
+                      sa * 100.0f, su, ba * 100.0f, bu, verdict);
     }
     float to[3];
     for (int k = 0; k < 3; ++k) to[k] = start[k] + d[k] * dist - eye[se][k];
     const float tg = dot(to, g);
     const float seen_r = std::atan2(dot(to, rt), tg) * deg, seen_u = std::atan2(dot(to, up), tg) * deg;
-    log::info("[aim] sight: seen %+.2f right %+.2f up deg (%+.0f %+.0f cm at %.1f m%s) | drawn %+.2f %+.2f deg | eye %d at %+.1f %+.1f %+.1f "
-              "cm (the other %.1f cm off the bore) | two-hand %.2f%s, aim ray %.0f ms, points %.0f ms old",
-              seen_r, seen_u, std::tan(seen_r / deg) * dist * 100.0f, std::tan(seen_u / deg) * dist * 100.0f, dist, probe ? ", the probe's" : "",
+    // no target actor (the game's lock follows the barrel's ray, so a miss can leave none): sighted, the bullet more than
+    // 20 cm off the sight line at the probe's distance is a miss the sights would not show
+    if (!tgt && sighted) {
+        const float off_cm = std::tan(std::hypot(seen_r, seen_u) / deg) * dist * 100.0f;
+        if (off_cm > 20.0f) std::snprintf(hit, sizeof(hit), " | no target actor: OFF THE SIGHTS by %.0f cm at %.1f m", off_cm, dist);
+    }
+    log::info("[aim] sight%s: seen %+.2f right %+.2f up deg (%+.0f %+.0f cm at %.1f m%s) | drawn %+.2f %+.2f deg | eye %d at %+.1f %+.1f %+.1f "
+              "cm (the other %.1f cm off the bore) | two-hand %.2f%s, aim ray %.0f ms, points %.0f ms old%s",
+              sighted ? " (sighted)" : "", seen_r, seen_u, std::tan(seen_r / deg) * dist * 100.0f, std::tan(seen_u / deg) * dist * 100.0f, dist, probe ? ", the probe's" : "",
               drawn_r, drawn_u, se, dot(w, rt) * 100.0f, dot(w, up) * 100.0f, -dot(w, g) * 100.0f, bore[1 - se] * 100.0f, holster::two_hand_blend(),
-              bp.steady ? " steady" : "", log::now_ms() - g_last_override_ms.load(std::memory_order_relaxed), log::now_ms() - bp.ms);
+              bp.steady ? " steady" : "", log::now_ms() - g_last_override_ms.load(std::memory_order_relaxed), log::now_ms() - bp.ms, hit);
 }
 
 std::atomic<double> g_mounted_shot_ms{-1e12};  // the player's last mounted gun shot (mounted_gun_fired)
