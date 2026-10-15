@@ -490,7 +490,7 @@ void watch_list_ends(ID3D12GraphicsCommandList* cl) {
 
 // ---- [Stereo] ViSlices: the game's render-size targets made with two array slices (set_stereo_targets). The game's
 // views (2D, no array) see slice 0; its barriers and copies naming a subresource (a plane: one mip, one slice) are
-// rewritten for the slices: subresource p is p * 2 (slice 0) and p * 2 + 1 (slice 1).
+// rewritten for the slices: subresource p is p * N + s (slice s of N: vi_slices(), 2, or 3 with the scope's view).
 thread_local uint32_t t_double_w = 0, t_double_h = 0;
 struct Doubled {
     std::atomic<const void*> res{nullptr};
@@ -588,20 +588,20 @@ enum Make { kPlain, kDouble, kSingle };
 Make want_double(const D3D12_RESOURCE_DESC* d, REFIID riid) {
     if (!d || riid != __uuidof(ID3D12Resource) || d->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d->MipLevels != 1 ||
         d->SampleDesc.Count != 1 || !(d->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) ||
-        (d->DepthOrArraySize != 1 && d->DepthOrArraySize != 2))
+        (d->DepthOrArraySize != 1 && d->DepthOrArraySize != vi_slices()))
         return kPlain;
     const bool in_window = t_double_w != 0;
-    if (!in_window && (d->DepthOrArraySize != 2 || !g_double_w.load(std::memory_order_relaxed) ||
+    if (!in_window && (d->DepthOrArraySize != vi_slices() || !g_double_w.load(std::memory_order_relaxed) ||
                        GetCurrentThreadId() != g_double_tid.load(std::memory_order_relaxed)))
         return kPlain;
     const uint32_t w = in_window ? t_double_w : g_double_w.load(std::memory_order_relaxed);
     const uint32_t h = in_window ? t_double_h : g_double_h.load(std::memory_order_relaxed);
     if (d->Width == w && d->Height == h) {
-        if (g_doubled_n.load(std::memory_order_relaxed) >= kMaxDoubled) return d->DepthOrArraySize == 2 ? kSingle : kPlain;
+        if (g_doubled_n.load(std::memory_order_relaxed) >= kMaxDoubled) return d->DepthOrArraySize == vi_slices() ? kSingle : kPlain;
         if (!in_window) g_inherited.fetch_add(1, std::memory_order_relaxed);
         return kDouble;
     }
-    if (d->DepthOrArraySize == 2) {
+    if (d->DepthOrArraySize == vi_slices()) {
         g_unsliced.fetch_add(1, std::memory_order_relaxed);
         return kSingle;
     }
@@ -635,18 +635,21 @@ void STDMETHODCALLTYPE hk_ResourceBarrier(ID3D12GraphicsCommandList* cl, UINT n,
                         x->st[p].store(static_cast<uint32_t>(b[i].Transition.StateAfter), std::memory_order_relaxed);
             if (sub != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) any = true;
         }
-        if (any) {  // the game's subresources: both slices' each
+        if (any) {  // the game's subresources: every slice's each
             auto& v = barrier_scratch();
             v.clear();
+            const UINT ns = vi_slices();
             for (UINT i = 0; i < n; ++i) {
                 v.push_back(b[i]);
                 if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || b[i].Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES ||
                     !doubled(b[i].Transition.pResource))
                     continue;
                 const UINT sub = b[i].Transition.Subresource;
-                v.back().Transition.Subresource = sub * 2;
-                v.push_back(b[i]);
-                v.back().Transition.Subresource = sub * 2 + 1;
+                v.back().Transition.Subresource = sub * ns;
+                for (UINT s = 1; s < ns; ++s) {
+                    v.push_back(b[i]);
+                    v.back().Transition.Subresource = sub * ns + s;
+                }
             }
             g_doubled_barriers.fetch_add(1, std::memory_order_relaxed);
             HP_ORIG(hp_, o_ResourceBarrier(cl, static_cast<UINT>(v.size()), v.data()));
@@ -710,9 +713,9 @@ void STDMETHODCALLTYPE hk_CopyResource(ID3D12GraphicsCommandList* cl, ID3D12Reso
         const UINT planes = (xd ? xd : xs)->planes;
         for (UINT p = 0; p < planes; ++p) {
             D3D12_TEXTURE_COPY_LOCATION d{dst, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
-            d.SubresourceIndex = xd ? p * 2 : p;
+            d.SubresourceIndex = xd ? p * vi_slices() : p;
             D3D12_TEXTURE_COPY_LOCATION s{src, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
-            s.SubresourceIndex = xs ? p * 2 : p;
+            s.SubresourceIndex = xs ? p * vi_slices() : p;
             o_CopyTextureRegion(cl, &d, 0, 0, 0, &s, nullptr);
         }
         g_doubled_copies.fetch_add(1, std::memory_order_relaxed);
@@ -742,10 +745,11 @@ void STDMETHODCALLTYPE hk_CopyTextureRegion(ID3D12GraphicsCommandList* cl, const
         Doubled* xs = src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ? doubled(src->pResource) : nullptr;
         if (xd || xs) {
             D3D12_TEXTURE_COPY_LOCATION d = *dst, s = *src;
-            if (xd) d.SubresourceIndex *= 2;
-            if (xs) s.SubresourceIndex *= 2;
+            const UINT ns = vi_slices();
+            if (xd) d.SubresourceIndex *= ns;
+            if (xs) s.SubresourceIndex *= ns;
             o_CopyTextureRegion(cl, &d, x, y, z, &s, box);
-            if (xd && xs) {  // (both: slice 1 too)
+            for (UINT i = 1; xd && xs && i < ns; ++i) {  // (both: the other slices too)
                 ++d.SubresourceIndex;
                 ++s.SubresourceIndex;
                 o_CopyTextureRegion(cl, &d, x, y, z, &s, box);
@@ -957,7 +961,7 @@ D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE hk_GetResourceAllocationInfo(I
         bool any = false;
         for (UINT i = 0; i < n; ++i) {
             one[i] = d[i];
-            if (d[i].DepthOrArraySize == 2 && want_double(&d[i], __uuidof(ID3D12Resource)) == kSingle) {
+            if (d[i].DepthOrArraySize == vi_slices() && want_double(&d[i], __uuidof(ID3D12Resource)) == kSingle) {
                 one[i].DepthOrArraySize = 1;
                 any = true;
             }
@@ -976,7 +980,7 @@ D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE hk_GetResourceAllocationInfo(I
                          desc, static_cast<int>(d[i].Dimension), static_cast<unsigned long long>(d[i].Alignment), d[i].DepthOrArraySize,
                          static_cast<int>(d[i].Layout), GetCurrentThreadId());
         }
-    } else if (n == 1 && d && d->DepthOrArraySize == 2 && g_doubled_made.load(std::memory_order_relaxed)) {
+    } else if (n == 1 && d && d->DepthOrArraySize == vi_slices() && g_doubled_made.load(std::memory_order_relaxed)) {
         char desc[160];
         describe_desc(d, desc, sizeof(desc));
         log::limited("d3d.allocinfo.two", 40, "[res] allocation info for a 2-slice desc: %s, align %#llx -> %llu bytes (align %#llx), thread %lu", desc,
@@ -1024,7 +1028,7 @@ HRESULT make_doubled(ID3D12Device* dev, D3D12_HEAP_FLAGS hf, const D3D12_RESOURC
                      const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
     if (g_doubled_no_room.load(std::memory_order_relaxed)) return E_OUTOFMEMORY;
     D3D12_RESOURCE_DESC dd = *d;
-    dd.DepthOrArraySize = 2;
+    dd.DepthOrArraySize = static_cast<UINT16>(vi_slices());
     char desc[160];
     describe_desc(d, desc, sizeof(desc));
     uint64_t used = 0, budget = 0;
@@ -1878,6 +1882,10 @@ void set_stereo_targets(uint32_t w, uint32_t h) {
         g_double_h = h;
         g_double_tid = GetCurrentThreadId();
     }
+}
+unsigned vi_slices() {
+    static const unsigned n = config::get_bool("Stereo", "ScopeView", false) ? 3u : 2u;
+    return n;
 }
 bool is_doubled(const void* res) { return g_doubled_n.load(std::memory_order_relaxed) && doubled(res); }
 bool doubled_state(const void* res, unsigned plane, int* out) {

@@ -31,6 +31,8 @@ bool prepare(const XrView* views, XrSession session, ID3D12CommandQueue* queue, 
              DXGI_FORMAT fmt);
 // This frame's lens quads (after a true prepare): the lens and its mask (black round it, the crosshair). Returns 2, or 0.
 int layers(XrSpace space, XrCompositionLayerQuad out[2]);
+// The rifle at the face this XR frame (any thread)
+bool raised();
 // scope [on|off] [zoom x] [size m] [offset x y z] [raise m deg] [eye auto|left|right] [all on|off]: the session's settings; no args: status
 std::string command(const std::string& line);
 

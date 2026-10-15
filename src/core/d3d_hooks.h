@@ -106,6 +106,8 @@ void raw_copy_region(ID3D12GraphicsCommandList* cl, const D3D12_TEXTURE_COPY_LOC
 // with two array slices, eye 1's and eye 2's. The game's views (2D) see slice 0; its barriers and copies naming a
 // subresource are rewritten for both slices, its copies between a 2-slice target and a plain one use slice 0. (0, 0) ends it.
 void set_stereo_targets(uint32_t w, uint32_t h);
+// The slices of those targets: 2, or 3 under [Stereo] ScopeView (the scope's view, slice 2; docs/SCOPE_VIEW_PLAN.md)
+unsigned vi_slices();
 bool is_doubled(const void* res);
 // A 2-slice target's state per plane as the game's last barrier (any list, recorded order) left it; false: not one
 bool doubled_state(const void* res, unsigned plane, int* out);  // (out: a D3D12_RESOURCE_STATES)

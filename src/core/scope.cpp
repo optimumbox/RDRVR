@@ -478,4 +478,6 @@ std::string command(const std::string& line) {
     return b;
 }
 
+bool raised() { return g_raised.load(std::memory_order_relaxed); }
+
 }  // namespace rdrvr::scope

@@ -399,7 +399,7 @@ void copy_tap(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, ID3D12Resource
     D3D12_RESOURCE_DESC d = src->GetDesc();
     // [Stereo] ViSlices (0.8.10.2's default): the scene depth a 2-slice target, slice 0 the first eye's and slice 1 the
     // second's, both in this one copy (2026-10-14: players' rounds in hand invisible, the 2-slice depth never copied)
-    const bool sliced = d.DepthOrArraySize == 2;
+    const bool sliced = d.DepthOrArraySize >= 2;
     if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count != 1 || (d.DepthOrArraySize != 1 && !sliced)) return;  // the scene depth only
     if (sliced && k != 0) return;  // (both eyes from the frame's first copy)
     ID3D12Device* dev = nullptr;

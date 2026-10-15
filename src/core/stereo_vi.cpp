@@ -26,8 +26,10 @@
 #include "core/config.h"
 #include "core/hooks.h"
 #include "core/log.h"
+#include "core/d3d_hooks.h"
 #include "core/prepass_arrays.h"
 #include "core/pso.h"
+#include "core/scope.h"
 #include "core/state.h"
 
 namespace rdrvr::vi {
@@ -281,7 +283,17 @@ struct Stream {
 // rectangle, worked out for eye 1's camera; eye 2's opening is elsewhere on its screen, so eye 2 lost the interior
 // (2026-10-13, the headset: a wall through the station's window in the right eye only). Unclipped, it is hidden where
 // it should be by the depth test, like the rest of the scene.
-const D3D12_VIEW_INSTANCE_LOCATION kLocations[2] = {{0, 0}, {1, 1}};
+// [Stereo] ScopeView (docs/SCOPE_VIEW_PLAN.md, phase 1): a third view into slice 2, with eye 2's viewport for now (the
+// shaders' view 2 reads eye 2's rows: `ViewID != 0`); drawn only while the scope is raised (mask 7, else 3)
+const D3D12_VIEW_INSTANCE_LOCATION kLocations[3] = {{0, 0}, {1, 1}, {2, 1}};
+UINT view_count() { return d3d::vi_slices() >= 3 ? 3u : 2u; }
+// "vi view3 auto|on|off": the third view with the scope raised (auto), always, never
+std::atomic<int> g_view3{0};  // 0 auto, 1 on, 2 off
+UINT view_mask() {
+    if (view_count() < 3) return 3;
+    const int m = g_view3.load(std::memory_order_relaxed);
+    return m == 1 || (m == 0 && scope::raised()) ? 7u : 3u;
+}
 
 // [Stereo] TwinCache (2026-10-15, on): each twin made is stored in a D3D12 pipeline library saved to
 // <game>\RDRVR_twins.bin, and a later session loads it from there (well under a millisecond) instead of compiling it
@@ -393,7 +405,7 @@ std::wstring twin_name(const Kept* k, const Stream& s) {
     mix(&s.sample.v, sizeof(s.sample.v));
     mix(&s.node.v, sizeof(s.node.v));
     mix(&s.flags.v, sizeof(s.flags.v));
-    mix(kLocations, sizeof(kLocations));
+    mix(kLocations, sizeof(kLocations[0]) * view_count());  // (2 views: the names as before)
     wchar_t b[24];
     std::swprintf(b, 24, L"t%016llx", static_cast<unsigned long long>(h));
     return b;
@@ -451,7 +463,7 @@ void make_twin(Kept* k) {
     s.sample.v = k->sample;
     s.node.v = k->node;
     s.flags.v = k->flags;
-    s.views.v = {2, kLocations, D3D12_VIEW_INSTANCING_FLAG_NONE};
+    s.views.v = {view_count(), kLocations, D3D12_VIEW_INSTANCING_FLAG_NONE};
     D3D12_PIPELINE_STATE_STREAM_DESC sd{sizeof(s), &s};
     ID3D12PipelineState* twin = nullptr;
     std::wstring name;
@@ -627,7 +639,7 @@ ID3D12PipelineState* wanted_for(ID3D12GraphicsCommandList* cl, const ListState& 
 void bind(ID3D12GraphicsCommandList* cl, ListState& s, ID3D12PipelineState* p) {
     if (p == s.bound) return;
     pso::raw_set_pipeline(cl, p);
-    if (p != s.game && s.cl1) s.cl1->SetViewInstanceMask(3);
+    if (p != s.game && s.cl1) s.cl1->SetViewInstanceMask(view_mask());
     if (p != s.game) rs_for_twin(cl, s);
     s.bound = p;
     g_rebinds.fetch_add(1, std::memory_order_relaxed);
@@ -808,7 +820,7 @@ ID3D12PipelineState* on_set_pso(ID3D12GraphicsCommandList* cl, ID3D12PipelineSta
     int region = 0;
     ID3D12PipelineState* twin = nullptr;
     ID3D12PipelineState* p = wanted_for(cl, s, &region, &twin);
-    if (p != ps && s.cl1) s.cl1->SetViewInstanceMask(3);
+    if (p != ps && s.cl1) s.cl1->SetViewInstanceMask(view_mask());
     if (p != ps && s.bound != p) rs_for_twin(cl, s);
     s.bound = p;
     return p;
@@ -1065,6 +1077,12 @@ std::string command(const std::vector<std::string>& t) {
     if (sub == "pred" && t.size() >= 3) {
         g_pred_off = t[2] == "off";
         return std::string("pass 2's predication ") + (g_pred_off.load() ? "ignored (A/B)" : "as the game's");
+    }
+    if (sub == "view3" && t.size() >= 3) {
+        g_view3 = t[2] == "on" ? 1 : t[2] == "off" ? 2 : 0;
+        return std::string("the third view (") + std::to_string(view_count()) + " views made): " +
+               (g_view3.load() == 1 ? "always" : g_view3.load() == 2 ? "never" : "with the scope raised") + ", mask now " +
+               std::to_string(view_mask());
     }
     if (sub == "pred0" && t.size() >= 3) {
         g_pred0_off = t[2] == "off";

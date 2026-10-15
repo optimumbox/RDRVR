@@ -192,11 +192,11 @@ bool ensure(int k, ID3D12Resource* res, DXGI_FORMAT view_fmt) {
     const D3D12_RESOURCE_DESC d = res->GetDesc();
     if (a.arr && a.game == res && a.w == d.Width && a.h == d.Height && a.res_fmt == d.Format) return true;
     const bool native = g_slices.load(std::memory_order_relaxed) && d3d::is_doubled(res);
-    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.DepthOrArraySize != (native ? 2 : 1) || d.MipLevels != 1 || d.SampleDesc.Count != 1) {
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.DepthOrArraySize != (native ? d3d::vi_slices() : 1) || d.MipLevels != 1 || d.SampleDesc.Count != 1) {
         char why[160];
         std::snprintf(why, sizeof(why), "a pre-pass target is not a single 2D texture (%s %p: dim %d, %llux%u x%u, mips %u, samples %u, %s)", kNames[k],
                       static_cast<void*>(res), static_cast<int>(d.Dimension), static_cast<unsigned long long>(d.Width), d.Height, d.DepthOrArraySize,
-                      d.MipLevels, d.SampleDesc.Count, native ? "2-slice" : "not one of the 2-slice targets");
+                      d.MipLevels, d.SampleDesc.Count, native ? "sliced" : "not one of the sliced targets");
         fail(why);
         return false;
     }
@@ -209,7 +209,7 @@ bool ensure(int k, ID3D12Resource* res, DXGI_FORMAT view_fmt) {
     if (a.e2) g_retired.push_back({a.e2, state::presents.load()});
     a = Arr{};
     D3D12_RESOURCE_DESC ad = d;
-    ad.DepthOrArraySize = 2;
+    ad.DepthOrArraySize = static_cast<UINT16>(d3d::vi_slices());
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     const DXGI_FORMAT vf = view_fmt != DXGI_FORMAT_UNKNOWN ? view_fmt : d.Format;
     D3D12_CLEAR_VALUE cv{};
@@ -227,8 +227,8 @@ bool ensure(int k, ID3D12Resource* res, DXGI_FORMAT view_fmt) {
     }
     D3D12_FEATURE_DATA_FORMAT_INFO fi{d.Format, 0};
     a.planes = SUCCEEDED(g_dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &fi, sizeof(fi))) && fi.PlaneCount ? fi.PlaneCount : 1;
-    for (int s = 0; s < 3; ++s) {  // s 2: both slices (the view-instanced draws' target)
-        const UINT first = s == 2 ? 0u : static_cast<UINT>(s), count = s == 2 ? 2u : 1u;
+    for (int s = 0; s < 3; ++s) {  // s 2: all slices (the view-instanced draws' target)
+        const UINT first = s == 2 ? 0u : static_cast<UINT>(s), count = s == 2 ? d3d::vi_slices() : 1u;
         if (is_depth(k)) {
             D3D12_DEPTH_STENCIL_VIEW_DESC dv{};
             dv.Format = vf;
@@ -601,7 +601,7 @@ void end_region(ID3D12GraphicsCommandList* cl) {
             D3D12_TEXTURE_COPY_LOCATION dst{a.game, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
             dst.SubresourceIndex = p;
             D3D12_TEXTURE_COPY_LOCATION src{a.arr, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
-            src.SubresourceIndex = static_cast<UINT>(g_r.slice) + p * 2;  // mip + slice * mips + plane * mips * slices
+            src.SubresourceIndex = static_cast<UINT>(g_r.slice) + p * d3d::vi_slices();  // mip + slice * mips + plane * mips * slices
             D3D12_BOX box;
             const bool boxed = copy_box(k, a.game, &box);
             (boxed ? g_boxed : g_unboxed).fetch_add(1, std::memory_order_relaxed);
@@ -621,14 +621,16 @@ void end_region(ID3D12GraphicsCommandList* cl) {
 // in a view-instanced slice-0 region, slice 1 into eye 2's copy (left readable by the pixel shaders).
 constexpr D3D12_RESOURCE_STATES kReadable = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
-// ---- "prepass grab <kind> <path>": both slices of a kind's array as the next view-instanced frame's slice-0 region
+// ---- "prepass grab <kind> <path>": the slices of a kind's array as the next view-instanced frame's slice-0 region
 // publishes them (plane 0; each publish in that region copies again, the last one's in the file): "RDA1", width,
-// height, footprint format, row bytes, then slice 0's rows and slice 1's (slice 1: what eye 2's copy got).
+// height, footprint format, row bytes, then each slice's rows (slice 1: what eye 2's copy got; slice 2: the scope's view
+// under [Stereo] ScopeView). The slices: the file's size.
 std::atomic<int> g_grab_phase{0};  // 0 idle, 1 armed (kind g_grab_kind), 2 copied this frame, 3 to finish
 int g_grab_kind = -1;
 uint64_t g_grab_frame = 0;
 ID3D12Resource* g_grab_rb = nullptr;
-D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_grab_fp[2]{};
+D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_grab_fp[3]{};
+UINT g_grab_slices = 2;
 UINT64 g_grab_row = 0;
 uint32_t g_grab_h = 0;
 std::string g_grab_path, g_grab_result;
@@ -637,10 +639,14 @@ void grab_tap(ID3D12GraphicsCommandList* cl, int k, ID3D12Resource* arr) {  // a
     const int ph = g_grab_phase.load(std::memory_order_acquire);
     if (k != g_grab_kind || !(ph == 1 || (ph == 2 && g_grab_frame == state::presents.load())) || !g_r.vi || g_r.slice != 0) return;
     D3D12_RESOURCE_DESC d = arr->GetDesc();
-    UINT rows[2];
-    UINT64 rb[2], total = 0;
-    const UINT first = 0;  // plane 0: subresources 0 and 1 (mip 0, slices 0 and 1)
-    g_dev->GetCopyableFootprints(&d, first, 2, 0, g_grab_fp, rows, rb, &total);
+    UINT rows[3];
+    UINT64 rb[3], total = 0;
+    const UINT first = 0, ns = std::min<UINT>(d.DepthOrArraySize, 3);  // plane 0: subresources 0.. (mip 0, each slice)
+    g_dev->GetCopyableFootprints(&d, first, ns, 0, g_grab_fp, rows, rb, &total);
+    if (g_grab_rb && g_grab_rb->GetDesc().Width < total) {
+        g_grab_rb->Release();
+        g_grab_rb = nullptr;
+    }
     if (!g_grab_rb) {
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
         D3D12_RESOURCE_DESC r{};
@@ -652,7 +658,8 @@ void grab_tap(ID3D12GraphicsCommandList* cl, int k, ID3D12Resource* arr) {  // a
         if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &r, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_grab_rb))))
             return;
     }
-    for (UINT s = 0; s < 2; ++s) {
+    g_grab_slices = ns;
+    for (UINT s = 0; s < ns; ++s) {
         D3D12_TEXTURE_COPY_LOCATION dl{g_grab_rb, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
         dl.PlacedFootprint = g_grab_fp[s];
         D3D12_TEXTURE_COPY_LOCATION sl{arr, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
@@ -685,11 +692,11 @@ std::string grab_finish() {
         const uint32_t hdr[5] = {0x31414452u /* RDA1 */, g_grab_fp[0].Footprint.Width, g_grab_h, static_cast<uint32_t>(g_grab_fp[0].Footprint.Format),
                                  static_cast<uint32_t>(g_grab_row)};
         fwrite(hdr, 1, sizeof(hdr), f);
-        for (int s = 0; s < 2; ++s)
+        for (UINT s = 0; s < g_grab_slices; ++s)
             for (uint32_t y = 0; y < g_grab_h; ++y)
                 fwrite(p + g_grab_fp[s].Offset + static_cast<uint64_t>(y) * g_grab_fp[s].Footprint.RowPitch, 1, static_cast<size_t>(g_grab_row), f);
         fclose(f);
-        result = "wrote " + g_grab_path + " (" + kNames[g_grab_kind] + ", both slices)";
+        result = "wrote " + g_grab_path + " (" + kNames[g_grab_kind] + ", " + std::to_string(g_grab_slices) + " slices)";
     }
     D3D12_RANGE none{0, 0};
     g_grab_rb->Unmap(0, &none);
@@ -742,7 +749,7 @@ void publish(ID3D12GraphicsCommandList* cl, int k, const D3D12_RESOURCE_STATES s
     for (UINT p = 0; p < a.planes; ++p) {
         if (!(planes & (1u << p))) continue;
         D3D12_TEXTURE_COPY_LOCATION src{a.arr, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
-        src.SubresourceIndex = static_cast<UINT>(g_r.slice) + p * 2;
+        src.SubresourceIndex = static_cast<UINT>(g_r.slice) + p * d3d::vi_slices();
         D3D12_TEXTURE_COPY_LOCATION dst{a.game, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
         dst.SubresourceIndex = p;
         D3D12_BOX box;
@@ -750,7 +757,7 @@ void publish(ID3D12GraphicsCommandList* cl, int k, const D3D12_RESOURCE_STATES s
         (boxed ? g_boxed : g_unboxed).fetch_add(1, std::memory_order_relaxed);
         d3d::raw_copy_region(cl, &dst, &src, boxed ? &box : nullptr);
         if (e2) {
-            src.SubresourceIndex = 1 + p * 2;
+            src.SubresourceIndex = 1 + p * d3d::vi_slices();
             dst.pResource = a.e2;
             d3d::raw_copy_region(cl, &dst, &src, boxed ? &box : nullptr);
         }
@@ -785,13 +792,13 @@ void handover(ID3D12GraphicsCommandList* cl, unsigned kinds) {
             if (st[p] != D3D12_RESOURCE_STATE_COPY_SOURCE) {
                 pre[n] = transition(a.game, st[p], D3D12_RESOURCE_STATE_COPY_SOURCE);
                 post[n] = transition(a.game, D3D12_RESOURCE_STATE_COPY_SOURCE, st[p]);
-                pre[n].Transition.Subresource = post[n].Transition.Subresource = p * 2 + 1;
+                pre[n].Transition.Subresource = post[n].Transition.Subresource = p * d3d::vi_slices() + 1;
                 ++n;
             }
             if (st[p] != D3D12_RESOURCE_STATE_COPY_DEST) {
                 pre[n] = transition(a.game, st[p], D3D12_RESOURCE_STATE_COPY_DEST);
                 post[n] = transition(a.game, D3D12_RESOURCE_STATE_COPY_DEST, st[p]);
-                pre[n].Transition.Subresource = post[n].Transition.Subresource = p * 2;
+                pre[n].Transition.Subresource = post[n].Transition.Subresource = p * d3d::vi_slices();
                 ++n;
             }
         }
@@ -805,9 +812,9 @@ void handover(ID3D12GraphicsCommandList* cl, unsigned kinds) {
         const Arr& a = g_arr[k];
         for (UINT p = 0; p < a.planes && p < 2; ++p) {
             D3D12_TEXTURE_COPY_LOCATION dst{a.game, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
-            dst.SubresourceIndex = p * 2;
+            dst.SubresourceIndex = p * d3d::vi_slices();
             D3D12_TEXTURE_COPY_LOCATION src{a.game, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
-            src.SubresourceIndex = p * 2 + 1;
+            src.SubresourceIndex = p * d3d::vi_slices() + 1;
             d3d::raw_copy_region(cl, &dst, &src);
         }
         g_handover_copies.fetch_add(1, std::memory_order_relaxed);
@@ -1961,12 +1968,12 @@ bool copy_resource(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, ID3D12Res
     d3d::raw_barrier(cl, n, pre);
     for (UINT p = 0; p < planes; ++p) {
         D3D12_TEXTURE_COPY_LOCATION s{a.arr, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
-        s.SubresourceIndex = static_cast<UINT>(g_r.slice) + p * 2;
+        s.SubresourceIndex = static_cast<UINT>(g_r.slice) + p * d3d::vi_slices();
         D3D12_TEXTURE_COPY_LOCATION d{dst, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
         d.SubresourceIndex = p;
         d3d::raw_copy_region(cl, &d, &s);
         if (to_e2) {
-            s.SubresourceIndex = 1 + p * 2;
+            s.SubresourceIndex = 1 + p * d3d::vi_slices();
             d.pResource = g_dr.e2;
             d3d::raw_copy_region(cl, &d, &s);
         }

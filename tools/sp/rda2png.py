@@ -1,6 +1,7 @@
-"""rda2png.py: the core's "prepass grab <kind> <path>" file (RDA1: both slices of a pre-pass array) as PNGs.
+"""rda2png.py: the core's "prepass grab <kind> <path>" file (RDA1: the slices of a pre-pass array) as PNGs.
 
-<path>-s0.png (slice 0, eye 1), <path>-s1.png (slice 1, eye 2: what eye 2's copy got), <path>-sbs.png, and per-slice
+<path>-s0.png (slice 0, eye 1), <path>-s1.png (slice 1, eye 2: what eye 2's copy got), <path>-s2.png ([Stereo]
+ScopeView: the scope's view), <path>-sbs.png, and per-slice
 statistics (mean, min, max of each channel; the share of texels equal to the slice's most common value).
 
     python rda2png.py <file.rda> [...]
@@ -22,7 +23,7 @@ def read(path):
     if magic != 0x31414452:
         raise SystemExit(f'{path}: not an RDA1 file')
     n = row * h
-    s = [np.frombuffer(b, np.uint8, n, 20 + i * n).reshape(h, row) for i in range(2)]
+    s = [np.frombuffer(b, np.uint8, n, 20 + i * n).reshape(h, row) for i in range((len(b) - 20) // n)]
     return w, h, fmt, s
 
 
