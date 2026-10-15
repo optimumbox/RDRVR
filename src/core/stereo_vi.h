@@ -30,6 +30,7 @@ ID3D12PipelineState* on_set_pso(ID3D12GraphicsCommandList* cl, ID3D12PipelineSta
 void on_reset(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps);
 bool before_draw(ID3D12GraphicsCommandList* cl);
 bool skip_clear(ID3D12GraphicsCommandList* cl);
+bool drop_resolve(ID3D12GraphicsCommandList* cl, D3D12_QUERY_TYPE type);  // [Stereo] ViKeepEye1Queries: eye 2's occlusion resolve under the skip
 bool drop_predication(ID3D12GraphicsCommandList* cl);  // "vi pred off": pass 2's main pass of a view-instanced frame
 // The query probe (I2's occlusion study): kind 0 BeginQuery, 1 EndQuery, 2 ResolveQueryData (index = start, n), 3
 // SetPredication (res and off: the predicate's buffer; type: the op). Counted per region of a view-instanced frame.
@@ -64,6 +65,16 @@ int writes_depth(ID3D12GraphicsCommandList* cl);
 bool may_read_depth(ID3D12GraphicsCommandList* cl);
 // The list's viewport 0 as the game set it since its Reset (this thread's lists): its right and bottom edges, in pixels
 bool viewport_extent(ID3D12GraphicsCommandList* cl, uint32_t* right, uint32_t* bottom);
+// A draw of the mod's own in the game's list (prepass_arrays.cpp's light copy): the root signature the game's bound
+// pipeline was made with (the same stays bound: its root arguments kept), the game's viewport 0, and afterwards the
+// game's pipeline (or its twin), viewports and scissors bound again (this thread's lists)
+ID3D12RootSignature* bound_root(ID3D12GraphicsCommandList* cl);
+bool game_viewport(ID3D12GraphicsCommandList* cl, D3D12_VIEWPORT* vp);
+void raw_viewport(ID3D12GraphicsCommandList* cl, const D3D12_VIEWPORT& vp);  // viewport and scissor 0, past the hooks
+void rebind(ID3D12GraphicsCommandList* cl);
+// The table slot of a plain (2D) view of a 2-slice target's slice 0, written like eye 2's (kEye2SlotBase + slot)
+constexpr int kLightSlice0Slot = 20;  // the Light Buffer's eye 1 slice (the light copy reads it)
+void slice0_texture(int slot, ID3D12Resource* res);
 std::string command(const std::vector<std::string>& t);
 
 }  // namespace rdrvr::vi

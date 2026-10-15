@@ -335,6 +335,15 @@ std::atomic<FrameSizeFn> g_frame_size{nullptr};
 std::atomic<bool> g_present_unsynced{false};
 std::atomic<uint64_t> g_unsynced_presents{0};
 
+// the calling thread's last targets as bound (after the pre-pass's and the substitution's changes): restore_targets
+struct LastTargets {
+    ID3D12GraphicsCommandList* cl = nullptr;
+    UINT n = 0;
+    D3D12_CPU_DESCRIPTOR_HANDLE rts[8]{}, ds{};
+    BOOL single = FALSE;
+    bool has_ds = false;
+};
+thread_local LastTargets t_last_targets;
 void STDMETHODCALLTYPE hk_OMSetRenderTargets(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts,
                                              BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* ds) {
     hookprof::Scope hp_(hookprof::kTargets);
@@ -362,6 +371,12 @@ void STDMETHODCALLTYPE hk_OMSetRenderTargets(ID3D12GraphicsCommandList* cl, UINT
         l.targets = t.empty() ? "none" : t;
     }
     D3D12_CPU_DESCRIPTOR_HANDLE pp_rts[8], pp_ds{};
+    auto rec = [&](const D3D12_CPU_DESCRIPTOR_HANDLE* r, const D3D12_CPU_DESCRIPTOR_HANDLE* d) {
+        LastTargets& t = t_last_targets;
+        t.cl = cl, t.n = n > 8 ? 8 : n, t.single = single, t.has_ds = d != nullptr;
+        for (UINT i = 0; i < (single ? (t.n ? 1u : 0u) : t.n) && r; ++i) t.rts[i] = r[i];
+        if (d) t.ds = *d;
+    };
     if (prepass::tracing()) prepass::trace_bind(cl, n, rts, single, ds);
     if (prepass::on() && !prepass::active()) prepass::note_bind(cl, n, rts, single, ds);  // (bound before the pre-pass's clear)
     if (prepass::active() && prepass::bind(cl, n, rts, single, ds, pp_rts, &pp_ds)) {  // the pre-pass's targets: its arrays
@@ -372,10 +387,12 @@ void STDMETHODCALLTYPE hk_OMSetRenderTargets(ID3D12GraphicsCommandList* cl, UINT
         D3D12_CPU_DESCRIPTOR_HANDLE repl[8];
         if (sub(cl, n, rts, ds, &repl[0])) {
             for (UINT i = 1; i < n; ++i) repl[i] = rts[i];
+            rec(repl, ds);
             HP_ORIG(hp_, o_OMSetRenderTargets(cl, n, repl, single, ds));
             return;
         }
     }
+    rec(rts, ds);
     HP_ORIG(hp_, o_OMSetRenderTargets(cl, n, rts, single, ds));
 }
 
@@ -661,6 +678,7 @@ void STDMETHODCALLTYPE hk_ResolveQuery(ID3D12GraphicsCommandList* cl, ID3D12Quer
     hookprof::Scope hp_(hookprof::kQuery);
     replay_ops::note(replay_ops::kQuery);
     vi::on_query(cl, 2, t, start, dst, off, n);
+    if (vi::drop_resolve(cl, t)) return;  // [Stereo] ViKeepEye1Queries: eye 1's counts stand
     HP_ORIG(hp_, o_ResolveQuery(cl, h, t, start, n, dst, off));
 }
 void STDMETHODCALLTYPE hk_EndQuery(ID3D12GraphicsCommandList* cl, ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) {
@@ -1673,6 +1691,18 @@ void raw_bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIP
               const D3D12_CPU_DESCRIPTOR_HANDLE* ds) {
     if (o_OMSetRenderTargets) o_OMSetRenderTargets(cl, n, rts, single, ds);
     else cl->OMSetRenderTargets(n, rts, single, ds);
+}
+
+void raw_draw(ID3D12GraphicsCommandList* cl, unsigned vertices) {
+    if (o_DrawInstanced) o_DrawInstanced(cl, vertices, 1, 0, 0);
+    else cl->DrawInstanced(vertices, 1, 0, 0);
+}
+
+bool restore_targets(ID3D12GraphicsCommandList* cl) {
+    const LastTargets& t = t_last_targets;
+    if (t.cl != cl) return false;
+    raw_bind(cl, t.n, t.n ? t.rts : nullptr, t.single, t.has_ds ? &t.ds : nullptr);
+    return true;
 }
 
 void raw_barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BARRIER* b) {

@@ -204,10 +204,12 @@ def patch(text, allow_prev_world=True):  # (allow_prev_world: kept for callers; 
     text = '\n'.join(out)
     text, n_wvp = patch_wvp(text) if found['wvp'] else (text, 0)
     text, n_inv = patch_inverse(text, found['inverse']) if found['inverse'] else (text, 0)
-    text, n_remap = patch_index_remap(text, set(screen))
+    text, n_ld, ld_handles = patch_globals_depth(text, LIGHT_DEPTH_PS)
+    text, n_remap = patch_index_remap(text, set(screen) | ld_handles)
+    n_remap += n_ld
     text, n_ndc = patch_ndc(text)
     text, n_sky = patch_sky_prev(text)
-    text, n_gd = patch_globals_depth(text)
+    text, n_gd, _ = patch_globals_depth(text)
     n_ndc += n_sky + n_gd
     if n_redirect + n_screen + n_wvp + n_inv + n_remap + n_ndc == 0:
         raise Refused('no view-dependent block')
@@ -571,18 +573,38 @@ def patch_ndc(text):
 # scene depth; the depth resolve, when it is the one bound, holds the same image by then). So they draw for both eyes
 # in slice 0's region and the recorder skip (ViSkipRecord) does not lose them in eye 2.
 GLOBALS_DEPTH_PS = {'PS_lightglow': 'DepthBufferSampler', 'PSFootprintCollector': 'DepthBufferSampler',
-                    'PSFootprintColor': 'DepthBufferSampler'}
+                    'PSFootprintColor': 'DepthBufferSampler',
+                    # 2026-10-14, the headset: a cart's wheel track through the horse (the collector had no twin fix: it
+                    # was used as is, so view 1 tested eye 1's depth); the lamps' volumetric glow likewise
+                    'PS_wheeltrackcollector': 'DepthBufferSampler', 'PS_VolumetricPointLightGeometry': 'DepthMapSampler'}
 
 
-def patch_globals_depth(text):
+# The deferred lights read the scene depth by $Globals DepthMapSampler: with rage_matrices, so before 2026-10-14 only the
+# index remap (patch_index_remap: equal to the core's depth index) covered it, and the light pass's index is not that one:
+# view 1 rebuilt each pixel's position from eye 1's depth (the headset: the porch lantern, PS_PointLight_Shadow, lit the
+# wall in the left eye only). Each reads eye 2's depth in view 1 whatever the index (patch_globals_depth's way).
+LIGHT_DEPTH_RE = re.compile(r'PS_(PointLight|SpotLight|SpotFillLight|FillLight|Directional)\w*$')
+LIGHT_DEPTH_PS = 'lights'
+
+
+def patch_globals_depth(text, which=None):
+    """(text, n, the handles made from eye 2's depth): GLOBALS_DEPTH_PS's shaders (no rage_matrices), or with which ==
+    LIGHT_DEPTH_PS the deferred lights' DepthMapSampler (before the index remap, which then leaves those handles)."""
     e = re.search(r'^define void @(\w+)\(', text, re.M)
-    name = GLOBALS_DEPTH_PS.get(e.group(1)) if e else None
     rid = range_ids(text)
-    if not name or '$Globals' not in rid or 'rage_matrices' in rid:
-        return text, 0
+    if which == LIGHT_DEPTH_PS:
+        name = 'DepthMapSampler' if e and LIGHT_DEPTH_RE.match(e.group(1)) else None
+        if not name or '$Globals' not in rid:
+            return text, 0, set()
+    else:
+        name = GLOBALS_DEPTH_PS.get(e.group(1)) if e else None
+        if not name or '$Globals' not in rid or 'rage_matrices' in rid:
+            return text, 0, set()
     m = re.search(r'^; cbuffer \$Globals$(.*?)^;\s+\} \$Globals;', text, re.M | re.S)
     off = m and re.search(r' ' + name + r';\s+; Offset:\s+(\d+)', m.group(1))
     if not off:
+        if which == LIGHT_DEPTH_PS:
+            return text, 0, set()
         raise Refused(f'no $Globals {name}')
     row, comp = int(off.group(1)) // 16, int(off.group(1)) % 16 // 4
     hg = set(cb_handles(text, rid['$Globals']))
@@ -594,18 +616,21 @@ def patch_globals_depth(text):
     for m in re.finditer(r'^  (%\d+) = add i32 (%\d+), 0$', text, re.M):
         if m.group(2) in idx:
             idx.add(m.group(1))
-    out, n = [], 0
+    out, n, made = [], 0, set()
     for ln in text.split(chr(10)):
         m = re.match(r'^  (%\d+) = call %dx\.types\.Handle @dx\.op\.createHandle\(i32 57, i8 0, i32 \d+, i32 (%\d+), i1', ln)
         if m and m.group(2) in idx:
             n += 1
-            t = f'%gd{n}.sp'
+            made.add(m.group(1))
+            t = f'%{"ld" if which == LIGHT_DEPTH_PS else "gd"}{n}.sp'
             out.append(f'  {t} = select i1 %isv1.sp, i32 {EYE2_SLOT_BASE + DEPTH_BUFFER_SLOT}, i32 {m.group(2)}')
             ln = ln.replace(f', i32 {m.group(2)}, i1', f', i32 {t}, i1', 1)
         out.append(ln)
     if not n:
+        if which == LIGHT_DEPTH_PS:  # declared, not read (PS_DirectionalLightGeometry)
+            return text, 0, set()
         raise Refused(f'{name} not read as a texture index')
-    return chr(10).join(out), n
+    return chr(10).join(out), n, made
 
 
 # The sky's vertex shader (vs_main: rage_matrices and rage_prev_proj, no rage_prev_world): its position is (world - the

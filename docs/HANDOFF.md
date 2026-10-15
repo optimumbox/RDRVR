@@ -146,3 +146,36 @@ motion vectors) are still recorded; that is ~2.85 ms render + ~2.5 ms playback.
   load live `vi load <dir> all`; NO_TWIN_PS in stereo_vs.py for full-screen passes that read screen images by their
   own index.
 - Build: `powershell -File tools\build.ps1`.
+- 2026-10-14, the water flat grey-brown in both eyes (the player's save, a desert creek): both eyes' scenes use the same
+  occlusion query slots and resolve into the same buffers, eye 2's last; under the skip eye 2's queries see nothing, so
+  its resolve wrote "nothing visible" over eye 1's and the game faded the reflection map out (`vi queries`: slice 1's
+  region resolves [0..9)). Ruled out first: the water shaders (unconverted: still brown), ViSlices=0, cull/pred/skip/
+  pass2 alone. Fix: `[Stereo] ViKeepEye1Queries` (default on; `vi qkeep on|off`) drops eye 2's occlusion resolves under
+  the skip. Verified both eyes: `research\cap_player\k.png` (left column off, right on).
+- 2026-10-14, the water greyed/smeared in one eye after the query fix: the four river-water pixel shaders
+  (PSRiverWater*) drawn view-instanced were wrong in view 1; now no twin (stereo_vs.py NO_TWIN_PS, set stereo_all16 edited
+  in place): each eye's region draws them, matching two-pass in the creek capture.
+- 2026-10-14, distant cacti and grass flickering in one eye under ViSkipRecord: bisected in the headset over the recorder
+  methods (`vi pass2 slots <hex>`): the state methods are needed (+0x100/+0x140 the texture tables copy descriptors into
+  the frame's ring once a frame stamp, and others). [Stereo] ViSkipSlots (default 6000) skips only the draws (+0x1a8,
+  +0x1b8); with ViSkipWalk pass 2 costs 0.79 ms (full skip 0.47). Some single-slot combinations crash (+0x100 needs the
+  pipeline at recorder +0xc0). Test aid: `pad` bits 0x0400/0x0800 hold LT/RT.
+
+### 2026-10-15: right-eye lights (MacFarlane's facade): the light copy
+- Symptom: at night some lights lit a wall in the left eye only. The facade's light is the spot 8afa
+  (PS_SpotLightShadowCascaded, VS d9f1, pair VS row 12). Ruled out: stencil and depth tests (`vi dsoff <ps> both`),
+  87f8 and 08bb. A flag diagnostic (atten/shadow/cone as 0/1 colours) lit nothing in view 1, so view 1 either never
+  shades or reconstructs a wrong position. Lead not yet checked: view 1's inverse (rows 29-31 composed with $Globals
+  rows 6-9 and rage_matrices 4-7) under a DLSS sub-rect.
+- Stopgap, on by default: `[Stereo] ViLightCopy` (1 max, 2 replace, 0 off; `prepass lightcopy off|max|replace`). At the
+  light pass's end one full-screen draw (the game's bound root signature; DXBC 5.1 made at first use) fills slice 1 of
+  the Light Buffer from slice 0, reprojected by eye 2's depth, where eye 1's depth agrees within 2% of the distance
+  (without that test, NPCs left a ghost beside them in the right eye). Cost measured in the headset: about 0.1 ms GPU
+  (off 7.86, on 7.97 ms; noise +-0.4). Slot kEye2SlotBase + 20: a plain view of the Light Buffer's slice 0.
+- Test method: `vi load <dir>` (no "all") then `vi dsoff <ps> <mode>` remakes only that PS's pipelines in ~0.8 s; the
+  test channel's command line stops at 1024 chars. `prepass grab light <file.rda>` + `tools\sp\rda2png.py`. In a
+  hand-edited .ll, a float constant not exact in float must be written in hex (dxa refuses `1.0e-03`).
+
+### 2026-10-14: ViKeepEye1Queries off by default; CAS sharpening
+- `[Stereo] ViKeepEye1Queries` now defaults to 0. Dropping eye 2's occlusion resolves left the no-twin river water broken after every load until a two-pass frame (alt-tab, or `vi off`/`vi on`). `vi qkeep off` live fixed it.
+- `[XR] Sharpness` (0..1, default 0.5; the menu's "Sharpening", below DLSS quality): AMD CAS (the no-scaling path, as KF2VR's) inside the eye blit's pixel shaders (`xr_blit.cpp`, `ps` and `ps_resample`), so it runs on the mod's own list after the game's post-processing, in every AA mode. 0 skips the taps. In the resample path the neighbours sit max(s, 1) content texels apart (exact at 1:1).

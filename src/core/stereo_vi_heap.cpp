@@ -69,7 +69,8 @@ struct Pending {
     int slot = 0;
     ID3D12Resource* e2 = nullptr;
     ID3D12Resource* game = nullptr;
-    std::unordered_map<ID3D12DescriptorHeap*, int64_t> written;  // heap -> the table base it was written for
+    std::unordered_map<ID3D12DescriptorHeap*, int64_t> written;
+    bool slice0 = false;  // (slice0_texture: slice 0's plain view, not eye 2's slice)  // heap -> the table base it was written for
 };
 std::vector<Pending> g_pending;
 std::atomic<uint64_t> g_written{0}, g_refused{0}, g_table_binds{0}, g_outside{0};
@@ -213,7 +214,7 @@ void write_pending(ID3D12DescriptorHeap* heap) {  // under g_mutex
             d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             d.Texture2D.MipLevels = 1;
         }
-        if (d3d::is_doubled(p.e2) && d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {  // ([Stereo] ViSlices: eye 2's slice)
+        if (d3d::is_doubled(p.e2) && d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D && !p.slice0) {  // ([Stereo] ViSlices: eye 2's slice)
             const D3D12_TEX2D_SRV t = d.Texture2D;
             d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
             d.Texture2DArray = {t.MostDetailedMip, t.MipLevels, 1, 1, t.PlaneSlice, t.ResourceMinLODClamp};
@@ -318,6 +319,19 @@ void eye2_texture(int slot, ID3D12Resource* e2, ID3D12Resource* game) {
             found = true;
         }
     if (!found) g_pending.push_back(Pending{slot, e2, game, {}});
+    for (auto& [heap, h] : g_heaps)
+        if (h.base >= 0) write_pending(heap);
+}
+
+void slice0_texture(int slot, ID3D12Resource* res) {
+    std::lock_guard lock(g_mutex);
+    bool found = false;
+    for (Pending& p : g_pending)
+        if (p.slot == slot) {
+            p = Pending{slot, res, res, {}, true};
+            found = true;
+        }
+    if (!found) g_pending.push_back(Pending{slot, res, res, {}, true});
     for (auto& [heap, h] : g_heaps)
         if (h.base >= 0) write_pending(heap);
 }

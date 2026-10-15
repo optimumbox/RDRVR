@@ -29,7 +29,7 @@ foreach ($k in $map.Keys) {
     Copy-Item -LiteralPath $map[$k] -Destination (Join-Path $pay $k)
 }
 # the single-pass stereo's converted shaders (session.ps1's set), in RDRVR_shaders\
-$shaders = Join-Path $root 'research\stereo_all16'
+$shaders = Join-Path $root 'research\stereo_all18'
 if (-not (Test-Path (Join-Path $shaders 'no_twin.txt'))) { throw "missing $shaders (tools\sp\dxil\stereo_vs.py)" }
 New-Item -ItemType Directory -Force (Join-Path $pay 'RDRVR_shaders') | Out-Null
 $files = @($map.Keys)

@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <d3dcompiler.h>
 
 #include <intrin.h>
 
@@ -20,12 +21,14 @@
 #include "core/d3d_hooks.h"
 #include "core/dual_pass.h"
 #include "core/log.h"
+#include "core/pso.h"
 #include "core/replay_ops.h"
 #include "core/state.h"
 #include "core/stereo_vi.h"
 #include "core/taa.h"
 
 namespace rdrvr::prepass {
+void set_light_copy(int mode);
 namespace {
 
 // The pre-pass's six, then (view-instanced main pass, [Stereo] ViMain) the main pass's own targets
@@ -1352,6 +1355,7 @@ void install() {
     g_i2 = arrays && config::get_bool("Stereo", "ViMain", false);
     if (g_i2) log::info("[prepass] [Stereo] ViMain on (test only: the region to the scene's end, the main pass's targets too)");
     g_slices = g_i2 && config::get_bool("Stereo", "ViSlices", true);
+    if (g_slices) set_light_copy(config::get_int("Stereo", "ViLightCopy", 1));
     if (g_slices) log::info("[prepass] [Stereo] ViSlices on (the render-size targets made with a slice per eye, drawn in place)");
     if (arrays) log::info("[prepass] [Stereo] PrepassArrays on (test only: each eye's pre-pass drawn into 2-slice arrays, copied back at the walk's end)");
     if (views && anchors::present(Id::HandleWorldView) && anchors::present(Id::HandleViewInverse) && anchors::present(Id::HandlePrevViewProj) &&
@@ -1553,6 +1557,258 @@ void drawn(ID3D12GraphicsCommandList* cl) {
     }
 }
 
+// ---- "prepass lightcopy off|max|replace": eye 2's Light Buffer slice filled from eye 1's, reprojected (a stopgap
+// while view 1's light passes leave lights out: 2026-10-14, the headset: MacFarlane's facade lit in the left eye only).
+// At the end of a view-instanced region's light pass (the Light Buffer turned from written to read), one full-screen
+// triangle into slice 1: each pixel's eye 2 depth (eye 2's copy, table slot kEye2SlotBase + kDepthBufferSlot) taken back
+// to a camera-relative position by eye 2's view-projection's inverse, moved to eye 1's camera and projected by eye 1's
+// (rage_matrices rows 17-20 and 28, 4-7 and 15, as the pair VSs read them), and slice 0 read there (a plain view of it
+// at kEye2SlotBase + kLightSlice0Slot) where eye 1 sees the same point: eye 1's depth there, taken back, within 2% of
+// the distance (else eye 1 sees something nearer there, and its light was a ghost of that beside it in eye 2:
+// 2026-10-15, the headset). max: the larger of eye 2's own light and eye 1's (eye 2's own kept where it has it);
+// replace: eye 1's. Drawn with the game's bound root signature (its root arguments stay), then the game's pipeline,
+// viewports and targets bound again.
+namespace {
+const char kLcShader[] = R"(
+cbuffer rage_matrices : register(b1) { float4 m[31]; };
+Texture2D<float4> tex[] : register(t0, space2);
+struct V {
+    float4 pos : SV_Position;
+    float2 uv : TEXCOORD0;
+    nointerpolation float4 i0 : TEXCOORD1;
+    nointerpolation float4 i1 : TEXCOORD2;
+    nointerpolation float4 i2 : TEXCOORD3;
+    nointerpolation float4 i3 : TEXCOORD4;
+    nointerpolation float4 j0 : TEXCOORD5;
+    nointerpolation float4 j1 : TEXCOORD6;
+    nointerpolation float4 j2 : TEXCOORD7;
+    nointerpolation float4 j3 : TEXCOORD8;
+};
+float4x4 inv4(float4x4 a) {
+    const float b00 = a[0][0] * a[1][1] - a[0][1] * a[1][0], b01 = a[0][0] * a[1][2] - a[0][2] * a[1][0];
+    const float b02 = a[0][0] * a[1][3] - a[0][3] * a[1][0], b03 = a[0][1] * a[1][2] - a[0][2] * a[1][1];
+    const float b04 = a[0][1] * a[1][3] - a[0][3] * a[1][1], b05 = a[0][2] * a[1][3] - a[0][3] * a[1][2];
+    const float b06 = a[2][0] * a[3][1] - a[2][1] * a[3][0], b07 = a[2][0] * a[3][2] - a[2][2] * a[3][0];
+    const float b08 = a[2][0] * a[3][3] - a[2][3] * a[3][0], b09 = a[2][1] * a[3][2] - a[2][2] * a[3][1];
+    const float b10 = a[2][1] * a[3][3] - a[2][3] * a[3][1], b11 = a[2][2] * a[3][3] - a[2][3] * a[3][2];
+    const float det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
+    float4x4 r;
+    r[0][0] = a[1][1] * b11 - a[1][2] * b10 + a[1][3] * b09;
+    r[0][1] = a[0][2] * b10 - a[0][1] * b11 - a[0][3] * b09;
+    r[0][2] = a[3][1] * b05 - a[3][2] * b04 + a[3][3] * b03;
+    r[0][3] = a[2][2] * b04 - a[2][1] * b05 - a[2][3] * b03;
+    r[1][0] = a[1][2] * b08 - a[1][0] * b11 - a[1][3] * b07;
+    r[1][1] = a[0][0] * b11 - a[0][2] * b08 + a[0][3] * b07;
+    r[1][2] = a[3][2] * b02 - a[3][0] * b05 - a[3][3] * b01;
+    r[1][3] = a[2][0] * b05 - a[2][2] * b02 + a[2][3] * b01;
+    r[2][0] = a[1][0] * b10 - a[1][1] * b08 + a[1][3] * b06;
+    r[2][1] = a[0][1] * b08 - a[0][0] * b10 - a[0][3] * b06;
+    r[2][2] = a[3][0] * b04 - a[3][1] * b02 + a[3][3] * b00;
+    r[2][3] = a[2][1] * b02 - a[2][0] * b04 - a[2][3] * b00;
+    r[3][0] = a[1][1] * b07 - a[1][0] * b09 - a[1][2] * b06;
+    r[3][1] = a[0][0] * b09 - a[0][1] * b07 + a[0][2] * b06;
+    r[3][2] = a[3][1] * b01 - a[3][0] * b03 - a[3][2] * b00;
+    r[3][3] = a[2][0] * b03 - a[2][1] * b01 + a[2][2] * b00;
+    return r / det;
+}
+V vs(uint id : SV_VertexID) {
+    V o;
+    const float2 uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+    o.uv = uv;
+    const float4x4 c = inv4(float4x4(m[17], m[18], m[19], m[20]));  // clip 2 -> eye 2's camera-relative (homogeneous)
+    o.i0 = c[0];
+    o.i1 = c[1];
+    o.i2 = c[2];
+    o.i3 = c[3];
+    const float4x4 c1 = inv4(float4x4(m[4], m[5], m[6], m[7]));  // clip 1 -> eye 1's camera-relative
+    o.j0 = c1[0];
+    o.j1 = c1[1];
+    o.j2 = c1[2];
+    o.j3 = c1[3];
+    return o;
+}
+float4 ps(V i) : SV_Target {
+    const float2 size = float2(1.0 / ddx(i.uv.x), 1.0 / ddy(i.uv.y));  // the viewport's, in pixels
+    const float d = tex[DEPTH_INDEX].Load(int3(int2(i.pos.xy), 0)).r;
+    const float2 n = float2(i.uv.x * 2.0 - 1.0, 1.0 - i.uv.y * 2.0);
+    const float4 h = n.x * i.i0 + n.y * i.i1 + d * i.i2 + i.i3;
+    if (abs(h.w) < 1e-20) discard;
+    const float3 rel = h.xyz / h.w + m[28].xyz - m[15].xyz;  // relative to eye 1's camera
+    const float4 c = rel.x * m[4] + rel.y * m[5] + rel.z * m[6] + m[7];
+    if (c.w < 1e-5) discard;
+    const float2 u = float2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
+    if (any(u < 0.0) || any(u > 1.0)) discard;
+    const int2 q = int2(i.pos.xy + (u - i.uv) * size);
+    // eye 1 sees the same point there (not something nearer hiding it from eye 1: eye 1's light of that would be a
+    // ghost of it beside it in eye 2): eye 1's depth there taken back to a position, within 2% of the distance
+    const uint di1 = asuint(m[30].w);  // the game's scene depth view (prepass_arrays.cpp write_inv_wv2)
+    if (di1 != 0xffffffffu) {
+        const float d1 = tex[NonUniformResourceIndex(di1)].Load(int3(q, 0)).r;
+        const float2 n1 = float2(u.x * 2.0 - 1.0, 1.0 - u.y * 2.0);
+        const float4 h1 = n1.x * i.j0 + n1.y * i.j1 + d1 * i.j2 + i.j3;
+        if (abs(h1.w) < 1e-20) discard;
+        const float3 e = h1.xyz / h1.w - rel;
+        if (dot(e, e) > 4e-4 * dot(rel, rel)) discard;
+    }
+    return tex[LIGHT_INDEX].Load(int3(q, 0));
+}
+)";
+std::atomic<int> g_lc_mode{0};  // 0 off, 1 max, 2 replace
+std::atomic<uint64_t> g_lc_drawn{0}, g_lc_skipped{0};
+std::atomic<const char*> g_lc_why{"not tried"};
+ID3DBlob *g_lc_vs = nullptr, *g_lc_ps = nullptr;
+struct LcPso {
+    ID3D12RootSignature* root;
+    DXGI_FORMAT fmt;
+    ID3D12PipelineState* pso[2];  // max, replace
+};
+std::vector<LcPso> g_lc_psos;  // (the playback thread's)
+ID3D12DescriptorHeap* g_lc_rtv_heap = nullptr;
+ID3D12Resource* g_lc_rtv_for = nullptr;  // the resource the RTV and slot 20's view are of
+DXGI_FORMAT g_lc_fmt = DXGI_FORMAT_UNKNOWN;
+
+using LcCompile_t = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR, UINT, UINT,
+                                     ID3DBlob**, ID3DBlob**);
+std::string lc_compile() {
+    if (g_lc_vs && g_lc_ps) return "";
+    HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+    auto fn = dc ? reinterpret_cast<LcCompile_t>(GetProcAddress(dc, "D3DCompile")) : nullptr;
+    if (!fn) return "no d3dcompiler_47";
+    const std::string di = std::to_string(vi::kEye2SlotBase + vi::kDepthBufferSlot), li = std::to_string(vi::kEye2SlotBase + vi::kLightSlice0Slot);
+    const D3D_SHADER_MACRO defs[] = {{"DEPTH_INDEX", di.c_str()}, {"LIGHT_INDEX", li.c_str()}, {nullptr, nullptr}};
+    std::string out;
+    for (int s = 0; s < 2; ++s) {
+        ID3DBlob *code = nullptr, *err = nullptr;
+        if (FAILED(fn(kLcShader, sizeof(kLcShader) - 1, "rdrvr_lightcopy", defs, nullptr, s ? "ps" : "vs", s ? "ps_5_1" : "vs_5_1",
+                      D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, 0, &code, &err)))
+            out += std::string(s ? "ps: " : "vs: ") + (err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
+        else (s ? g_lc_ps : g_lc_vs) = code;
+        if (err) err->Release();
+    }
+    return out;
+}
+DXGI_FORMAT lc_rtv_format(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        default: return f;
+    }
+}
+ID3D12PipelineState* lc_pso(ID3D12RootSignature* root, DXGI_FORMAT fmt, int mode) {
+    for (const LcPso& p : g_lc_psos)
+        if (p.root == root && p.fmt == fmt) return p.pso[mode == 2 ? 1 : 0];
+    LcPso made{root, fmt, {}};
+    for (int m = 0; m < 2; ++m) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = root;
+        pd.VS = {g_lc_vs->GetBufferPointer(), g_lc_vs->GetBufferSize()};
+        pd.PS = {g_lc_ps->GetBufferPointer(), g_lc_ps->GetBufferSize()};
+        D3D12_RENDER_TARGET_BLEND_DESC& b = pd.BlendState.RenderTarget[0];
+        b.BlendEnable = m == 0;
+        b.SrcBlend = b.DestBlend = b.SrcBlendAlpha = b.DestBlendAlpha = D3D12_BLEND_ONE;
+        b.BlendOp = b.BlendOpAlpha = D3D12_BLEND_OP_MAX;
+        b.LogicOp = D3D12_LOGIC_OP_NOOP;
+        b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = ~0u;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = fmt;
+        pd.SampleDesc = {1, 0};
+        if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&made.pso[m])))) {
+            log::warn("[prepass] light copy: the pipeline (format %d) not made with the game's root signature %p", static_cast<int>(fmt),
+                      static_cast<void*>(root));
+            made.pso[m] = nullptr;
+        }
+    }
+    g_lc_psos.push_back(made);
+    log::info("[prepass] light copy: pipelines for root signature %p, format %d", static_cast<void*>(root), static_cast<int>(fmt));
+    return made.pso[mode == 2 ? 1 : 0];
+}
+// lb in RENDER_TARGET (all subresources): the game's barrier out of it is next
+void light_copy(ID3D12GraphicsCommandList* cl, ID3D12Resource* lb) {
+    const int mode = g_lc_mode.load(std::memory_order_relaxed);
+    if (!mode || !lb) return;
+    if (!g_lc_vs || !g_lc_ps) {  // ([Stereo] ViLightCopy: made at the first use, once)
+        static bool tried = false;
+        if (tried) return;
+        tried = true;
+        const std::string e = lc_compile();
+        if (!e.empty()) {
+            log::error("[prepass] light copy: the shaders do not compile: %s", e.c_str());
+            g_lc_why = "the shaders do not compile";
+            return;
+        }
+    }
+    auto skip = [](const char* why) {
+        g_lc_why = why;
+        g_lc_skipped.fetch_add(1, std::memory_order_relaxed);
+    };
+    const D3D12_RESOURCE_DESC rd = lb->GetDesc();
+    if (rd.DepthOrArraySize < 2) return skip("the Light Buffer has one slice");
+    ID3D12RootSignature* root = vi::bound_root(cl);
+    if (!root) return skip("no game pipeline bound (its root signature not known)");
+    D3D12_VIEWPORT vp{};
+    if (!vi::game_viewport(cl, &vp)) return skip("no game viewport");
+    if (lb != g_lc_rtv_for) {
+        if (!g_lc_rtv_heap) {
+            D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            if (FAILED(g_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_lc_rtv_heap)))) return skip("no RTV heap");
+        }
+        g_lc_fmt = lc_rtv_format(rd.Format);
+        D3D12_RENDER_TARGET_VIEW_DESC v{};
+        v.Format = g_lc_fmt;
+        v.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+        v.Texture2DArray = {0, 1, 1, 0};
+        g_dev->CreateRenderTargetView(lb, &v, g_lc_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+        vi::slice0_texture(vi::kLightSlice0Slot, lb);
+        g_lc_rtv_for = lb;
+        log::info("[prepass] light copy: the Light Buffer %p (format %d, view %d)", static_cast<void*>(lb), static_cast<int>(rd.Format),
+                  static_cast<int>(g_lc_fmt));
+        return skip("the views just made (drawn from the next frame)");
+    }
+    ID3D12PipelineState* pso = lc_pso(root, g_lc_fmt, mode);
+    if (!pso) return skip("no pipeline");
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition = {lb, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};  // slice 0
+    d3d::raw_barrier(cl, 1, &b);
+    pso::raw_set_pipeline(cl, pso);
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_lc_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    d3d::raw_bind(cl, 1, &rtv, FALSE, nullptr);
+    vi::raw_viewport(cl, vp);
+    d3d::raw_draw(cl, 3);
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    d3d::raw_barrier(cl, 1, &b);
+    vi::rebind(cl);
+    d3d::restore_targets(cl);
+    g_lc_drawn.fetch_add(1, std::memory_order_relaxed);
+    g_lc_why = "drawn";
+}
+}  // namespace
+void set_light_copy(int mode) {
+    g_lc_mode = mode < 0 || mode > 2 ? 0 : mode;
+    static const char* const names[] = {"off", "max", "replace"};
+    log::info("[prepass] [Stereo] ViLightCopy %s (eye 2's Light Buffer from eye 1's, reprojected)", names[g_lc_mode.load()]);
+}
+std::string light_copy_command(const std::string& arg) {
+    if (arg == "off" || arg == "max" || arg == "replace") {
+        if (arg != "off") {
+            const std::string e = lc_compile();
+            if (!e.empty()) return "ERROR light copy shaders: " + e;
+        }
+        g_lc_mode = arg == "off" ? 0 : arg == "max" ? 1 : 2;
+    }
+    static const char* const names[] = {"off", "max", "replace"};
+    return std::string("light copy ") + names[g_lc_mode.load()] + ": drawn " + std::to_string(g_lc_drawn.load()) + ", skipped " +
+           std::to_string(g_lc_skipped.load()) + " (" + g_lc_why.load() + ")";
+}
+
 void barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BARRIER* b) {
     if (cl != g_r.cl || !b) return;
     if (g_end_pending.load(std::memory_order_acquire)) {  // the walk ended: copied before this batch
@@ -1564,9 +1820,18 @@ void barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BAR
         const int k = kind_of_resource(b[i].Transition.pResource);
         if (k < 0) continue;
         if (g_arr[k].native) {
-            if (g_arr[k].e2 && g_r.vi && g_r.slice == 0 && writing(k, b[i].Transition.StateBefore) && !writing(k, b[i].Transition.StateAfter) &&
-                b[i].Transition.StateAfter != D3D12_RESOURCE_STATE_COPY_DEST)
-                snapshot(cl, k, b[i].Transition.StateBefore);
+            const bool done_writing = g_r.vi && g_r.slice == 0 && writing(k, b[i].Transition.StateBefore) && !writing(k, b[i].Transition.StateAfter) &&
+                                      b[i].Transition.StateAfter != D3D12_RESOURCE_STATE_COPY_DEST;
+            if (g_arr[k].e2 && done_writing) snapshot(cl, k, b[i].Transition.StateBefore);
+            if (k == kLight && done_writing && b[i].Transition.StateBefore == D3D12_RESOURCE_STATE_RENDER_TARGET)
+                light_copy(cl, g_arr[k].game);  // ("prepass lightcopy")
+            if (done_writing && g_arr[k].planes == 1 && g_grab_phase.load(std::memory_order_relaxed)) {  // "prepass grab" of a native kind
+                const D3D12_RESOURCE_BARRIER to = transition(g_arr[k].game, b[i].Transition.StateBefore, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                const D3D12_RESOURCE_BARRIER back = transition(g_arr[k].game, D3D12_RESOURCE_STATE_COPY_SOURCE, b[i].Transition.StateBefore);
+                d3d::raw_barrier(cl, 1, &to);
+                grab_tap(cl, k, g_arr[k].game);
+                d3d::raw_barrier(cl, 1, &back);
+            }
             continue;
         }
         const UINT sub = b[i].Transition.Subresource;

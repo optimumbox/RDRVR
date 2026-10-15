@@ -27,6 +27,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 NO_TWIN_PS = {
     'PS_Blit': 'the refraction copy reads FullScreenCopy through TextureSampler',
     'PSMiragerSingle': 'the heat haze reads the scene copy through RenderMapBilinearSampler',
+    # 2026-10-14, the player's creek: view 1's water greyed and smeared (twinned); drawn by each eye it matches two-pass
+    'PSRiverWaterRefracted': 'the river water (view 1 wrong when twinned)',
+    'PSRiverWaterJointSplash': 'the river water (view 1 wrong when twinned)',
+    'PSRiverWaterNotRefracted': 'the river water (view 1 wrong when twinned)',
+    'PSRiverWaterJointNoRefraction': 'the river water (view 1 wrong when twinned)',
 }
 import os
 for _n in filter(None, os.environ.get('RDRVR_NO_TWIN_EXTRA', '').split(',')):  # (experiments)

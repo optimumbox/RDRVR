@@ -10,6 +10,7 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <sstream>
 #include <algorithm>
 #include <map>
 #include <mutex>
@@ -71,10 +72,23 @@ std::atomic<bool> g_configured{false}, g_on{true};
 std::atomic<bool> g_query_draws{true};
 std::atomic<bool> g_skip{true};      // slice 1's twinned draws skipped ("vi skip off": eye 2 draws them itself, the A/B)
 std::atomic<bool> g_pred_off{false}; // pass 2's main pass ignores the game's predication ("vi pred off": the A/B)
+// [Stereo] ViUnpredicated ("vi pred0 off|on"; 2026-10-14, the player's distant cacti flickering in one eye): slice 0's
+// region drops the game's predication, which is eye 1's occlusion and hid eye 2's view of a draw too
+std::atomic<bool> g_pred0_off{false};
 // [Stereo] ViMain (I2): the main pass in the regions too. Slice 1's region then holds eye 2's main pass, whose draws the
 // game predicates by eye 2's own queries, which see nothing once its pre-pass draws are skipped: its predication is
 // dropped instead (the draws it still makes, the untwinned, all drawn) and its queried draws need not be redrawn.
 std::atomic<bool> g_main{false};  // slice 1's draws inside an occlusion query drawn ("vi qdraw on|off": the A/B)
+// [Stereo] ViKeepEye1Queries (default off since the river water has no twin; 2026-10-14, the player's save: the water flat and grey-brown in both eyes, its
+// reflection gone): both eyes' scenes use the same occlusion query slots and resolve them into the same buffers, eye 2's
+// last. Eye 2's queries see nothing under the skip (its draws skipped, the predication dropped), so its resolve wrote
+// "nothing visible" over eye 1's results, and the game, reading them, faded the water's reflection map out (probe: slice
+// 1's region resolves slots [0..9) into the buffers slice 0's region resolved). Eye 2's occlusion resolves are dropped
+// under the skip: the game reads eye 1's counts ("vi qkeep on|off"). Since the river water shaders have no twin (eye 2's
+// region draws the water itself, its queries count), dropping eye 2's resolves left the water broken after each load
+// until a two-pass frame (an alt-tab); the headset, the same day: resolves made, the water right.
+std::atomic<bool> g_keep_eye1_queries{false};
+std::atomic<uint64_t> g_resolves_dropped{0};
 ID3D12Device2* g_dev = nullptr;
 int g_tier = -1;
 std::string g_dir;
@@ -84,7 +98,15 @@ std::vector<std::unique_ptr<Kept>> g_kept;
 std::unordered_map<ID3D12PipelineState*, Kept*> g_by_pso;
 std::atomic<uint64_t> g_by_pso_gen{0};  // records added (kept_of's caches)
 std::unordered_map<uint64_t, std::vector<uint8_t>> g_vs_conv, g_ps_conv;
+// vp_<vs hash>_<ps hash>.dxil: a vertex shader for that pair only, before vs_<hash> (2026-10-14: the light quads' view 1
+// reads the light's sphere from $Globals, whose layout is the pixel shader's)
+std::unordered_map<uint64_t, std::vector<uint8_t>> g_vp_conv;
+uint64_t vp_key(uint64_t vs, uint64_t ps) { return vs ^ (ps * 0x9e3779b97f4a7c15ull); }
 std::unordered_set<uint64_t> g_ps_safe;
+// "vi dsoff <ps,...> stencil|depth|both" / "vi dsoff off": twins of those pixel shaders made without the stencil and/or
+// depth test (the A/B of 2026-10-14: eye 2's light quads drew no pixel at all)
+std::unordered_set<uint64_t> g_dsoff;
+int g_dsoff_what = 0;  // 1 stencil, 2 depth, 3 both
 std::unordered_set<uint64_t> g_no_twin;  // <ViShaders>/no_twin.txt (stereo_vs.py NO_TWIN_PS): eye 1 only on purpose
 // [Stereo] ViSkipRecord's safety: a draw in slice 0's region with no twin (a shader not converted: one the dump never saw)
 // draws eye 1 only, and a skipped second scene records nothing for eye 2: eye 2's scene is recorded whole for a while
@@ -168,13 +190,20 @@ bool read_file(const std::string& path, std::vector<uint8_t>* out) {
 
 // vs_<hash>.dxil, ps_<hash>.dxil and ps_safe.txt from the folder (replacing what was loaded)
 void load_shaders(const std::string& dir) {
-    std::unordered_map<uint64_t, std::vector<uint8_t>> vs, ps;
+    std::unordered_map<uint64_t, std::vector<uint8_t>> vs, ps, vp;
     std::unordered_set<uint64_t> safe;
     WIN32_FIND_DATAA fd{};
     HANDLE h = FindFirstFileA((dir + "\\*.dxil").c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
             const std::string name = fd.cFileName;  // vs_<16 hex>.dxil
+            if (name.size() == 3 + 16 + 1 + 16 + 5 && name.compare(0, 3, "vp_") == 0) {  // vp_<vs>_<ps>.dxil
+                const uint64_t hv = std::strtoull(name.substr(3, 16).c_str(), nullptr, 16);
+                const uint64_t hp = std::strtoull(name.substr(20, 16).c_str(), nullptr, 16);
+                std::vector<uint8_t> b;
+                if (hv && hp && read_file(dir + "\\" + name, &b)) vp.emplace(vp_key(hv, hp), std::move(b));
+                continue;
+            }
             if (name.size() != 3 + 16 + 5 || (name.compare(0, 3, "vs_") != 0 && name.compare(0, 3, "ps_") != 0)) continue;
             const uint64_t hash = std::strtoull(name.substr(3, 16).c_str(), nullptr, 16);
             std::vector<uint8_t> b;
@@ -206,13 +235,14 @@ void load_shaders(const std::string& dir) {
     AcquireSRWLockExclusive(&g_lock);
     g_vs_conv.swap(vs);
     g_ps_conv.swap(ps);
+    g_vp_conv.swap(vp);
     g_ps_safe.swap(safe);
     g_no_depth.swap(no_depth);
     g_no_twin.swap(no_twin);
-    const size_t nv = g_vs_conv.size(), np = g_ps_conv.size(), ns = g_ps_safe.size(), nd = g_no_depth.size();
+    const size_t nv = g_vs_conv.size(), np = g_ps_conv.size(), ns = g_ps_safe.size(), nd = g_no_depth.size(), nvp = g_vp_conv.size();
     ReleaseSRWLockExclusive(&g_lock);
-    log::info("[vi] shaders from %s: %zu vertex, %zu pixel converted, %zu pixel listed safe, %zu that cannot read the depth", dir.c_str(),
-              nv, np, ns, nd);
+    log::info("[vi] shaders from %s: %zu vertex, %zu pixel converted, %zu pixel listed safe, %zu that cannot read the depth, %zu pair "
+              "vertex shaders", dir.c_str(), nv, np, ns, nd, nvp);
 }
 
 // ---- the twin: the game's desc as a pipeline stream, the converted shaders and a 2-view instancing subobject
@@ -251,6 +281,9 @@ const D3D12_VIEW_INSTANCE_LOCATION kLocations[2] = {{0, 0}, {1, 1}};
 
 void make_twin(Kept* k) {
     k->state = -1;
+    // "vi load <dir> all": a pipeline whose shaders are no twin (or refused) in the new set loses its old twin (leaked:
+    // frames in flight use it); before 2026-10-14 the old twin stayed bound, so a no-twin A/B tested nothing
+    k->twin.store(nullptr);
     if (k->other_stages) {
         k->why = "other stages";
         g_stages.fetch_add(1, std::memory_order_relaxed);
@@ -260,7 +293,8 @@ void make_twin(Kept* k) {
     const std::vector<uint8_t>* ps = nullptr;
     bool ps_ok = k->ps.empty();
     AcquireSRWLockShared(&g_lock);
-    if (auto it = g_vs_conv.find(k->vs_hash); it != g_vs_conv.end()) vs = &it->second;
+    if (auto it = g_vp_conv.find(vp_key(k->vs_hash, k->ps_hash)); !k->ps.empty() && it != g_vp_conv.end()) vs = &it->second;
+    else if (auto it2 = g_vs_conv.find(k->vs_hash); it2 != g_vs_conv.end()) vs = &it2->second;
     if (auto it = g_ps_conv.find(k->ps_hash); !k->ps.empty() && it != g_ps_conv.end()) {
         ps = &it->second;
         ps_ok = true;
@@ -285,6 +319,10 @@ void make_twin(Kept* k) {
     s.sample_mask.v = k->sample_mask;
     s.rast.v = k->rast;
     s.depth.v = k->depth;
+    if (g_dsoff_what && g_dsoff.count(k->ps_hash)) {
+        if (g_dsoff_what & 1) s.depth.v.StencilEnable = FALSE;
+        if (g_dsoff_what & 2) s.depth.v.DepthEnable = FALSE;
+    }
     s.layout.v = {k->layout.empty() ? nullptr : k->layout.data(), static_cast<UINT>(k->layout.size())};
     s.cut.v = k->cut;
     s.topology.v = k->topology;
@@ -486,6 +524,8 @@ void init() {
     g_twin_delay_ms = config::get_int("Stereo", "ViTwinDelayMs", 0);
     g_main = config::get_bool("Stereo", "ViMain", false);
     if (g_main) g_query_draws = false;
+    g_keep_eye1_queries = config::get_bool("Stereo", "ViKeepEye1Queries", false);
+    g_pred0_off = config::get_bool("Stereo", "ViUnpredicated", false);
     g_configured = true;
     log::info("[vi] view-instanced pre-pass configured (%s)", g_on.load() ? "on" : "off until \"vi on\"");
 }
@@ -567,6 +607,36 @@ bool viewport_extent(ID3D12GraphicsCommandList* cl, uint32_t* right, uint32_t* b
     *right = static_cast<uint32_t>(std::ceil(v.TopLeftX + v.Width));
     *bottom = static_cast<uint32_t>(std::ceil(v.TopLeftY + v.Height));
     return true;
+}
+
+ID3D12RootSignature* bound_root(ID3D12GraphicsCommandList* cl) {
+    if (!g_configured.load(std::memory_order_relaxed)) return nullptr;
+    const ListState& s = list(cl);
+    return s.kept ? s.kept->root : nullptr;
+}
+bool game_viewport(ID3D12GraphicsCommandList* cl, D3D12_VIEWPORT* vp) {
+    if (!g_configured.load(std::memory_order_relaxed)) return false;
+    const ListState& s = list(cl);
+    if (!s.have_vp) return false;
+    *vp = s.vp;
+    return true;
+}
+void raw_viewport(ID3D12GraphicsCommandList* cl, const D3D12_VIEWPORT& vp) {
+    const D3D12_RECT r{static_cast<LONG>(vp.TopLeftX), static_cast<LONG>(vp.TopLeftY), static_cast<LONG>(vp.TopLeftX + vp.Width),
+                       static_cast<LONG>(vp.TopLeftY + vp.Height)};
+    if (o_SetViewports) o_SetViewports(cl, 1, &vp);
+    if (o_SetScissors) o_SetScissors(cl, 1, &r);
+}
+void rebind(ID3D12GraphicsCommandList* cl) {
+    ListState& s = list(cl);
+    if (!s.bound) s.bound = s.game;
+    if (s.bound) pso::raw_set_pipeline(cl, s.bound);
+    if (s.bound && s.bound != s.game) return rs_for_twin(cl, s);
+    if (s.have_vp && o_SetViewports) o_SetViewports(cl, 1, &s.vp);
+    if (o_SetScissors) {
+        const D3D12_RECT r = s.have_sc ? s.sc : wide_of(s);
+        if (s.have_sc || s.have_vp) o_SetScissors(cl, 1, &r);
+    }
 }
 
 bool may_read_depth(ID3D12GraphicsCommandList* cl) {
@@ -724,9 +794,20 @@ void on_query(ID3D12GraphicsCommandList* cl, int kind, D3D12_QUERY_TYPE type, UI
     on_query_impl(cl, kind, index, res, off, n);
 }
 
+bool drop_resolve(ID3D12GraphicsCommandList* cl, D3D12_QUERY_TYPE type) {
+    if (!g_configured.load(std::memory_order_relaxed) || !g_keep_eye1_queries.load(std::memory_order_relaxed) ||
+        !g_skip.load(std::memory_order_relaxed))
+        return false;
+    if (type != D3D12_QUERY_TYPE_OCCLUSION && type != D3D12_QUERY_TYPE_BINARY_OCCLUSION) return false;
+    if (prepass::vi_region(cl, nullptr) != 2) return false;
+    g_resolves_dropped.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 bool drop_predication(ID3D12GraphicsCommandList* cl) {
     if (!g_configured.load(std::memory_order_relaxed)) return false;
     if (g_main.load(std::memory_order_relaxed) && prepass::vi_region(cl, nullptr) == 2) return true;
+    if (g_pred0_off.load(std::memory_order_relaxed) && prepass::vi_region(cl, nullptr) == 1) return true;
     if (!g_pred_off.load(std::memory_order_relaxed)) return false;
     return prepass::vi_region(cl, nullptr) == 0 && prepass::last_slice() == 1 && prepass::vi_frame_now();
 }
@@ -772,6 +853,8 @@ std::string command(const std::vector<std::string>& t) {
         }
         return o;
     }
+    if (sub == "pass2" && t.size() >= 4 && t[2] == "slots")  // vi pass2 slots <hex mask> (recorder_skip.h)
+        return recorder_skip::slots(static_cast<uint32_t>(std::strtoul(t[3].c_str(), nullptr, 16)));
     if (sub == "pass2" && t.size() >= 5 && t[2] == "cut")  // vi pass2 cut <rva hex> on|off (recorder_skip.h)
         return recorder_skip::cut(static_cast<uintptr_t>(std::strtoull(t[3].c_str(), nullptr, 16)), t[4] == "on");
     if (sub == "pass2" && t.size() >= 3) {  // vi pass2 skip|draw: a view-instanced frame's second scene not walked / walked
@@ -817,9 +900,40 @@ std::string command(const std::vector<std::string>& t) {
         g_skip = t[2] == "on";
         return std::string("slice 1's twinned draws ") + (g_skip.load() ? "skipped" : "drawn by eye 2 itself (A/B)");
     }
+    if (sub == "dsoff" && t.size() >= 3) {
+        AcquireSRWLockExclusive(&g_lock);
+        g_dsoff.clear();
+        g_dsoff_what = 0;
+        if (t[2] != "off") {
+            std::stringstream ss(t[2]);
+            std::string item;
+            while (std::getline(ss, item, ',')) if (!item.empty()) g_dsoff.insert(std::strtoull(item.c_str(), nullptr, 16));
+            const std::string w = t.size() >= 4 ? t[3] : "stencil";
+            g_dsoff_what = w == "depth" ? 2 : w == "both" ? 3 : 1;
+        }
+        std::vector<Kept*> again;
+        for (auto& k : g_kept)
+            if (k->ps_hash && (g_dsoff.count(k->ps_hash) || t[2] == "off")) {
+                k->remake = true;
+                again.push_back(k.get());
+            }
+        ReleaseSRWLockExclusive(&g_lock);
+        for (Kept* k : again) enqueue(k);
+        return "twins without " + std::string(g_dsoff_what == 2 ? "the depth test" : g_dsoff_what == 3 ? "depth and stencil tests" : g_dsoff_what ? "the stencil test" : "nothing") +
+               " for " + std::to_string(g_dsoff.size()) + " pixel shaders; " + std::to_string(again.size()) + " pipelines remade";
+    }
     if (sub == "pred" && t.size() >= 3) {
         g_pred_off = t[2] == "off";
         return std::string("pass 2's predication ") + (g_pred_off.load() ? "ignored (A/B)" : "as the game's");
+    }
+    if (sub == "pred0" && t.size() >= 3) {
+        g_pred0_off = t[2] == "off";
+        return std::string("slice 0's region's predication ") + (g_pred0_off.load() ? "dropped (both eyes draw all)" : "as the game's (eye 1's occlusion)");
+    }
+    if (sub == "qkeep" && t.size() >= 3) {
+        g_keep_eye1_queries = t[2] == "on";
+        return std::string("eye 2's occlusion resolves ") + (g_keep_eye1_queries.load() ? "dropped (eye 1's counts kept)" : "made (the A/B)") +
+               " (" + std::to_string(g_resolves_dropped.load()) + " dropped so far)";
     }
     if (sub == "qdraw" && t.size() >= 3) {
         g_query_draws = t[2] == "on";

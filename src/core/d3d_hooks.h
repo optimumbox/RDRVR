@@ -93,6 +93,10 @@ void set_rtv_substitute(RtvSubstFn fn);
 const void* view_resource(uintptr_t handle, int* format = nullptr);  // (format: a DXGI_FORMAT)
 // A barrier and a whole-subresource copy into the game's list, past the mod's own list hooks (the mod's own work).
 void raw_barrier(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_RESOURCE_BARRIER* b);
+void raw_draw(ID3D12GraphicsCommandList* cl, unsigned vertices);  // DrawInstanced(vertices, 1, 0, 0), past the hooks
+// The list's targets as the calling thread last bound them (the game's, as changed by the hooks), bound again; false:
+// this thread's last bind was another list's
+bool restore_targets(ID3D12GraphicsCommandList* cl);
 void raw_bind(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, int single,
               const D3D12_CPU_DESCRIPTOR_HANDLE* ds);
 void raw_copy_region(ID3D12GraphicsCommandList* cl, const D3D12_TEXTURE_COPY_LOCATION* dst, const D3D12_TEXTURE_COPY_LOCATION* src,
