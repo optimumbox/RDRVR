@@ -4,7 +4,7 @@
 // at is copied into the lens image and shown as a quad at the scope's eyepiece, the patch's angle `Zoom` times smaller
 // than the lens's. The source eye is the one farther from the barrel's line: the rifle's own scope model covers the
 // target in the sighting eye's image, not in the other's (its parallax at the eyepiece is ~10 degrees). The lens is
-// round (its corners cleared to transparent) with a crosshair. The presenting thread.
+// framed by a mask quad over it (filled once): black round it and a crosshair. The presenting thread.
 
 #include <d3d12.h>
 
@@ -28,8 +28,8 @@ void init();
 // origin, `fmt` their format. Copies this frame's lens image on `queue`; true when a lens layer is ready for layer().
 bool prepare(const XrView* views, XrSession session, ID3D12CommandQueue* queue, ID3D12Resource* const eyes[2], uint32_t iw, uint32_t ih,
              DXGI_FORMAT fmt);
-// This frame's lens quad (after a true prepare).
-bool layer(XrSpace space, XrCompositionLayerQuad* out);
+// This frame's lens quads (after a true prepare): the lens and its mask (black round it, the crosshair). Returns 2, or 0.
+int layers(XrSpace space, XrCompositionLayerQuad out[2]);
 // scope [on|off] [zoom x] [size m] [offset x y z] [eye auto|left|right] [all on|off]: the session's settings; no args: status
 std::string command(const std::string& line);
 

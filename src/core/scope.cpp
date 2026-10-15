@@ -19,6 +19,7 @@
 #include "core/holster.h"
 #include "core/log.h"
 #include "core/state.h"
+#include "core/xr.h"
 #include "core/xr_blit.h"
 
 namespace rdrvr::scope {
@@ -36,8 +37,9 @@ bool g_weapon[64] = {};
 XrSwapchain g_sc = XR_NULL_HANDLE;
 std::vector<ID3D12Resource*> g_images;
 DXGI_FORMAT g_fmt = DXGI_FORMAT_UNKNOWN;
-ID3D12DescriptorHeap* g_rtv = nullptr;
-UINT g_rtv_step = 0;
+XrSwapchain g_mask = XR_NULL_HANDLE;  // the lens's frame: black round it, the crosshair (filled once, kMaskEdge square)
+constexpr uint32_t kMaskEdge = 512;
+constexpr float kMaskScale = 1.6f;  // the mask quad's edge over the lens's (black to the lens quad's corners, then fading)
 ID3D12CommandAllocator* g_alloc[kSlots] = {};
 ID3D12GraphicsCommandList* g_list = nullptr;
 ID3D12Fence* g_fence = nullptr;
@@ -52,6 +54,131 @@ uint32_t g_patch = 0;
 std::atomic<uint64_t> g_frames{0}, g_busy{0}, g_off_image{0};
 std::atomic<int> g_last_eye{-1}, g_last_patch{0};
 std::atomic<float> g_last_dist{0.0f};
+
+// The mask's texel at (u, v), both -kMaskScale/2..kMaskScale/2 in lens diameters from the centre (premultiplied black):
+// clear inside the lens but for the crosshair (a thin cross, thick posts from the edge), a soft dark rim, black out past
+// the lens quad's corners, then fading to the mask's edge
+float mask_alpha(float u, float v, float px) {
+    const float r = std::sqrt(u * u + v * v);
+    auto ramp = [px](float x, float a, float b) { return std::clamp((x - a) / std::max(b - a, px), 0.0f, 1.0f); };
+    const float lens = 0.5f;
+    if (r > lens) return r < 0.72f ? 1.0f : 1.0f - ramp(r, 0.72f, 0.5f * kMaskScale);
+    const float a = ramp(r, lens * 0.88f, lens);  // the rim
+    const float au = std::fabs(u), av = std::fabs(v);
+    const float thin = 0.0035f, thick = 0.014f, post = lens * 0.45f;
+    auto line = [px](float d, float half) { return std::clamp(half + 0.5f * px - d, 0.0f, px) / px; };
+    float cross = std::max(line(av, thin), line(au, thin));
+    if (r > post && au > av) cross = std::max(cross, line(av, thick));  // the side posts
+    if (r > post && v < 0.0f && av > au) cross = std::max(cross, line(au, thick));  // the bottom post
+    return std::max(a, cross);
+}
+bool fill_mask(XrSession session, ID3D12Device* dev, DXGI_FORMAT fmt) {
+    ID3D12CommandQueue* q = xr::image_queue();
+    if (!q) return false;
+    XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    ci.format = static_cast<int64_t>(fmt);
+    ci.sampleCount = 1;
+    ci.width = ci.height = kMaskEdge;
+    ci.faceCount = ci.arraySize = ci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(session, &ci, &g_mask))) {
+        log::error("[scope] the mask's xrCreateSwapchain failed");
+        g_mask = XR_NULL_HANDLE;
+        return false;
+    }
+    uint32_t ni = 0;
+    xrEnumerateSwapchainImages(g_mask, 0, &ni, nullptr);
+    std::vector<XrSwapchainImageD3D12KHR> imgs(ni, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+    xrEnumerateSwapchainImages(g_mask, ni, &ni, reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()));
+    uint32_t index = 0;
+    XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (XR_FAILED(xrAcquireSwapchainImage(g_mask, &ai, &index)) || index >= ni) return false;
+    XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = 100000000;
+    XrResult wr = XR_TIMEOUT_EXPIRED;
+    for (int tries = 0; tries < 10 && wr == XR_TIMEOUT_EXPIRED; ++tries) wr = xrWaitSwapchainImage(g_mask, &wi);
+    const bool waited = wr == XR_SUCCESS;
+    bool ok = waited;
+    ID3D12Resource* dst = imgs[index].texture;
+    const D3D12_RESOURCE_DESC dd = dst->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    UINT rows = 0;
+    UINT64 row_bytes = 0, total = 0;
+    dev->GetCopyableFootprints(&dd, 0, 1, 0, &fp, &rows, &row_bytes, &total);
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = total;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* up = nullptr;
+    ID3D12CommandAllocator* alloc = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+    ID3D12Fence* fence = nullptr;
+    bool done = false, submitted = false;
+    ok = ok &&
+         SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&up))) &&
+         SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) &&
+         SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&list))) &&
+         SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
+    uint8_t* p = nullptr;
+    D3D12_RANGE none{0, 0};
+    if (ok) ok = SUCCEEDED(up->Map(0, &none, reinterpret_cast<void**>(&p))) && p;
+    if (ok) {
+        const float px = kMaskScale / static_cast<float>(kMaskEdge);
+        for (uint32_t y = 0; y < kMaskEdge; ++y) {
+            uint8_t* row = p + fp.Offset + static_cast<size_t>(y) * fp.Footprint.RowPitch;
+            for (uint32_t x = 0; x < kMaskEdge; ++x) {
+                const float u = (static_cast<float>(x) + 0.5f) * px - 0.5f * kMaskScale, v = 0.5f * kMaskScale - (static_cast<float>(y) + 0.5f) * px;
+                row[x * 4 + 0] = row[x * 4 + 1] = row[x * 4 + 2] = 0;  // black, premultiplied
+                row[x * 4 + 3] = static_cast<uint8_t>(std::lround(255.0f * mask_alpha(u, v, px)));
+            }
+        }
+        up->Unmap(0, nullptr);
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = dst;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        list->ResourceBarrier(1, &b);
+        D3D12_TEXTURE_COPY_LOCATION dl{};
+        dl.pResource = dst;
+        dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION sl{};
+        sl.pResource = up;
+        sl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        sl.PlacedFootprint = fp;
+        list->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        list->ResourceBarrier(1, &b);
+        ok = SUCCEEDED(list->Close());
+        if (ok) {
+            d3d::submit_internal(q, list);
+            submitted = true;
+            ok = SUCCEEDED(q->Signal(fence, 1));
+            HANDLE ev = ok ? CreateEventW(nullptr, FALSE, FALSE, nullptr) : nullptr;
+            done = ev && SUCCEEDED(fence->SetEventOnCompletion(1, ev)) && WaitForSingleObject(ev, 2000) == WAIT_OBJECT_0;
+            if (ev) CloseHandle(ev);
+            ok = ok && done;
+        }
+    }
+    if (waited) {
+        XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        ok = XR_SUCCEEDED(xrReleaseSwapchainImage(g_mask, &ri)) && ok;
+    }
+    if (list && (done || !submitted)) list->Release();
+    if (fence && (done || !submitted)) fence->Release();
+    if (alloc && (done || !submitted)) alloc->Release();
+    if (up && (done || !submitted)) up->Release();
+    if (!ok) log::error("[scope] filling the mask failed");
+    return ok;
+}
 
 bool ensure(XrSession session, DXGI_FORMAT fmt) {
     if (g_ready) return g_fmt == fmt;
@@ -76,24 +203,12 @@ bool ensure(XrSession session, DXGI_FORMAT fmt) {
     std::vector<XrSwapchainImageD3D12KHR> imgs(ni, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
     xrEnumerateSwapchainImages(g_sc, ni, &ni, reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()));
     for (auto& im : imgs) g_images.push_back(im.texture);
-    D3D12_DESCRIPTOR_HEAP_DESC hd{};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.NumDescriptors = ni;
-    if (ni == 0 || FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_rtv)))) {
-        log::error("[scope] no RTV heap");
-        return false;
-    }
-    g_rtv_step = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    D3D12_RENDER_TARGET_VIEW_DESC rd{};
-    rd.Format = fmt;
-    rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-    D3D12_CPU_DESCRIPTOR_HANDLE h = g_rtv->GetCPUDescriptorHandleForHeapStart();
-    for (uint32_t i = 0; i < ni; ++i, h.ptr += g_rtv_step) dev->CreateRenderTargetView(g_images[i], &rd, h);
     for (auto& a : g_alloc)
         if (FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a)))) return false;
     if (FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_alloc[0], nullptr, IID_PPV_ARGS(&g_list))) ||
         FAILED(g_list->Close()) || FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence))))
         return false;
+    if (!fill_mask(session, dev, fmt)) return false;
     g_ready = true;
     g_failed = false;
     log::info("[scope] lens swapchain %ux%u format %d (%u images)", kImg, kImg, static_cast<int>(fmt), ni);
@@ -255,34 +370,8 @@ bool prepare(const XrView* views, XrSession session, ID3D12CommandQueue* queue, 
         g_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, &box);
         for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
         g_list->ResourceBarrier(2, b);
-        // round: the corners cleared to transparent, a dark rim and a crosshair (a thin cross, thick posts at the edge)
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_rtv->GetCPUDescriptorHandleForHeapStart();
-        rtv.ptr += static_cast<SIZE_T>(index) * g_rtv_step;
-        std::vector<D3D12_RECT> clear, dark;
-        const float r = 0.5f * static_cast<float>(S), rim = r * 0.92f;
-        const LONG s = static_cast<LONG>(S);
-        const LONG band = S >= 128 ? 2 : 1;
-        for (LONG y = 0; y < s; y += band) {
-            const float dy = static_cast<float>(y) + 0.5f * band - r;
-            const float ax = dy * dy < r * r ? std::sqrt(r * r - dy * dy) : 0.0f;
-            const float ix = dy * dy < rim * rim ? std::sqrt(rim * rim - dy * dy) : 0.0f;
-            const LONG a0 = std::lround(r - ax), a1 = std::lround(r + ax), i0 = std::lround(r - ix), i1 = std::lround(r + ix);
-            const LONG y1 = std::min(y + band, s);
-            if (a0 > 0) clear.push_back({0, y, a0, y1});
-            if (a1 < s) clear.push_back({a1, y, s, y1});
-            if (i0 > a0) dark.push_back({a0, y, i0, y1});
-            if (a1 > i1) dark.push_back({i1, y, a1, y1});
-            if (ax <= 0) clear.back() = {0, y, s, y1};
-        }
-        const LONG c = s / 2, thin = std::max<LONG>(1, s / 200), thick = std::max<LONG>(2, s / 40), post = static_cast<LONG>(r * 0.55f);
-        dark.push_back({0, c - thin, s, c + thin});
-        dark.push_back({c - thin, 0, c + thin, s});
-        dark.push_back({0, c - thick, post, c + thick});
-        dark.push_back({s - post, c - thick, s, c + thick});
-        dark.push_back({c - thick, s - post, c + thick, s});
-        const float transparent[4] = {0, 0, 0, 0}, black[4] = {0, 0, 0, 1};
-        if (!dark.empty()) g_list->ClearRenderTargetView(rtv, black, static_cast<UINT>(dark.size()), dark.data());
-        if (!clear.empty()) g_list->ClearRenderTargetView(rtv, transparent, static_cast<UINT>(clear.size()), clear.data());  // last: the cross's ends too
+        if (g_frames.load(std::memory_order_relaxed) == 0)
+            log::info("[scope] first lens: eye %d, patch %u px at (%ld %ld) of %ux%u, image %u", src, S, x0, y0, iw, ih, index);
         ok = SUCCEEDED(g_list->Close());
         if (ok) {
             d3d::submit_internal(queue, g_list);
@@ -306,23 +395,28 @@ bool prepare(const XrView* views, XrSession session, ID3D12CommandQueue* queue, 
     return true;
 }
 
-bool layer(XrSpace space, XrCompositionLayerQuad* out) {
-    if (!g_have) return false;
+int layers(XrSpace space, XrCompositionLayerQuad out[2]) {
+    if (!g_have) return 0;
     float size;
     {
         std::lock_guard lock(g_mutex);
         size = g_size;
     }
-    XrCompositionLayerQuad& q = *out;
+    XrCompositionLayerQuad& q = out[0];  // the lens: opaque (its corners under the mask's black)
     q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
-    q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;  // the cleared corners: alpha 0
     q.space = space;
     q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
     q.subImage.swapchain = g_sc;
     q.subImage.imageRect = {{0, 0}, {static_cast<int32_t>(g_patch), static_cast<int32_t>(g_patch)}};
     q.pose = g_pose;
     q.size = {size, size};
-    return true;
+    XrCompositionLayerQuad& m = out[1];  // the mask over it
+    m = q;
+    m.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;  // premultiplied
+    m.subImage.swapchain = g_mask;
+    m.subImage.imageRect = {{0, 0}, {static_cast<int32_t>(kMaskEdge), static_cast<int32_t>(kMaskEdge)}};
+    m.size = {size * kMaskScale, size * kMaskScale};
+    return 2;
 }
 
 std::string command(const std::string& line) {
