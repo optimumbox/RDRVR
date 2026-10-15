@@ -3,12 +3,14 @@
 #include <windows.h>
 #include <d3dcompiler.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <utility>
 
 #include "core/anchors.h"
+#include "core/config.h"
 #include "core/d3d_hooks.h"
 #include "core/log.h"
 #include "core/round_draw.h"
@@ -20,13 +22,29 @@ namespace {
 // final gamma and returns the linear value whose sRGB encoding is that display value.
 const char kShader[] = R"(
 Texture2D<float4> src : register(t0);
-cbuffer K : register(b0) { float gamma; };
+cbuffer K : register(b0) { float gamma; float peak; };
+// AMD FidelityFX CAS (MIT), the no-scaling path of ffx_cas.h (as KF2VR's): the 3 x 3 texels a..i around e, in the
+// display encoding; peak = -1 / lerp(8, 5, sharpness), 0 = off
+float3 cas(float3 a, float3 b, float3 c, float3 d, float3 e, float3 f, float3 g, float3 h, float3 i, float peak) {
+    float3 mn = min(min(min(d, e), min(f, b)), h);
+    mn += min(min(mn, a), min(min(c, g), i));
+    float3 mx = max(max(max(d, e), max(f, b)), h);
+    mx += max(max(mx, a), max(max(c, g), i));
+    float3 w = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-5))) * peak;
+    return saturate((b * w + d * w + f * w + h * w + e) / (1.0 + 4.0 * w));
+}
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 t = float2((id << 1) & 2, id & 2);
     return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
 }
 float4 ps(float4 pos : SV_Position) : SV_Target {
-    float3 c = saturate(src.Load(int3(pos.xy, 0)).rgb);
+    int2 p = int2(pos.xy), hi;
+    src.GetDimensions(hi.x, hi.y);
+    hi -= 1;
+#define T(x, y) saturate(src.Load(int3(clamp(p + int2(x, y), 0, hi), 0)).rgb)
+    float3 c = T(0, 0);
+    if (peak < 0) c = cas(T(-1, -1), T(0, -1), T(1, -1), T(-1, 0), c, T(1, 0), T(-1, 1), T(0, 1), T(1, 1), peak);
+#undef T
     float3 d = pow(c, gamma);
     float3 lin = d <= 0.04045 ? d / 12.92 : pow((d + 0.055) / 1.055, 2.4);
     return float4(lin, 1);
@@ -53,13 +71,24 @@ DXGI_FORMAT g_dst_format = DXGI_FORMAT_UNKNOWN;
 bool g_ready = false;
 std::atomic<uint64_t> g_blits{0}, g_skips{0};
 std::atomic<float> g_last_gamma{0.0f}, g_override{0.0f};
+std::atomic<float> g_sharp{-1.0f};  // [XR] Sharpness 0..1 (CAS in the eye blit); -1: not read yet
 
 // ---- [XR] EyeShape's paths (eye_shape.h), made only when first used: their own root signature (a linear sampler),
 // the resample into an eye-shaped (or the runtime's largest) swapchain, the monitor's repaint and the cinema's resample
 const char kShapeShader[] = R"(
 Texture2D<float4> src : register(t0);
 SamplerState lin : register(s0);
-cbuffer K : register(b0) { float gamma; float decode; float2 image; float2 content; float2 stage; float2 dst; float2 pad1; };
+cbuffer K : register(b0) { float gamma; float decode; float2 image; float2 content; float2 stage; float2 dst; float peak; float pad1; };
+// AMD FidelityFX CAS (MIT), the no-scaling path of ffx_cas.h (as KF2VR's): the 3 x 3 texels a..i around e, in the
+// display encoding; peak = -1 / lerp(8, 5, sharpness), 0 = off
+float3 cas(float3 a, float3 b, float3 c, float3 d, float3 e, float3 f, float3 g, float3 h, float3 i, float peak) {
+    float3 mn = min(min(min(d, e), min(f, b)), h);
+    mn += min(min(mn, a), min(min(c, g), i));
+    float3 mx = max(max(max(d, e), max(f, b)), h);
+    mx += max(max(mx, a), max(max(c, g), i));
+    float3 w = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-5))) * peak;
+    return saturate((b * w + d * w + f * w + h * w + e) / (1.0 + 4.0 * w));
+}
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 t = float2((id << 1) & 2, id & 2);
     return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
@@ -81,7 +110,15 @@ float3 fetch_box(float2 p, float2 s) {
 }
 float4 ps_resample(float4 pos : SV_Position) : SV_Target {
     float2 s = content / image;
-    float3 d = pow(fetch_box(pos.xy * s, s), gamma);
+    float2 p = pos.xy * s;
+    float3 c = fetch_box(p, s);
+    if (peak < 0) {  // CAS over the image pixel's neighbours (a content texel apart at least)
+        float2 o = max(s, 1.0);
+#define T(x, y) fetch(p + o * float2(x, y))
+        c = cas(T(-1, -1), T(0, -1), T(1, -1), T(-1, 0), c, T(1, 0), T(-1, 1), T(0, 1), T(1, 1), peak);
+#undef T
+    }
+    float3 d = pow(c, gamma);
     float3 l = d <= 0.04045 ? d / 12.92 : pow((d + 0.055) / 1.055, 2.4);
     return float4(l, 1);
 }
@@ -161,7 +198,7 @@ bool make_pipeline() {
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
         D3D12_ROOT_PARAMETER params[2]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants = {0, 0, 1};
+        params[0].Constants = {0, 0, 2};
         params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[1].DescriptorTable = {1, &range};
@@ -303,6 +340,16 @@ void shape_consts(float* k, float gamma, uint32_t iw, uint32_t ih, uint32_t cw, 
 
 }  // namespace
 
+float sharpness() {
+    float v = g_sharp.load(std::memory_order_relaxed);
+    if (v < 0.0f) {
+        v = std::clamp(config::get_float("XR", "Sharpness", 0.5f), 0.0f, 1.0f);
+        g_sharp.store(v, std::memory_order_relaxed);
+    }
+    return v;
+}
+void set_sharpness(float v) { g_sharp.store(std::clamp(v, 0.0f, 1.0f), std::memory_order_relaxed); }
+
 DXGI_FORMAT pick_format(const int64_t* formats, uint32_t count) {
     const DXGI_FORMAT order[] = {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB};
     for (DXGI_FORMAT want : order)
@@ -387,15 +434,19 @@ bool blit(ID3D12CommandQueue* queue, ID3D12Resource* const dst[2], float gamma, 
             return false;
         }
     }
+    const float sharp = sharpness();
+    const float peak = sharp > 0.0f ? -1.0f / (8.0f - 3.0f * sharp) : 0.0f;
     if (FAILED(g_alloc[s]->Reset()) || FAILED(g_list->Reset(g_alloc[s], resample ? g_pso_resample : g_pso))) return false;
     g_list->SetGraphicsRootSignature(resample ? g_root2 : g_root);
     g_list->SetDescriptorHeaps(1, &g_srv_heap);
     if (resample) {
         float k[12];
         shape_consts(k, gamma, iw, ih, frame->cw, frame->ch, 0, 0);
+        k[10] = peak;
         g_list->SetGraphicsRoot32BitConstants(0, 12, k, 0);
     } else {
-        g_list->SetGraphicsRoot32BitConstants(0, 1, &gamma, 0);
+        const float k[2] = {gamma, peak};
+        g_list->SetGraphicsRoot32BitConstants(0, 2, k, 0);
     }
     g_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     D3D12_VIEWPORT vp{0, 0, static_cast<float>(iw), static_cast<float>(ih), 0, 1};

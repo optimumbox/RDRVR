@@ -106,7 +106,11 @@ DWORD WINAPI hk_GetState(DWORD user, XINPUT_STATE* st) {
     if (user == 0 && st && r == ERROR_SUCCESS) {
         // The packet number changes only when the state does, as a real pad's would.
         if (GetTickCount64() < g_until.load()) {
-            st->Gamepad.wButtons |= g_buttons.load();
+            // (test aid: the unused bits 0x0400 and 0x0800 hold the left and right triggers fully)
+            const uint16_t b = g_buttons.load();
+            st->Gamepad.wButtons |= static_cast<WORD>(b & ~0x0c00);
+            if (b & 0x0400) st->Gamepad.bLeftTrigger = 0xFF;
+            if (b & 0x0800) st->Gamepad.bRightTrigger = 0xFF;
             if (g_sticks_on.load()) {
                 st->Gamepad.sThumbLX = g_lx.load();
                 st->Gamepad.sThumbLY = g_ly.load();

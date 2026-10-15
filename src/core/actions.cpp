@@ -115,6 +115,10 @@ std::atomic<uint64_t> g_hand_closes{0};
 // Winchester, the Henry, the Evans, the Volcanic). A flick down opens it (and stays open), a flick up closes it; the
 // hammer is cocked by the opening and falls with the shot. The drawn amounts, eased
 std::atomic<bool> g_lever_parts{false};
+// [Reload] LeverSteady: a lever gun held two-handed is carried by the front hand while its lever is worked (body.cpp);
+// g_lever_pend: a shot not cycled (or the lever open), with when it was last set (the frame-end listener)
+std::atomic<bool> g_lever_steady{true}, g_lever_pend{false};
+std::atomic<double> g_lever_pend_ms{0.0};
 bool g_lever_open = false, g_hammer_down = false;
 std::atomic<float> g_lever_amt{0.0f}, g_hammer_amt{1.0f};
 std::atomic<int> g_lever_weapon{-1};
@@ -980,6 +984,8 @@ void frame() {
     } else if (k == kLever && !g_needs && g_w[0] >= g_lever_speed && g_lever_down_ms > 0) {
         g_lever_down_ms = 0;
     }
+    g_lever_pend.store(k == kLever && kind_on(k) && !deadeye && (g_needs || g_lever_open), std::memory_order_relaxed);
+    g_lever_pend_ms.store(now, std::memory_order_relaxed);
     {  // the lever and hammer as drawn: the lever over 80 ms either way, the hammer with it
         static double last = 0;
         const float step = last > 0 ? static_cast<float>((now - last) / 80.0) : 1.0f;
@@ -1074,6 +1080,7 @@ void init() {
     g_hints = config::get_bool("Reload", "ActionHints", true);
     g_open_cyl = config::get_bool("Reload", "OpenCylinder", false);
     g_lever_parts = config::get_bool("Reload", "LeverParts", false);
+    g_lever_steady = config::get_bool("Reload", "LeverSteady", true);
     g_pump_parts = config::get_bool("Reload", "PumpParts", false);
     g_bolt_parts = config::get_bool("Reload", "BoltParts", false);
     g_breech_parts = config::get_bool("Reload", "BreechParts", false);
@@ -1293,6 +1300,15 @@ float pump_drawn() {
     if (!g_on.load(std::memory_order_relaxed) || !g_pump_parts.load(std::memory_order_relaxed) || g_pump_weapon.load(std::memory_order_relaxed) < 0)
         return 0.0f;
     return g_pump_amt.load(std::memory_order_relaxed);
+}
+bool lever_steady() { return g_lever_steady.load(std::memory_order_relaxed); }
+void set_lever_steady(bool on) {
+    g_lever_steady = on;
+    config::set("Reload", "LeverSteady", on ? "1" : "0");
+}
+bool lever_pending() {
+    return g_on.load(std::memory_order_relaxed) && g_lever_pend.load(std::memory_order_relaxed) &&
+           log::now_ms() - g_lever_pend_ms.load(std::memory_order_relaxed) < 200.0;
 }
 void set_lever_parts(bool on) {
     if (g_lever_parts.exchange(on) != on) log::info("[actions] the lever worked by hand, drawn: %s", on ? "on" : "off");

@@ -58,6 +58,9 @@ void cinema_status(uint64_t* resamples, uint32_t* w, uint32_t* h);
 float game_gamma(float def);
 // Positive control: a fixed Gamma instead of the game's ("xr gamma <value>"); 0 = the game's again ("xr gamma live").
 void set_gamma_override(float g);
+// [XR] Sharpness: AMD CAS in the eye blit, 0 (off) to 1; set_sharpness for the menu (not saved here)
+float sharpness();
+void set_sharpness(float v);
 void status_text(char* out, size_t len);
 
 }  // namespace rdrvr::xr_blit

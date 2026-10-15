@@ -7408,7 +7408,7 @@ void before_scene(const float* cam) {
     // two-handed long guns (holster.cpp: the front hand on the foregrip): John's gun hand (the right) turns so the
     // barrel points from its grip to the front hand's, by the blend's share of the turn (rigid: the aim follows)
     {
-        const float tb = holster::two_hand_blend();
+        const float tb = holster::physical_stock() ? 0.0f : holster::two_hand_blend();  // a stock: the front hand turns nothing
         float bt[3];
         const int gj = f.gun_j, fj = 1 - gj;
         bool bt_ok = false;
@@ -7472,6 +7472,147 @@ void before_scene(const float* cam) {
                 for (int k = 0; k < 3; ++k) f.ik_t[gj][k] = grip_wp[gj][k] + Rn[k * 3 + 2] * hc.wrist_offset;
                 g_two_diag = std::atan2(sn / dl, cs) * 57.29578f;
             }
+        }
+        // [Reload] PhysicalStock: the long gun turned in the gun hand by [Reload] StockTurn, learned by the stock
+        // calibration (the barrel along the line from the gun hand's controller to the front hand's, both on the stock)
+        if (holster::physical_stock() && f.long_gun && f.ik[gj] && bt_ok) {
+            const float* R = f.ik_r[gj];
+            float deg[3];
+            holster::stock_turn(deg);
+            if (holster::stock_calibrate_due()) {
+                // the drawn gun's axes (world; columns x right, y up, z back) were drawn on this hand's target turned by
+                // the turn now (U = R C0): the gun's barrel and up in U's frame, and where they should be (the barrel
+                // along the line from the gun hand's controller to the front hand's, its up toward the world's up)
+                float G[9];
+                bool g_ok;
+                {
+                    std::lock_guard lock(g_draw_mutex);
+                    g_ok = g_points.gun_frame_ok;
+                    std::memcpy(G, g_points.gun_frame_R, sizeof(G));
+                }
+                float C0[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}, U[9];
+                const float a0 = std::sqrt(deg[0] * deg[0] + deg[1] * deg[1] + deg[2] * deg[2]);
+                if (a0 > 0.01f) {
+                    const float ax0[3] = {deg[0] / a0, deg[1] / a0, deg[2] / a0};
+                    axis_angle(ax0, a0 * 0.0174532925f, C0);
+                }
+                mul3(R, C0, U);
+                auto to_u = [&](const float* v, float* o) {  // U^T v
+                    for (int k = 0; k < 3; ++k) o[k] = U[k] * v[0] + U[3 + k] * v[1] + U[6 + k] * v[2];
+                };
+                float d[3], up[3] = {0.0f, 1.0f, 0.0f}, gb[3] = {-G[2], -G[5], -G[8]}, gu[3] = {G[1], G[4], G[7]};
+                for (int k = 0; k < 3; ++k) d[k] = grip_wp[fj][k] - grip_wp[gj][k];
+                float F0[3], F1[3], F2[3], D0[3], D1[3], D2[3];  // the gun's (barrel, up, side) now and wanted, in U's frame
+                to_u(gb, F0);
+                to_u(gu, F1);
+                to_u(d, D0);
+                to_u(up, D1);
+                auto ortho = [&](float* x, float* y, float* z) {
+                    norm(x);
+                    const float dp = x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+                    for (int k = 0; k < 3; ++k) y[k] -= dp * x[k];
+                    norm(y);
+                    cross(x, y, z);
+                };
+                ortho(F0, F1, F2);
+                ortho(D0, D1, D2);
+                if (g_ok && f.ik[fj]) {
+                    float Cd[9], Cn[9];  // Cd = D F^T: the gun's axes now onto the wanted ones; the new turn C0 Cd
+                    for (int r = 0; r < 3; ++r)
+                        for (int c = 0; c < 3; ++c) Cd[r * 3 + c] = D0[r] * F0[c] + D1[r] * F1[c] + D2[r] * F2[c];
+                    mul3(C0, Cd, Cn);
+                    const float tr = std::clamp((Cn[0] + Cn[4] + Cn[8] - 1.0f) * 0.5f, -1.0f, 1.0f);
+                    const float ang = std::acos(tr);
+                    float v[3] = {Cn[7] - Cn[5], Cn[2] - Cn[6], Cn[3] - Cn[1]};
+                    const float vl = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+                    for (int k = 0; k < 3; ++k) deg[k] = vl > 1e-6f ? v[k] / vl * ang * 57.29578f : 0.0f;
+                    holster::set_stock_turn(deg);
+                    log::info("[body] stock calibrated: the long gun turned %.1f deg in the gun hand (%.2f %.2f %.2f), its barrel on the stock "
+                              "and its top up",
+                              ang * 57.29578f, deg[0], deg[1], deg[2]);
+                } else {
+                    log::warn("[body] stock calibration: %s, nothing learned", g_ok ? "the front hand not tracked" : "no drawn long gun");
+                }
+            }
+            const float a = std::sqrt(deg[0] * deg[0] + deg[1] * deg[1] + deg[2] * deg[2]);
+            if (a > 0.01f) {
+                const float ax[3] = {deg[0] / a, deg[1] / a, deg[2] / a};
+                float C[9], Rn[9];
+                axis_angle(ax, a * 0.0174532925f, C);
+                mul3(R, C, Rn);
+                std::memcpy(f.ik_r[gj], Rn, sizeof(Rn));
+                for (int k = 0; k < 3; ++k) f.ik_t[gj][k] = grip_wp[gj][k] + Rn[k * 3 + 2] * hc.wrist_offset;
+            }
+        }
+    }
+    // [Reload] LeverSteady (2026-10-15, the user: "Whenever the lever needs to be cocked of a two-handed weapon, the right
+    // controller can no longer affect the offset of the gun ... it will be stable in the left hand while performing that
+    // action"): a lever gun held two-handed with its lever to be worked: the gun hand's target is carried by the front
+    // hand's controller, as it was on it when the lever was wanted; worked, it eases back onto the gun hand's controller
+    // over kLeverEase ms (the flick that works it is the controller's own: actions.cpp)
+    {
+        constexpr double kLeverEase = 150.0;
+        static bool locked = false;
+        static float rel_r[9], rel_t[3];   // the gun hand's target in the front hand's frame
+        static float last_r[9], last_t[3];  // the last carried target, eased from when let go
+        static double free_ms = -1e9;
+        const int gj = f.gun_j, fj = 1 - gj;
+        const bool want = f.ik[0] && f.ik[1] && actions::lever_steady() && actions::lever_pending() && holster::two_hand_blend() > 0.5f;
+        auto to_q = [](const float* m, float* q) {  // row-major rotation -> x y z w
+            const float tr = m[0] + m[4] + m[8];
+            if (tr > 0.0f) {
+                const float s = std::sqrt(tr + 1.0f) * 2.0f;
+                q[3] = 0.25f * s, q[0] = (m[7] - m[5]) / s, q[1] = (m[2] - m[6]) / s, q[2] = (m[3] - m[1]) / s;
+            } else if (m[0] > m[4] && m[0] > m[8]) {
+                const float s = std::sqrt(1.0f + m[0] - m[4] - m[8]) * 2.0f;
+                q[3] = (m[7] - m[5]) / s, q[0] = 0.25f * s, q[1] = (m[1] + m[3]) / s, q[2] = (m[2] + m[6]) / s;
+            } else if (m[4] > m[8]) {
+                const float s = std::sqrt(1.0f + m[4] - m[0] - m[8]) * 2.0f;
+                q[3] = (m[2] - m[6]) / s, q[0] = (m[1] + m[3]) / s, q[1] = 0.25f * s, q[2] = (m[5] + m[7]) / s;
+            } else {
+                const float s = std::sqrt(1.0f + m[8] - m[0] - m[4]) * 2.0f;
+                q[3] = (m[3] - m[1]) / s, q[0] = (m[2] + m[6]) / s, q[1] = (m[5] + m[7]) / s, q[2] = 0.25f * s;
+            }
+        };
+        auto to_m = [](const float* q, float* m) {
+            const float x = q[0], y = q[1], z = q[2], w_ = q[3];
+            m[0] = 1 - 2 * (y * y + z * z), m[1] = 2 * (x * y - z * w_), m[2] = 2 * (x * z + y * w_);
+            m[3] = 2 * (x * y + z * w_), m[4] = 1 - 2 * (x * x + z * z), m[5] = 2 * (y * z - x * w_);
+            m[6] = 2 * (x * z - y * w_), m[7] = 2 * (y * z + x * w_), m[8] = 1 - 2 * (x * x + y * y);
+        };
+        const float* Rf = f.ik_r[fj];
+        const float* tf = f.ik_t[fj];
+        if (want && !locked) {  // the front hand's frame from here: Rf^T Rg, Rf^T (tg - tf)
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) rel_r[r * 3 + c] = Rf[r] * f.ik_r[gj][c] + Rf[3 + r] * f.ik_r[gj][3 + c] + Rf[6 + r] * f.ik_r[gj][6 + c];
+                rel_t[r] = Rf[r] * (f.ik_t[gj][0] - tf[0]) + Rf[3 + r] * (f.ik_t[gj][1] - tf[1]) + Rf[6 + r] * (f.ik_t[gj][2] - tf[2]);
+            }
+            locked = true;
+            log::info("[actions] lever: the gun steady in the front hand while the lever is worked");
+        } else if (!want && locked) {
+            locked = false;
+            free_ms = log::now_ms();
+        }
+        if (locked) {
+            mul3(Rf, rel_r, last_r);
+            for (int k = 0; k < 3; ++k) last_t[k] = tf[k] + Rf[k * 3] * rel_t[0] + Rf[k * 3 + 1] * rel_t[1] + Rf[k * 3 + 2] * rel_t[2];
+            std::memcpy(f.ik_r[gj], last_r, sizeof(last_r));
+            std::memcpy(f.ik_t[gj], last_t, sizeof(last_t));
+        } else if (f.ik[0] && f.ik[1] && log::now_ms() - free_ms < kLeverEase) {  // back onto the gun hand's controller
+            const float a = static_cast<float>((log::now_ms() - free_ms) / kLeverEase);
+            float q0[4], q1[4], q[4];
+            to_q(last_r, q0);
+            to_q(f.ik_r[gj], q1);
+            const float d = q0[0] * q1[0] + q0[1] * q1[1] + q0[2] * q1[2] + q0[3] * q1[3];
+            float l = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+                q[k] = q0[k] * (1.0f - a) + (d < 0.0f ? -q1[k] : q1[k]) * a;
+                l += q[k] * q[k];
+            }
+            l = std::sqrt(l);
+            for (int k = 0; k < 4; ++k) q[k] /= l;
+            to_m(q, f.ik_r[gj]);
+            for (int k = 0; k < 3; ++k) f.ik_t[gj][k] = last_t[k] * (1.0f - a) + f.ik_t[gj][k] * a;
         }
     }
     f.pitch = pitch_deg * 0.0174532925f;

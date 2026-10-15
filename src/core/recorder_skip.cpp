@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "core/anchors.h"
@@ -29,6 +30,7 @@ struct Block {
     volatile uint8_t on;
     uint8_t pad[3];
     volatile uint64_t calls;  // (unused by the thunks: the skips are counted by begin/end)
+    volatile uint8_t slot_on[kN];  // each method skipped (1) or recorded (0) in the second scene ("vi pass2 slots <mask>")
     void* orig[kN];
     uint8_t code[kN][48];
 };
@@ -69,6 +71,12 @@ void install() {
     g_b = static_cast<Block*>(VirtualAlloc(nullptr, sizeof(Block), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
     if (!g_b) return;
     std::memset(g_b, 0, sizeof(Block));
+    // [Stereo] ViSkipSlots (hex, bit i = kSlots[i] skipped; default 0x6000: the draws only, +0x1a8 and +0x1b8). The
+    // state methods are recorded: skipped, eye 1's distant cacti and grass flickered in eye 2 (2026-10-14, the player's
+    // save; bisected in the headset: +0x100 and +0x140, the texture tables, copy a table's descriptors into the frame's
+    // ring once a frame stamp, and more besides). Cost with ViSkipWalk: pass 2 0.47 -> 0.79 ms on the render thread.
+    const uint32_t mask = static_cast<uint32_t>(std::strtoul(config::get_string("Stereo", "ViSkipSlots", "6000").c_str(), nullptr, 16));
+    for (size_t i = 0; i < kN; ++i) g_b->slot_on[i] = (mask >> i) & 1;
     for (size_t i = 0; i < kN; ++i) {
         g_b->orig[i] = vt[kSlots[i] / 8];
         uint8_t* c = g_b->code[i];
@@ -80,10 +88,16 @@ void install() {
         const int32_t r1 = rel(p + 4, &g_b->tid);
         std::memcpy(p, &r1, 4);
         p += 4;
-        *p++ = 0x75, *p++ = 10;    // jne orig (+10: the cmp (7), je (2), ret (1))
+        *p++ = 0x75, *p++ = 19;    // jne orig (+19: the cmp (7), je (2), cmp (7), je (2), ret (1))
         *p++ = 0x80, *p++ = 0x3d;  // cmp byte [rip+on], 0
         const int32_t r2 = rel(p + 5, &g_b->on);
         std::memcpy(p, &r2, 4);
+        p += 4;
+        *p++ = 0x00;
+        *p++ = 0x74, *p++ = 10;    // je orig
+        *p++ = 0x80, *p++ = 0x3d;  // cmp byte [rip+slot_on[i]], 0
+        const int32_t r4 = rel(p + 5, &g_b->slot_on[i]);
+        std::memcpy(p, &r4, 4);
         p += 4;
         *p++ = 0x00;
         *p++ = 0x74, *p++ = 0x01;  // je orig
@@ -179,6 +193,18 @@ std::string cut(uintptr_t rva, bool on) {
     if (!hooks::install(name, target, c.code, &c.orig)) return "ERROR the hook failed";
     ++g_ncuts;
     return std::string("cut ") + name + " on";
+}
+
+std::string slots(uint32_t mask) {
+    if (!g_installed) return "ERROR the recorder skip is not installed";
+    std::string o = "second scene skips:";
+    for (size_t i = 0; i < kN; ++i) {
+        g_b->slot_on[i] = (mask >> i) & 1;
+        char b[16];
+        std::snprintf(b, sizeof(b), " %#x%s", kSlots[i], g_b->slot_on[i] ? "" : "(rec)");
+        o += b;
+    }
+    return o;
 }
 
 void begin() {

@@ -19,6 +19,15 @@ Upstream [Disonomouss/RDRVR](https://github.com/Disonomouss/RDRVR) 0.8.10 plus:
   holsters and elbows follow your physical turns (at most 30 degrees behind), so the arms no longer twist.
 - **Roomscale** (`[Body] RoomScale`, `RoomLean`, `RoomStop`, `RoomMax`): step away from the centre of your playspace
   and the body follows; past 0.55 m John walks after you with the game's own movement (walls still stop him).
+- **Physical rifle stock** (new in 0.8.10.4; Guns tab): for a stock that holds your controllers. The front hand's
+  trigger grabs the foregrip as well as its grip, and only the gun hand aims the gun. **Calibrate the stock** sets
+  every long gun straight along your stock with its sights on top.
+- **Lever guns steady in the front hand** (new in 0.8.10.4; Reloading tab): held two-handed, a lever gun stays in your
+  front hand while you work the lever, then your gun hand aims it again.
+- **Sharpening** (new in 0.8.10.4; Display tab): AMD CAS sharpening of each eye, as in KF2VR, restoring the detail DLSS
+  and TAA soften.
+- **The trigger takes a round** (new in 0.8.10.4; `[Reload] TriggerTakesRound`): your empty hand's trigger at the chest
+  takes a round, as its grip does.
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
 > and it contains no game files except, in this fork's release, `RDRVR_shaders\`: shaders converted from the
@@ -334,6 +343,7 @@ The picture, the resolution the game renders at for your headset, performance, t
 | ↳ **Eyes in the headset's shape with DLSS** (restart; new in 0.8.0) | The same with DLSS: each eye rendered smaller in your headset's shape and upscaled by DLSS into an eye-shaped image. | Off |
 | **Motion blur** (new in 0.8.5; was "No motion blur" before 0.8.9) | The game's motion blur, which smears the view as you turn your head. On: the game's own graphics setting decides. The game's settings file is not changed. | Off |
 | **Heat haze** (new in 0.8.5) | The desert's heat shimmer. | Off |
+| **Sharpening** (new in 0.8.10.4) | AMD CAS sharpening of each eye's image, 5% a press; 0 turns it off. Restores the detail DLSS and TAA soften. | 50% |
 | **Render resolution: headset** (restart) | The game's frame size: your headset's screen height, Automatic (the size your VR runtime asks for), or the game's own size. | The game's own (its Graphics menu) |
 | ↳ **Render resolution: size** (restart) | 100%, 150% or 200% of the chosen headset's pixels, still 16:9. | 100% once a headset or Automatic is chosen |
 | **Now: ...** | Shows the size the game is running at now, or why it uses its own size. | – |
@@ -443,6 +453,9 @@ The gun in your hand: the reticle, how it fires, dual wielding, two-handed long 
 | ↳ **Your other sidearm's model** | If you own a different sidearm, the copy is that gun (the one that hip's holster shows), and its shots leave its muzzle. | On |
 | ↳ ↳ **A second of the gun at its own holster** | Gripping the holster the gun was drawn from gives a second of that same gun; the other hip still gives your other sidearm. | On |
 | **Two-handed long guns** | Grip a long gun's foregrip with your other hand to aim it with both hands. | On |
+| ↳ **Physical rifle stock** (new in 0.8.10.4) | For a stock that holds your controllers: your front hand's trigger at the foregrip takes hold of the gun as well as its grip (the trigger still does its usual job), and only your gun hand aims the gun: the front hand no longer turns it. | Off |
+| ↳ ↳ **Calibrate the stock** | Press, then within 5 seconds hold any long gun on your stock with both hands, aiming down the sights: every long gun is set straight along the stock with its top up. Calibrate again any time. | – (button) |
+| ↳ ↳ **Clear the stock calibration** | The long guns back to the game's own angle in your gun hand. | – (button) |
 | ↳ **The front hand snaps onto the gun** | While you hold the foregrip, John's front hand sits in the game's own grip instead of following your controller. | On |
 | **This gun: The foregrip / The foregrip ring / The loading ring** | Draw a gun first: the heading names it. Moves where John's front hand sits on this gun, and moves and sizes the rings where your front hand takes hold and where a round goes in, 5 mm per press. Until you change a value it uses every gun's (the Reloading tab). | Every gun's (some guns have their own) |
 | ↳ **Use every gun's** | Clears this gun's own values so it uses the shared ones again. | – (button) |
@@ -466,6 +479,7 @@ Reloading by hand, the round in your hand, every gun's rings, working each gun's
 | **Work each gun's action by hand** | Flick the right stick down to open a revolver and flick the gun to close it; after a shot, work the bolt, lever or pump yourself before the trigger fires again. | On |
 | ↳ **Revolvers drawn open** | An open revolver is drawn open (tipped, swung out or gate open). | On |
 | ↳ **Lever guns: the lever by your flick** | Flick the gun down to open the lever and up to close it and chamber the round. | On |
+| ↳ **Lever guns: steady in the front hand** (new in 0.8.10.4) | Held two-handed, a lever gun stays where your front hand holds it while you work the lever with your gun hand; once worked, your gun hand aims it again. | On |
 | ↳ **Pump-action: the fore-end in your front hand** | After a shot, pull the fore-end back with your front hand and push it forward. | On |
 | ↳ **Bolt actions: the bolt in your other hand** | On the Bolt Action and Carcano: lift, pull back, push forward and turn down the bolt by hand. | On |
 | ↳ **Single-shot rifles opened by hand** | Open the Springfield's and Rolling Block's breech with your other hand (the Buffalo's with a flick), load one round, then shut it. | On |

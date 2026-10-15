@@ -397,7 +397,11 @@ void copy_tap(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, ID3D12Resource
     }
     const int eye = k == 0 ? first : 1 - first, par = static_cast<int>(frame % kKeep);
     D3D12_RESOURCE_DESC d = src->GetDesc();
-    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count != 1 || d.DepthOrArraySize != 1) return;  // the scene depth only
+    // [Stereo] ViSlices (0.8.10.2's default): the scene depth a 2-slice target, slice 0 the first eye's and slice 1 the
+    // second's, both in this one copy (2026-10-14: players' rounds in hand invisible, the 2-slice depth never copied)
+    const bool sliced = d.DepthOrArraySize == 2;
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count != 1 || (d.DepthOrArraySize != 1 && !sliced)) return;  // the scene depth only
+    if (sliced && k != 0) return;  // (both eyes from the frame's first copy)
     ID3D12Device* dev = nullptr;
     if (FAILED(src->GetDevice(IID_PPV_ARGS(&dev))) || !dev) return;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
@@ -420,12 +424,18 @@ void copy_tap(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, ID3D12Resource
     dl.pResource = buf;
     dl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dl.PlacedFootprint = fp;
-    dl.PlacedFootprint.Offset = stride * static_cast<uint64_t>(par * 2 + eye);
     sl.pResource = src;
     sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    sl.SubresourceIndex = 0;
-    cl->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
-    g_taps.fetch_add(1, std::memory_order_relaxed);
+    const int slices = sliced ? 2 : 1;
+    for (int sl_i = 0; sl_i < slices; ++sl_i) {  // the depth plane of each slice (subresource index = the slice, one mip)
+        const int e = sliced ? (sl_i == 0 ? first : 1 - first) : eye;
+        dl.PlacedFootprint.Offset = stride * static_cast<uint64_t>(par * 2 + e);
+        sl.SubresourceIndex = static_cast<UINT>(sl_i);
+        // unhooked: the hook takes a game's index on a 2-slice target as slice 0's and doubles it (slice 1 became the
+        // stencil plane: the device removed, DLSS's evaluate crashed at the first shot, the 0.8.10.4 test build)
+        d3d::raw_copy_region(cl, &dl, &sl);
+    }
+    g_taps.fetch_add(static_cast<uint64_t>(slices), std::memory_order_relaxed);
     std::lock_guard lock(g_depth_mutex);
     g_dmeta.w = static_cast<uint32_t>(d.Width);
     g_dmeta.h = d.Height;
@@ -433,6 +443,7 @@ void copy_tap(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, ID3D12Resource
     g_dmeta.fmt = static_cast<uint32_t>(d.Format);  // the resource's: its plane's footprint says R32_TYPELESS for D24S8 too
     g_dmeta.stride = stride;
     g_dframe[par][eye] = frame;
+    if (sliced) g_dframe[par][1 - eye] = frame;
 }
 
 void ensure_buffer(ID3D12Device* dev, uint64_t frame) {

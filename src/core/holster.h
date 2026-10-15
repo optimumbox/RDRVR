@@ -21,6 +21,19 @@ void set_keeps_drawn(bool on);
 bool holsters_enabled();
 void set_holsters_enabled(bool on);  // also written to the user ini
 bool grip_consumed(int h);           // that hand's grip is a holster's (draw, put away, a round, the foregrip): not LB/RB
+bool trigger_takes_round();
+void set_trigger_takes_round(bool on);  // also written to the user ini
+// a physical rifle stock: the front hand's trigger also holds the foregrip
+bool physical_stock();
+void set_physical_stock(bool on);  // also written to the user ini
+// the stock calibration: in delay_ms, with the gun on both controllers, the long gun's turn in the gun hand is learned
+// so its barrel lies along the line from the gun hand's controller to the front hand's ([Reload] StockTurn, degrees as
+// a rotation vector; with PhysicalStock, every long gun held so, and the front hand no longer turns it)
+void stock_calibrate(double delay_ms);
+double stock_calibrate_in();  // ms until the sample (-1: none asked)
+bool stock_calibrate_due();   // true once, when the sample is due (body.cpp)
+void stock_turn(float deg[3]);
+void set_stock_turn(const float deg[3]);  // also written to the user ini
 // The two-handed aim's weight (0..1): the front hand holds the long gun's foregrip ([Reload] TwoHanded). body.cpp turns
 // the gun hand so the barrel points at the front hand by this much. Any thread.
 float two_hand_blend();

@@ -633,6 +633,11 @@ std::string execute(const std::vector<std::string>& t) {
         config::set_user_path(w.c_str());
         return "user ini for this run: " + p;
     }
+    if (c == "stock") {  // stock [on|off]: [Reload] PhysicalStock (written to the user ini, as the menu does)
+        if (t.size() >= 2 && t[1] == "calibrate") holster::stock_calibrate(t.size() >= 3 ? std::atof(t[2].c_str()) * 1000.0 : 0.0);
+        else if (t.size() >= 2) holster::set_physical_stock(t[1] == "on");
+        return std::string("physical stock: ") + (holster::physical_stock() ? "on" : "off");
+    }
     if (c == "sun") {
         // sun | sun check on|off
         if (t.size() >= 3 && t[1] == "check") dual_pass::set_sun_behind_check(t[2] == "on");

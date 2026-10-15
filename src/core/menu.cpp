@@ -41,6 +41,7 @@
 #include "core/eye_shape.h"
 #include "core/hands.h"
 #include "core/log.h"
+#include "core/xr_blit.h"
 #include "core/physics.h"
 #include "core/pose.h"
 #include "core/render_settings.h"
@@ -626,6 +627,16 @@ void page_display() {
     const int running = render_settings::forced_aa();
     if (running >= 0 && ((running == 3) != (g_set.aa == 3) || (running == 3 && g_set.dlss_q != render_settings::dlss_quality())))
         note("Restart the game to apply.");
+    {  // [XR] Sharpness (2026-10-14): AMD CAS in the eye blit, as KF2VR's after DLSS
+        float sh = xr_blit::sharpness() * 100.0f;
+        if (nudge1("Sharpening", &sh, 5.0f, 0.0f, 100.0f, "%.0f%%",
+                   "AMD CAS sharpening of each eye's image (0 = off; a press 5%). Restores detail that DLSS and TAA soften.")) {
+            xr_blit::set_sharpness(sh / 100.0f);
+            char v[16];
+            std::snprintf(v, sizeof(v), "%.2f", sh / 100.0f);
+            config::set("XR", "Sharpness", v);
+        }
+    }
     // [XR] EyeShape (run 7 item 4): with FXAA only (the mode stands aside for the other techniques)
     sub_begin(g_set.aa == 1);
     bool eye = eye_shape::enabled();
@@ -1383,6 +1394,30 @@ void page_guns() {
     if (check("Two-handed long guns", &v, "Grip a long gun's foregrip with your other hand, ahead of the gun hand, to aim it with both hands."))
         reload::set_two_handed(v);
     sub_begin(v);
+    bool stock = holster::physical_stock();
+    if (check("Physical rifle stock", &stock,
+              "For a stock on your controllers: the front hand's trigger, as well as its grip, at the foregrip holds the gun."))
+        holster::set_physical_stock(stock);
+    sub_begin(stock);
+    {
+        const double in = holster::stock_calibrate_in();
+        char lbl[96];
+        if (in > 0.0) std::snprintf(lbl, sizeof(lbl), "Calibrating in %.0f s...###stockcal", std::ceil(in / 1000.0));
+        else std::snprintf(lbl, sizeof(lbl), "Calibrate the stock###stockcal");
+        if (reset_button(lbl, stock && in <= 0.0,
+                         "Press, then within 5 seconds hold a long gun on your stock with both hands, aiming down the sights: "
+                         "the gun is set straight along the stock for every long gun."))
+            holster::stock_calibrate(5000.0);
+        float sd[3];
+        holster::stock_turn(sd);
+        if (reset_button("Clear the stock calibration", stock && (sd[0] != 0.0f || sd[1] != 0.0f || sd[2] != 0.0f),
+                         "The long guns back to the game's own angle in the gun hand."))
+        {
+            const float zero[3] = {};
+            holster::set_stock_turn(zero);
+        }
+    }
+    sub_end();
     bool snap = holster::foregrip_snap();
     if (check("The front hand snaps onto the gun", &snap,
               "While you hold the foregrip, John's front hand sits on the gun as the game holds it, instead of following your controller."))
@@ -1559,6 +1594,11 @@ void page_reloading() {
     bool lp = actions::lever_parts();
     if (check("Lever guns: the lever by your flick", &lp, "Flick the gun down to open the lever and up to close it and chamber a round."))
         actions::set_lever_parts(lp);
+    bool ls = actions::lever_steady();
+    if (check("Lever guns: steady in the front hand", &ls,
+              "Held two-handed, a lever gun stays where your front hand holds it while you work the lever; once worked, the gun "
+              "hand aims it again."))
+        actions::set_lever_steady(ls);
     bool pp = actions::pump_parts();
     if (check("Pump-action: the fore-end in your front hand", &pp,
               "After a shot, pull the fore-end back with your front hand (held two-handed) and push it forward."))

@@ -83,6 +83,11 @@ int parts_weapon();
 double since_shot_ms();
 // The gun in hand's drawn lever (0 closed - 1 open) and hammer (0 down - 1 cocked), eased; false when off. Any thread.
 bool lever_drawn(int* weapon, float* lever, float* hammer);
+// a lever gun in hand whose lever is to be worked (a shot not cycled, or the lever open). Any thread.
+bool lever_pending();
+// [Reload] LeverSteady: held two-handed, the gun stays in the front hand while the gun hand works the lever
+bool lever_steady();
+void set_lever_steady(bool on);  // also written to the user ini
 // Run 6 item 9: the drivers of the gun in hand's drawn parts (body.cpp's kGunModels), set by the player's gestures: the
 // opening (0 shut - 1 open), the lever (0 closed - 1 open), the hammer (0 down - 1 cocked), the cylinder's index (the
 // rounds put in by hand, eased: each turns it one chamber), the pump (0 forward - 1 back), the bolt's lift and slide

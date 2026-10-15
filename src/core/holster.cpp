@@ -585,6 +585,16 @@ std::mutex g_zone_mutex;  // the zone settings: the menu writes, the frame end r
 std::atomic<bool> g_holsters{true};
 std::atomic<bool> g_instant{true};  // [Holsters] InstantDraw
 std::atomic<bool> g_consumed[2] = {false, false};
+// [Reload] TriggerTakesRound (2026-10-14, the user: "I'd like my triggers to also be able to grab bullets when the hand is
+// empty"; "The trigger still needs to be able to aim and grab bullets"): the empty hand's trigger pulled at the chest's
+// ammo zone takes a round as its grip does, held while the trigger is; the game still gets that trigger (the aim)
+std::atomic<bool> g_trig_round{true};
+std::atomic<bool> g_stock{false};  // [Reload] PhysicalStock
+// [Reload] StockTurn: the long gun's turn in the gun hand's target for a physical stock (a rotation vector, degrees),
+// learned by the stock calibration (body.cpp); g_stock_cal_ms: when the calibration takes its sample (0: none asked)
+std::mutex g_stock_mutex;
+float g_stock_turn[3] = {};
+std::atomic<double> g_stock_cal_ms{0.0};
 std::atomic<bool> g_wanted[2] = {false, false};  // grip_wanted: as of the last frame end
 float g_grip_on = 0.6f;
 std::atomic<uint64_t> g_draws{0}, g_puts{0}, g_entries{0};
@@ -624,6 +634,7 @@ void holster_frame() {
     static double draw_ms[2] = {0, 0};
     static int draw_slot[2] = {-1, -1};
     static bool round_held[2] = {false, false}, two_hold[2] = {false, false}, trig_down = false;
+    static bool trig_on[2] = {false, false}, trig_grab[2] = {false, false};  // TriggerTakesRound: each trigger, and a take by it
     static bool two_paused[2] = {false, false};  // [Reload] ManualBreak: the two-handed hold waiting while the gun is open
     static bool sec_pending[2] = {false, false};  // [Hands] DualWield: the second gun's hand let go here puts it back
     // the put-back arms once the hand has left the zone it took the second gun at (round 10: a grip again at the same
@@ -658,6 +669,7 @@ void holster_frame() {
             round_held[h] = false;
             two_hold[h] = false;
             g_wanted[h] = false;
+            trig_grab[h] = false;
         }
         g_raised.store(false, std::memory_order_relaxed);  // no aim stance held for a gun the holsters no longer see
         g_gun_at_zone.store(false, std::memory_order_relaxed);
@@ -1257,7 +1269,24 @@ void holster_frame() {
             sec_zone[h] = -2;
             sec_armed[h] = false;
         }
-        const bool down = grip_down[h], pressed = down && !was_down[h], released = !down && was_down[h];
+        {  // [Reload] TriggerTakesRound: the empty hand's trigger pulled in the ammo zone (the grip not held) grabs as the grip
+            const bool t = hands::get(h).trigger > (trig_on[h] ? 0.4f : 0.6f);
+            const bool t_press = t && !trig_on[h];
+            trig_on[h] = t;
+            const bool empty = gun && h == off_h && !(ds.on && h == ds.ctrl) && !two_hold[h];
+            if (t_press && !grip_down[h] && !was_down[h] && empty && zone_rounds(in_z[h]) && g_trig_round.load(std::memory_order_relaxed)) {
+                trig_grab[h] = true;
+                log::info("[holster] %s trigger at the ammo zone: a round taken by the trigger", h ? "right" : "left");
+            }
+            // [Reload] PhysicalStock: the front hand's trigger at the foregrip holds the gun as the grip does (held
+            // there, as KF2VR's: a trigger already pulled when the hand reaches the foregrip takes it too)
+            if (t && !trig_grab[h] && !grip_down[h] && !was_down[h] && empty && in_z[h] < 0 && fore_ok && g_stock.load(std::memory_order_relaxed)) {
+                trig_grab[h] = true;
+                log::info("[holster] %s trigger at the foregrip: the gun held (physical stock)", h ? "right" : "left");
+            }
+            if (!t) trig_grab[h] = false;
+        }
+        const bool down = grip_down[h] || trig_grab[h], pressed = down && !was_down[h], released = !down && was_down[h];
         was_down[h] = down;
         {  // run 12 item 3: John's belt's pieces placed by hand: a grip within 10 cm of a piece's joint takes it; while held
            // it follows the hand's move and turn since the grip (body::piece_grab); letting go keeps it (saved). 2026-10-13
@@ -2346,6 +2375,13 @@ void init() {
     g_show_dots = config::get_bool("Holsters", "ShowHandDots", g_show_zones.load());
     g_ring_gun_axes = config::get_bool("Reload", "RingInGunAxes", true);
     g_steady_ring = config::get_bool("Reload", "SteadyRing", true);
+    g_trig_round = config::get_bool("Reload", "TriggerTakesRound", true);
+    g_stock = config::get_bool("Reload", "PhysicalStock", false);
+    {
+        const std::string s = config::get_string("Reload", "StockTurn", "0 0 0");
+        std::lock_guard lock(g_stock_mutex);
+        if (sscanf_s(s.c_str(), "%f %f %f", g_stock_turn, g_stock_turn + 1, g_stock_turn + 2) != 3) std::memset(g_stock_turn, 0, sizeof(g_stock_turn));
+    }
     g_show_points = config::get_bool("Holsters", "ShowWeaponPoints", g_show_zones.load());
     g_release_margin = config::get_float("Holsters", "ReleaseMargin", 1.3f);
     g_weapon_choice = config::get_bool("Holsters", "WeaponChoice", true);
@@ -2484,6 +2520,41 @@ void set_holsters_enabled(bool on) {
     config::set("Holsters", "Enabled", on ? "1" : "0");
 }
 bool grip_consumed(int h) { return h >= 0 && h < 2 && g_consumed[h].load(std::memory_order_relaxed); }
+bool trigger_takes_round() { return g_trig_round.load(); }
+void set_trigger_takes_round(bool on) {
+    g_trig_round = on;
+    config::set("Reload", "TriggerTakesRound", on ? "1" : "0");
+}
+bool physical_stock() { return g_stock.load(std::memory_order_relaxed); }
+void set_physical_stock(bool on) {
+    g_stock = on;
+    config::set("Reload", "PhysicalStock", on ? "1" : "0");
+}
+void stock_calibrate(double delay_ms) {
+    g_stock_cal_ms = log::now_ms() + delay_ms;
+    log::info("[holster] stock calibration in %.0f ms: hold the gun on both controllers, aiming down the sights", delay_ms);
+}
+double stock_calibrate_in() {
+    const double t = g_stock_cal_ms.load(std::memory_order_relaxed);
+    return t > 0.0 ? t - log::now_ms() : -1.0;
+}
+bool stock_calibrate_due() {
+    double t = g_stock_cal_ms.load(std::memory_order_relaxed);
+    return t > 0.0 && log::now_ms() >= t && g_stock_cal_ms.compare_exchange_strong(t, 0.0);
+}
+void stock_turn(float deg[3]) {
+    std::lock_guard lock(g_stock_mutex);
+    std::memcpy(deg, g_stock_turn, sizeof(g_stock_turn));
+}
+void set_stock_turn(const float deg[3]) {
+    {
+        std::lock_guard lock(g_stock_mutex);
+        std::memcpy(g_stock_turn, deg, sizeof(g_stock_turn));
+    }
+    char b[80];
+    std::snprintf(b, sizeof(b), "%.2f %.2f %.2f", deg[0], deg[1], deg[2]);
+    config::set("Reload", "StockTurn", b);
+}
 float two_hand_blend() { return g_two_blend.load(std::memory_order_relaxed); }
 void foregrip(float off[3], float* radius) {
     std::lock_guard lock(g_zone_mutex);
