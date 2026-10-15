@@ -4,12 +4,12 @@ A native-stereo VR mod for the PC port of **Red Dead Redemption** (2024). The ga
 your headset's view, John's body and arms follow you, and the guns are held, aimed, holstered and reloaded with your
 hands.
 
-Version 0.8.10.3 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
+Version 0.8.11.1 (an early public release). Tested with a Meta Quest 3 on Virtual Desktop; any PC headset with an
 OpenXR runtime should work (see [Compatibility](#compatibility)).
 
 ## This fork (optimumbox/RDRVR)
 
-Upstream [Disonomouss/RDRVR](https://github.com/Disonomouss/RDRVR) 0.8.10 plus:
+Upstream [Disonomouss/RDRVR](https://github.com/Disonomouss/RDRVR) 0.8.11 plus:
 
 - **Single-pass stereo:** both eyes' main scene drawn in one view-instanced pass (D3D12 view instancing), and the
   second eye's scene recorded without draws: much less CPU per frame (holds 90 Hz in town on a Bigscreen Beyond).
@@ -28,6 +28,8 @@ Upstream [Disonomouss/RDRVR](https://github.com/Disonomouss/RDRVR) 0.8.10 plus:
   and TAA soften.
 - **The trigger takes a round** (new in 0.8.10.4; `[Reload] TriggerTakesRound`): your empty hand's trigger at the chest
   takes a round, as its grip does.
+- **Fixed in 0.8.11.1:** a crash in single-pass stereo when the game re-made its light buffer (the right eye's light
+  copy kept the old one); the guns shown in your holsters are hidden in cutscenes.
 
 > RDRVR is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive,
 > and it contains no game files except, in this fork's release, `RDRVR_shaders\`: shaders converted from the
@@ -301,7 +303,7 @@ Upstream [Disonomouss/RDRVR](https://github.com/Disonomouss/RDRVR) 0.8.10 plus:
    Disabled=true
    ```
    RDRVR draws and presents the frame itself; RedHook's DirectX hook gets in its way.
-2. Download `RDRVR-0.8.11.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
+2. Download `RDRVR-0.8.11.1.zip` from the [Releases](../../releases) page, unzip it, and run `Install.cmd`. It finds
    the game through Steam (or asks for the folder; or `Install.cmd -GameDir "<the game folder>"`), backs up anything it
    would replace, and never changes a game file. Its window stays open until you press a key (since 0.8.0): if it
    stops on an error, the text says why, and `%TEMP%\RDRVR_install.log` has everything it printed (attach that file to
