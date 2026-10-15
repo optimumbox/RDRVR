@@ -19,6 +19,7 @@
 #include "core/state.h"
 #include "core/vr_mode.h"
 #include "core/reload.h"
+#include "core/wheel.h"
 #include "core/xinput.h"
 #include "core/xr.h"
 
@@ -295,6 +296,15 @@ void on_frame_end(uint64_t) {
         }
         float sx = xinput::pad_right_x();
         if (controllers && std::fabs(pad.rx / 32767.0f) > std::fabs(sx)) sx = pad.rx / 32767.0f;
+        // 2026-10-15 (the user: "when the wheel is open, stick turning is disabled and the joystick has control in all
+        // directions for the weapon wheel"): while the game's wheel button (LB) is held, or the hand wheel is open, the
+        // right stick is the wheel's: no turn, its x passed to the game; after it, no turn until the stick is let go (no
+        // snap from the stick still held at the wheel's release)
+        static bool s_wheel_stick = false;
+        const bool wheel_held = (controllers && (pad.buttons & 0x0100 /* XINPUT_GAMEPAD_LEFT_SHOULDER */) != 0) || wheel::open();
+        if (wheel_held) s_wheel_stick = true;
+        else if (std::fabs(sx) < 0.3f) s_wheel_stick = false;
+        if (s_wheel_stick) sx = 0.0f;
         if (stick_steer) {
             // the view faces the horse and the left stick steers it; the right stick turns the view by an offset over
             // the mount's heading ([Horse] StickTurn), or not at all
@@ -369,7 +379,7 @@ void on_frame_end(uint64_t) {
             float a = stick_yaw * 0.0174532925f, lx = pad.lx / 32767.0f, ly = pad.ly / 32767.0f;
             pad.lx = stick(lx * std::cos(a) - ly * std::sin(a));
             pad.ly = stick(lx * std::sin(a) + ly * std::cos(a));
-            pad.rx = 0;  // the anchored camera is not the game's to turn
+            if (!wheel_held) pad.rx = 0;  // the anchored camera is not the game's to turn (the wheel's stick is the game's)
             if (lx != 0 || ly != 0) ++g_walk_frames;
         }
         {  // [Body] BodyTurnsWithHead

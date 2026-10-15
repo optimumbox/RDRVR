@@ -129,8 +129,12 @@ DWORD WINAPI hk_GetState(DWORD user, XINPUT_STATE* st) {
             auto clamp = [](float v) { return static_cast<SHORT>((v < -1 ? -1 : v > 1 ? 1 : v) * 32767.0f); };
             st->Gamepad.sThumbLX = clamp(lx * std::cos(a) - ly * std::sin(a));
             st->Gamepad.sThumbLY = clamp(lx * std::sin(a) + ly * std::cos(a));
-            g_right_x.store(st->Gamepad.sThumbRX / 32767.0f, std::memory_order_relaxed);
-            st->Gamepad.sThumbRX = 0;
+            if (st->Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) {  // the weapon wheel open: its stick, no turn
+                g_right_x.store(0.0f, std::memory_order_relaxed);
+            } else {
+                g_right_x.store(st->Gamepad.sThumbRX / 32767.0f, std::memory_order_relaxed);
+                st->Gamepad.sThumbRX = 0;
+            }
         }
         std::lock_guard lock(g_source_mutex);
         if (g_source_on) {
