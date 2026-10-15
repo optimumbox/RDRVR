@@ -34,7 +34,7 @@ float g_zoom = 4.0f, g_size = 0.045f, g_off[3] = {0.0f, 0.07f, -0.10f};
 int g_eye = -1;  // -1 automatic (the eye off the barrel's line), 0 left, 1 right
 // [Scope] RaiseDistance / RaiseAngle: the lens only with the rifle at the face: the eyepiece within this of the sighting
 // eye and the barrel within this angle of the eye's view (degrees); off again 4 cm / 10 degrees past them
-float g_raise_dist = 0.15f, g_raise_deg = 25.0f;
+float g_raise_dist = 0.45f, g_raise_deg = 20.0f;
 std::atomic<bool> g_raised{false};  // the presenting thread's (the hysteresis)
 bool g_weapon[64] = {};
 
@@ -54,6 +54,7 @@ bool g_ready = false, g_failed = false;
 // this frame's lens (prepare -> layer)
 bool g_have = false;
 XrPosef g_pose{};
+XrQuaternionf g_mask_q{0, 0, 0, 1};  // the mask (the crosshair): the lens turned about its normal to the rifle's up
 uint32_t g_patch = 0;
 std::atomic<uint64_t> g_frames{0}, g_busy{0}, g_off_image{0};
 std::atomic<int> g_last_eye{-1}, g_last_patch{0};
@@ -273,8 +274,8 @@ void init() {
             if (_stricmp(t, tok.c_str()) == 0) g_weapon[w] = true;
         }
     }
-    g_raise_dist = std::clamp(config::get_float("Scope", "RaiseDistance", 0.15f), 0.02f, 1.0f);
-    g_raise_deg = std::clamp(config::get_float("Scope", "RaiseAngle", 25.0f), 1.0f, 90.0f);
+    g_raise_dist = std::clamp(config::get_float("Scope", "RaiseDistance", 0.45f), 0.02f, 1.0f);
+    g_raise_deg = std::clamp(config::get_float("Scope", "RaiseAngle", 20.0f), 1.0f, 90.0f);
     log::info("[scope] %s, zoom %.1f, lens %.3f m at (%.3f %.3f %.3f) in the gun's axes; at the face within %.2f m and %.0f deg", g_on ? "on" : "off",
               g_zoom, g_size, g_off[0], g_off[1], g_off[2], g_raise_dist, g_raise_deg);
 }
@@ -412,6 +413,20 @@ bool prepare(const XrView* views, XrSession session, ID3D12CommandQueue* queue, 
     if (!ok) return false;
     g_pose.orientation = v.pose.orientation;  // parallel to the source eye's image: the patch as upright as it saw it
     g_pose.position = {l[0], l[1], l[2]};
+    {  // the crosshair with the rifle's roll: the gun's up (its y) in the source eye's image plane
+        const float uw[3] = {lw[0] + R[1] * 0.1f, lw[1] + R[4] * 0.1f, lw[2] + R[7] * 0.1f};
+        float ul[3], e[3];
+        g_mask_q = g_pose.orientation;
+        if (camera_lever::world_to_local(bp.cam, uw, ul)) {
+            const float d[3] = {ul[0] - l[0], ul[1] - l[1], ul[2] - l[2]};
+            unrotate(v.pose.orientation, d, e);
+            if (e[0] * e[0] + e[1] * e[1] > 1e-8f) {
+                const float a = std::atan2(-e[0], e[1]), sz = std::sin(a * 0.5f), cw = std::cos(a * 0.5f);
+                const XrQuaternionf& o = g_pose.orientation;  // o * (0, 0, sz, cw)
+                g_mask_q = {o.x * cw + o.y * sz, o.y * cw - o.x * sz, o.z * cw + o.w * sz, o.w * cw - o.z * sz};
+            }
+        }
+    }
     g_patch = S;
     g_have = true;
     g_frames.fetch_add(1, std::memory_order_relaxed);
@@ -443,6 +458,7 @@ int layers(XrSpace space, XrCompositionLayerQuad out[2]) {
     m.subImage.swapchain = g_mask;
     m.subImage.imageRect = {{0, 0}, {static_cast<int32_t>(kMaskEdge), static_cast<int32_t>(kMaskEdge)}};
     m.size = {size * kMaskScale, size * kMaskScale};
+    m.pose.orientation = g_mask_q;
     return 2;
 }
 
