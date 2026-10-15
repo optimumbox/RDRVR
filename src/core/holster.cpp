@@ -1,4 +1,5 @@
 #include "core/holster.h"
+#include "core/vr_mode.h"
 
 #include <windows.h>
 
@@ -1881,7 +1882,22 @@ void holster_frame() {
         if (!dual::copy_W() || !dual::sidearm_fragment(dual::copy_model())) held_prop::want(1, nullptr, nullptr);
         // [Holsters] ShowGuns: each gun zone's gun at it (the gun it draws; automatic: its slot's last gun in hand, else
         // the highest owned of its slot), none while that gun is in a hand (the gun in hand, the second gun)
-        const bool show = g_show_guns.load(std::memory_order_relaxed);
+        // 2026-10-15 (the user's cutscene captures: the right hip's holster and gun stretched from John's hip toward the
+        // viewer; gone with ShowGuns off): no shown guns while a cutscene plays or the camera is away from John (a
+        // script's scene: the camera more than 0.8 m across from his root; riding, it stays over him)
+        bool cam_away = false;
+        if (bp.cam_ok) {
+            const float dx = bp.cam[12] - bp.root[0], dz = bp.cam[14] - bp.root[2];
+            cam_away = dx * dx + dz * dz > 0.8f * 0.8f;
+        }
+        const bool scene = vr_mode::cutscene_now() == 1 || cam_away;
+        {
+            static bool was_scene = false;
+            if (scene != was_scene && g_show_guns.load(std::memory_order_relaxed))
+                log::info("[holster] the shown guns %s (%s)", scene ? "hidden" : "shown again", scene ? (cam_away ? "the camera away from John" : "a cutscene") : "the scene over");
+            was_scene = scene;
+        }
+        const bool show = g_show_guns.load(std::memory_order_relaxed) && !scene;
         const bool show_back = g_show_back_guns.load(std::memory_order_relaxed);
         ShowDiag sd;
         {

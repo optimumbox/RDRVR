@@ -29,6 +29,7 @@
 
 namespace rdrvr::prepass {
 void set_light_copy(int mode);
+void light_copy_forget();
 namespace {
 
 // The pre-pass's six, then (view-instanced main pass, [Stereo] ViMain) the main pass's own targets
@@ -260,6 +261,7 @@ bool ensure(int k, ID3D12Resource* res, DXGI_FORMAT view_fmt) {
     }
     log::info("[prepass] %s: %s %llux%u (format %d, view %d, %u plane(s))", kNames[k], native ? "the game's own 2-slice target" : "a 2-slice array",
               static_cast<unsigned long long>(d.Width), d.Height, static_cast<int>(d.Format), static_cast<int>(vf), a.planes);
+    if (k == kLight) light_copy_forget();  // a new Light Buffer, even at the old one's address: the light copy's views made again
     if (native && kSlot[k] >= 0 && k != kFsc) {  // view 1 reads slice 1 of the game's own (stereo_vi_heap.cpp: an array view)
         vi::eye2_texture(kSlot[k], res, res);
     } else if (g_i2.load(std::memory_order_relaxed) && kSlot[k] >= 0) {  // eye 2's copy, read by view 1 through the slot
@@ -1791,6 +1793,10 @@ void light_copy(ID3D12GraphicsCommandList* cl, ID3D12Resource* lb) {
     g_lc_why = "drawn";
 }
 }  // namespace
+// 0.8.10.4's crash (nvwgf2umx.dll, a read at 0x28, in the light copy's draw): the game made its targets again and the new
+// Light Buffer came at the address of one made earlier, so the copy drew through views of the freed one. Called (the
+// render thread, as light_copy) whenever a Light Buffer is taken: its views are made again at its first copy.
+void light_copy_forget() { g_lc_rtv_for = nullptr; }
 void set_light_copy(int mode) {
     g_lc_mode = mode < 0 || mode > 2 ? 0 : mode;
     static const char* const names[] = {"off", "max", "replace"};
