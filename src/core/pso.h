@@ -26,4 +26,7 @@ bool current(const ID3D12GraphicsCommandList* cl, uint64_t* vs, uint64_t* ps, ui
 // The list's SetPipelineState past the hook (stereo_vi.cpp binds a twin or the game's pipeline back).
 void raw_set_pipeline(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* ps);
 
+// The fnv of the blob a root signature was made from (0: not seen being made), a name the next session can find again.
+uint64_t root_signature_hash(const void* rs);
+
 }  // namespace rdrvr::pso

@@ -132,14 +132,16 @@ using CreateRootSig_t = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const v
 CreateRootSig_t o_CreateRootSig = nullptr;
 std::string g_dump_dir;
 std::mutex g_dump_mutex;
-std::unordered_map<void*, std::vector<uint8_t>> g_root_blobs;  // under g_dump_mutex
+std::unordered_map<void*, std::vector<uint8_t>> g_root_blobs;  // under g_dump_mutex (PsoDump only)
+std::unordered_map<void*, uint64_t> g_root_hash;                // under g_dump_mutex: each root signature's blob's fnv
 int g_dumped = 0;
 HRESULT STDMETHODCALLTYPE hk_CreateRootSig(ID3D12Device* dev, UINT mask, const void* blob, SIZE_T len, REFIID riid, void** out) {
     const HRESULT hr = o_CreateRootSig(dev, mask, blob, len, riid, out);
     if (SUCCEEDED(hr) && out && *out && blob && len) {
         std::lock_guard lock(g_dump_mutex);
         const uint8_t* b = static_cast<const uint8_t*>(blob);
-        g_root_blobs[*out] = std::vector<uint8_t>(b, b + len);
+        g_root_hash[*out] = fnv(blob, len);
+        if (!g_dump_dir.empty()) g_root_blobs[*out] = std::vector<uint8_t>(b, b + len);
     }
     return hr;
 }
@@ -395,9 +397,10 @@ void install_device_hooks(ID3D12Device* dev) {
         load_swaps();
         if (config::get_bool("Debug", "PsoCensus", false)) g_census = true;
         g_dump_dir = config::get_string("Debug", "PsoDump", "");
+        // (always: the twin cache's names hold the root signature's content, vi::make_twin)
+        hooks::install("ID3D12Device::CreateRootSignature", hooks::vtable_entry(dev, 16), hk_CreateRootSig, &o_CreateRootSig);
         if (!g_dump_dir.empty()) {
             CreateDirectoryA(g_dump_dir.c_str(), nullptr);
-            hooks::install("ID3D12Device::CreateRootSignature", hooks::vtable_entry(dev, 16), hk_CreateRootSig, &o_CreateRootSig);
             log::info("[pso] PsoDump: the game's pipelines written to %s", g_dump_dir.c_str());
         }
     }
@@ -595,6 +598,12 @@ std::string command(const std::string& line) {
         out += buf;
     }
     return out;
+}
+
+uint64_t root_signature_hash(const void* rs) {
+    std::lock_guard lock(g_dump_mutex);
+    const auto it = g_root_hash.find(const_cast<void*>(rs));
+    return it == g_root_hash.end() ? 0 : it->second;
 }
 
 }  // namespace rdrvr::pso

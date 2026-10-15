@@ -283,6 +283,122 @@ struct Stream {
 // it should be by the depth test, like the rest of the scene.
 const D3D12_VIEW_INSTANCE_LOCATION kLocations[2] = {{0, 0}, {1, 1}};
 
+// [Stereo] TwinCache (2026-10-15, on): each twin made is stored in a D3D12 pipeline library saved to
+// <game>\RDRVR_twins.bin, and a later session loads it from there (well under a millisecond) instead of compiling it
+// (tens of ms on a cold driver cache; while a twin is being made, eye 2's scene is recorded whole: the CPU spikes riding
+// into a town). A twin's name is its shaders' and states' content, so another shader set or state finds nothing and is
+// made again. A library from another driver or GPU is refused by the runtime: a new one is started. Saved every 20 s
+// while new twins came (the game ends with TerminateProcess: nothing runs at exit).
+std::mutex g_lib_mutex;                // the library's calls (its loads, stores and serializing)
+ID3D12PipelineLibrary1* g_lib = nullptr;
+std::vector<uint8_t> g_lib_blob;       // the file's bytes, which the library reads from as long as it lives
+std::atomic<int> g_lib_new{0};
+std::atomic<uint64_t> g_lib_hits{0}, g_lib_stored{0};
+bool g_lib_tried = false;
+constexpr size_t kLibMaxBytes = 768ull << 20;  // a larger file (old shader sets' twins piling up) is started again
+
+std::wstring lib_path() { return std::wstring(log::game_dir()) + L"RDRVR_twins.bin"; }
+
+void lib_save() {
+    std::vector<uint8_t> buf;
+    {
+        std::lock_guard lock(g_lib_mutex);
+        if (!g_lib || g_lib_new.load() == 0) return;
+        buf.resize(g_lib->GetSerializedSize());
+        if (buf.empty() || FAILED(g_lib->Serialize(buf.data(), buf.size()))) {
+            log::warn("[vi] twin cache: not serialized");
+            return;
+        }
+        g_lib_new = 0;
+    }
+    const std::wstring path = lib_path(), tmp = path + L".tmp";
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, tmp.c_str(), L"wb") != 0 || !f) return;
+    const bool ok = std::fwrite(buf.data(), 1, buf.size(), f) == buf.size();
+    std::fclose(f);
+    if (ok && MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+        log::info("[vi] twin cache saved: %.1f MB (%llu loaded from it this session, %llu new)", buf.size() / 1048576.0,
+                  static_cast<unsigned long long>(g_lib_hits.load()), static_cast<unsigned long long>(g_lib_stored.load()));
+    else
+        DeleteFileW(tmp.c_str());
+}
+
+void lib_open() {  // under g_lib_mutex, once, from the first twin
+    if (g_lib_tried) return;
+    g_lib_tried = true;
+    if (!config::get_bool("Stereo", "TwinCache", true)) return;
+    const std::wstring path = lib_path();
+    if (FILE* f = nullptr; _wfopen_s(&f, path.c_str(), L"rb") == 0 && f) {
+        std::fseek(f, 0, SEEK_END);
+        const long n = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        if (n > 0 && static_cast<size_t>(n) <= kLibMaxBytes) {
+            g_lib_blob.resize(static_cast<size_t>(n));
+            if (std::fread(g_lib_blob.data(), 1, g_lib_blob.size(), f) != g_lib_blob.size()) g_lib_blob.clear();
+        }
+        std::fclose(f);
+    }
+    HRESULT hr = E_FAIL;
+    if (!g_lib_blob.empty()) {
+        hr = g_dev->CreatePipelineLibrary(g_lib_blob.data(), g_lib_blob.size(), IID_PPV_ARGS(&g_lib));
+        if (SUCCEEDED(hr))
+            log::info("[vi] twin cache: %.1f MB from %ls", g_lib_blob.size() / 1048576.0, path.c_str());
+        else
+            log::info("[vi] twin cache: %ls not used (%#lx: another driver or GPU): a new one", path.c_str(), static_cast<unsigned long>(hr));
+    }
+    if (FAILED(hr)) {
+        g_lib_blob.clear();
+        g_lib = nullptr;
+        hr = g_dev->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&g_lib));
+        if (FAILED(hr)) {
+            g_lib = nullptr;
+            log::warn("[vi] twin cache: no pipeline library (%#lx): twins made each session", static_cast<unsigned long>(hr));
+            return;
+        }
+    }
+    std::thread([] {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(20));
+            lib_save();
+        }
+    }).detach();
+}
+
+// The twin's name: everything its desc holds but pointers (the shaders' bytes, the root signature's blob)
+std::wstring twin_name(const Kept* k, const Stream& s) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](const void* p, size_t n) {
+        const uint8_t* b = static_cast<const uint8_t*>(p);
+        for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+    };
+    auto mix64 = [&](uint64_t v) { mix(&v, sizeof(v)); };
+    mix64(fnv(s.vs.v.pShaderBytecode, s.vs.v.BytecodeLength));
+    mix64(s.ps.v.BytecodeLength ? fnv(s.ps.v.pShaderBytecode, s.ps.v.BytecodeLength) : 0);
+    mix64(pso::root_signature_hash(k->root));
+    mix(&s.blend.v, sizeof(s.blend.v));
+    mix(&s.sample_mask.v, sizeof(s.sample_mask.v));
+    mix(&s.rast.v, sizeof(s.rast.v));
+    mix(&s.depth.v, sizeof(s.depth.v));
+    for (size_t i = 0; i < k->layout.size(); ++i) {
+        const D3D12_INPUT_ELEMENT_DESC& e = k->layout[i];
+        if (e.SemanticName) mix(e.SemanticName, std::strlen(e.SemanticName) + 1);
+        const uint32_t v[6] = {e.SemanticIndex, static_cast<uint32_t>(e.Format), e.InputSlot, e.AlignedByteOffset,
+                               static_cast<uint32_t>(e.InputSlotClass), e.InstanceDataStepRate};
+        mix(v, sizeof(v));
+    }
+    mix(&s.cut.v, sizeof(s.cut.v));
+    mix(&s.topology.v, sizeof(s.topology.v));
+    mix(&s.rtv.v, sizeof(s.rtv.v));
+    mix(&s.dsv.v, sizeof(s.dsv.v));
+    mix(&s.sample.v, sizeof(s.sample.v));
+    mix(&s.node.v, sizeof(s.node.v));
+    mix(&s.flags.v, sizeof(s.flags.v));
+    mix(kLocations, sizeof(kLocations));
+    wchar_t b[24];
+    std::swprintf(b, 24, L"t%016llx", static_cast<unsigned long long>(h));
+    return b;
+}
+
 void make_twin(Kept* k) {
     k->state = -1;
     // "vi load <dir> all": a pipeline whose shaders are no twin (or refused) in the new set loses its old twin (leaked:
@@ -336,9 +452,29 @@ void make_twin(Kept* k) {
     s.node.v = k->node;
     s.flags.v = k->flags;
     s.views.v = {2, kLocations, D3D12_VIEW_INSTANCING_FLAG_NONE};
-    const D3D12_PIPELINE_STATE_STREAM_DESC sd{sizeof(s), &s};
+    D3D12_PIPELINE_STATE_STREAM_DESC sd{sizeof(s), &s};
     ID3D12PipelineState* twin = nullptr;
-    const HRESULT hr = g_dev->CreatePipelineState(&sd, IID_PPV_ARGS(&twin));
+    std::wstring name;
+    bool cache = false;
+    {
+        std::lock_guard lock(g_lib_mutex);
+        lib_open();
+        cache = g_lib != nullptr && pso::root_signature_hash(k->root) != 0;
+        if (cache) {
+            name = twin_name(k, s);
+            if (SUCCEEDED(g_lib->LoadPipeline(name.c_str(), &sd, IID_PPV_ARGS(&twin))) && twin) g_lib_hits.fetch_add(1, std::memory_order_relaxed);
+            else twin = nullptr;
+        }
+    }
+    const bool loaded = twin != nullptr;
+    const HRESULT hr = loaded ? S_OK : g_dev->CreatePipelineState(&sd, IID_PPV_ARGS(&twin));
+    if (SUCCEEDED(hr) && twin && cache && !loaded) {
+        std::lock_guard lock(g_lib_mutex);
+        if (SUCCEEDED(g_lib->StorePipeline(name.c_str(), twin))) {  // (refused: that name holds another desc, or is taken)
+            g_lib_stored.fetch_add(1, std::memory_order_relaxed);
+            g_lib_new.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (FAILED(hr) || !twin) {
         k->why = "CreatePipelineState refused";
         if (g_failed.fetch_add(1, std::memory_order_relaxed) < 10)
