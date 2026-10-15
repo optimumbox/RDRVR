@@ -558,8 +558,6 @@ struct Frame {
     bool ik[2] = {false, false};
     float ik_t[2][3] = {};      // the wrist targets (world)
     float ik_r[2][9] = {};      // the controllers' orientations (world, the calibration turn applied)
-    bool steady = false;        // [Reload] LeverSteady / RifleSteady: the gun hand's target carried by the front hand
-    float free_t[3] = {}, free_r[9] = {};  // the gun hand's own target then (its controller's)
     float ik_pole[2][3] = {};   // the elbows' bend hints (world)
     float arm_local[2][3] = {}, elbow_local[2][3] = {}, wrist_local[2][3] = {};
     float pitch = 0;      // radians, the torso pitch offset
@@ -4386,10 +4384,6 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
             g_item_corr[g].ms = now;
             g_item_corr[g].ik = f.ik[xfer_ok && g == f.item_side ? f.gun_j : g];
         }
-        g_points.steady = f.steady;
-        g_points.free_ok = f.ik[f.gun_j];
-        std::memcpy(g_points.free_hand, f.steady ? f.free_t : f.ik_t[f.gun_j], sizeof(g_points.free_hand));
-        std::memcpy(g_points.free_rot, f.steady ? f.free_r : f.ik_r[f.gun_j], sizeof(g_points.free_rot));
         for (int h = 0; h < 2; ++h) {
             g_points.hand_ok[h] = f.ik[h];
             std::memcpy(g_points.hand[h], f.ik_t[h], sizeof(g_points.hand[h]));
@@ -7729,12 +7723,7 @@ void before_scene(const float* cam) {
         static float last_r[9], last_t[3];  // the last carried target, eased from when let go
         static double free_ms = -1e9;
         const int gj = f.gun_j, fj = 1 - gj;
-        std::memcpy(f.free_t, f.ik_t[gj], sizeof(f.free_t));
-        std::memcpy(f.free_r, f.ik_r[gj], sizeof(f.free_r));
-        f.steady = false;
-        // [Reload] RifleSteady (2026-10-15): a bolt gun or a hand-worked breech with its action to be worked, the same
-        const bool want = f.ik[0] && f.ik[1] && ((actions::lever_steady() && actions::lever_pending()) || actions::rifle_pending()) &&
-                          holster::two_hand_blend() > 0.5f;
+        const bool want = f.ik[0] && f.ik[1] && actions::lever_steady() && actions::lever_pending() && holster::two_hand_blend() > 0.5f;
         auto to_q = [](const float* m, float* q) {  // row-major rotation -> x y z w
             const float tr = m[0] + m[4] + m[8];
             if (tr > 0.0f) {
@@ -7765,13 +7754,12 @@ void before_scene(const float* cam) {
                 rel_t[r] = Rf[r] * (f.ik_t[gj][0] - tf[0]) + Rf[3 + r] * (f.ik_t[gj][1] - tf[1]) + Rf[6 + r] * (f.ik_t[gj][2] - tf[2]);
             }
             locked = true;
-            log::info("[actions] the gun steady in the front hand while its action is worked (%s)", actions::rifle_pending() ? "a bolt or breech" : "the lever");
+            log::info("[actions] lever: the gun steady in the front hand while the lever is worked");
         } else if (!want && locked) {
             locked = false;
             free_ms = log::now_ms();
         }
         if (locked) {
-            f.steady = true;
             mul3(Rf, rel_r, last_r);
             for (int k = 0; k < 3; ++k) last_t[k] = tf[k] + Rf[k * 3] * rel_t[0] + Rf[k * 3 + 1] * rel_t[1] + Rf[k * 3 + 2] * rel_t[2];
             std::memcpy(f.ik_r[gj], last_r, sizeof(last_r));

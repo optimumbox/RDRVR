@@ -96,11 +96,6 @@ struct BodyPoints {
     bool gun_frame_ok = false;
     float gun_frame_R[9] = {};
     float gun_frame_o[3] = {};
-    // [Reload] LeverSteady / RifleSteady: steady, the gun carried by the front hand (hand[gun] then the carried wrist,
-    // on the gun); free_hand / free_rot the gun hand's own controller target (world; hand[gun]'s when not steady)
-    bool steady = false, free_ok = false;
-    float free_hand[3] = {};
-    float free_rot[9] = {};
 };
 bool body_points(BodyPoints* out);
 // [Body] HiddenGeometry: 0 draw (the hidden parts drawn collapsed, as before), 1 skip (the geometries with every bone

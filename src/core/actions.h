@@ -87,10 +87,6 @@ bool lever_drawn(int* weapon, float* lever, float* hammer);
 bool lever_pending();
 // [Reload] LeverSteady: held two-handed, the gun stays in the front hand while the gun hand works the lever
 bool lever_steady();
-// [Reload] RifleSteady: a bolt gun or a hand-worked breech (the Springfield, the Rolling Block) held two-handed with its
-// action to be worked (a shot, the bolt back, the breech open): the gun stays in the front hand and the gun hand's
-// controller works the part and brings the round from the chest. Any thread.
-bool rifle_pending();
 void set_lever_steady(bool on);  // also written to the user ini
 // Run 6 item 9: the drivers of the gun in hand's drawn parts (body.cpp's kGunModels), set by the player's gestures: the
 // opening (0 shut - 1 open), the lever (0 closed - 1 open), the hammer (0 down - 1 cocked), the cylinder's index (the

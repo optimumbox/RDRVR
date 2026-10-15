@@ -1064,16 +1064,6 @@ void holster_frame() {
     const int gj = bp.gun, fj = 1 - gj;  // John's gun hand and his front hand
     float gb[2][3];  // [Hands] InteractOffset: each hand's interaction spot (what grabs); the gun hand's wrist stays the gun's reference
     for (int j = 0; j < 2; ++j) grab_point(bp, j, gb[j]);
-    // [Reload] RifleSteady (actions.cpp): the gun carried by the front hand, the gun hand's controller free: its own spot
-    // (gb[gj] stays the carried wrist's) takes a round from the chest and brings it to the gun; John's hand stays on the grip
-    const bool rifle_free = bp.steady && bp.free_ok && actions::rifle_pending();
-    float gbf[3];
-    {
-        body::BodyPoints fb = bp;
-        std::memcpy(fb.hand[gj], bp.free_hand, sizeof(fb.hand[gj]));
-        std::memcpy(fb.target_rot[gj], bp.free_rot, sizeof(fb.target_rot[gj]));
-        grab_point(fb, gj, gbf);
-    }
     float lo[3], lr = 0.12f;
     bool touch = false;
     {
@@ -1096,12 +1086,6 @@ void holster_frame() {
     }
     // [Reload] InsertOnTouch: the drawn round's distance from the point (the hand holding one), else the wrist's
     auto round_at = [&](int rj, float* d_round, float* d_wrist) {
-        if (rifle_free && rj == gj) {  // RifleSteady: the free controller's spot (no round drawn: the hand is on the grip)
-            const float fx = gbf[0] - load_pt[0], fy = gbf[1] - load_pt[1], fz = gbf[2] - load_pt[2];
-            *d_wrist = std::sqrt(fx * fx + fy * fy + fz * fz);
-            *d_round = -1.0f;
-            return;
-        }
         const float dx = gb[rj][0] - load_pt[0], dy = gb[rj][1] - load_pt[1], dz = gb[rj][2] - load_pt[2];
         *d_wrist = std::sqrt(dx * dx + dy * dy + dz * dz);
         *d_round = -1.0f;
@@ -1234,16 +1218,6 @@ void holster_frame() {
     // foregrip (cycle M2: the Springfield's trapdoor lies 11 cm from the foregrip's point, inside its ring)
     const bool fore_ok = fore_near && !broken && !actions::grip_wanted(off_h);
     static bool was_down[2] = {false, false};
-    // RifleSteady: the zone of rounds the gun hand's free controller is in (-1 none); a round it holds is dropped once
-    // the gun is back on it
-    int srz = -1;
-    if (rifle_free)
-        for (int z = 0; z < kZones && srz < 0; ++z) {
-            if (!zok[z] || !zone_rounds(z)) continue;
-            const float dx = gbf[0] - zp[z][0], dy = gbf[1] - zp[z][1], dz = gbf[2] - zp[z][2];
-            if (std::sqrt(dx * dx + dy * dy + dz * dz) < zones[z].radius) srz = z;
-        }
-    if (!rifle_free && round_held[gun_h]) round_held[gun_h] = false;
     int in_z[2] = {-1, -1};
     for (int h = 0; h < 2; ++h) {  // h: the controller; jh: John's hand on it (body.cpp's mapping)
         const int jh = bp.ctrl[0] == h ? 0 : 1;
@@ -1518,20 +1492,7 @@ void holster_frame() {
                 continue;  // no draws, put-aways or rounds while placing
             }
         }
-        if (rifle_free && h == gun_h && pressed && srz >= 0) {  // RifleSteady: the gun hand's controller at the rounds
-            const bool loadable = reload::hand_reload() && gun && st.clip + 0.5f <= st.clip_max && st.spare >= 1.0f && actions::can_load(st.weapon) &&
-                                  !(st.weapon_flags & (RDRVR_WEAPON_DEADEYE | RDRVR_WEAPON_RELOADING));
-            g_consumed[h] = true;
-            press_zone[h] = srz;
-            pending[h] = false;
-            round_held[h] = loadable;
-            controllers::pulse(h, loadable ? 0.4f : 0.15f, loadable ? 25 : 10);
-            if (loadable) {
-                g_rounds_taken.fetch_add(1, std::memory_order_relaxed);
-                log::info("[holster] the gun hand took a round, the gun steady in the front hand (clip %.0f/%.0f, spare %.0f)", st.clip, st.clip_max,
-                          st.spare);
-            }
-        } else if (pressed && zone_rounds(in_z[h])) {
+        if (pressed && zone_rounds(in_z[h])) {
             // a round from the chest for the gun in the other hand (the game's count: the gun not full, spare rounds)
             g_consumed[h] = true;
             press_zone[h] = in_z[h];
@@ -1780,7 +1741,7 @@ void holster_frame() {
                 log::info("[holster] %s hand still on the foregrip as the gun shut: two-handed again", h ? "right" : "left");
             }
         }
-        g_wanted[h] = in_z[h] >= 0 || (h == off_h && fore_ok) || (h == gun_h && srz >= 0);
+        g_wanted[h] = in_z[h] >= 0 || (h == off_h && fore_ok);
         if (released && round_held[h]) {  // round 10: two rounds taken and let go before the gun, silently lost
             const int rj = bp.ctrl[0] == h ? 0 : 1;
             float d_round = -1.0f, d = 1e9f;
@@ -1864,7 +1825,7 @@ void holster_frame() {
         g_raise_dbg[3].store(static_cast<float>((gun ? 1 : 0) | (bp.hand_ok[gj] ? 2 : 0) | (bp.bone_ok[4] ? 4 : 0) | (in_z[gun_h] < 0 ? 8 : 0) |
                                                 (!round_held[0] && !round_held[1] ? 16 : 0)),
                              std::memory_order_relaxed);
-        if (gun && bp.hand_ok[gj] && bp.bone_ok[4] && in_z[gun_h] < 0 && (rifle_free || (!round_held[0] && !round_held[1]))) {
+        if (gun && bp.hand_ok[gj] && bp.bone_ok[4] && in_z[gun_h] < 0 && !round_held[0] && !round_held[1]) {
             const float pitch = std::asin(u[1] < -1.0f ? -1.0f : u[1] > 1.0f ? 1.0f : u[1]) * 57.2957795f;
             const float dx = bp.hand[gj][0] - bp.bone[4][0], dz = bp.hand[gj][2] - bp.bone[4][2];
             const float reach = std::sqrt(dx * dx + dz * dz), ahead = dx * u[0] + dz * u[2];
@@ -1898,7 +1859,7 @@ void holster_frame() {
     {  // [Reload] RoundInHand: John's hand holding a round, for its draw (round_draw)
         int rh = -1;
         for (int h = 0; h < 2; ++h)
-            if (round_held[h] && !(rifle_free && h == gun_h)) rh = bp.ctrl[0] == h ? 0 : 1;
+            if (round_held[h]) rh = bp.ctrl[0] == h ? 0 : 1;
         round_draw::set_held(rh, audio::click_family(st.weapon));
         // [Reload] ShowAmmo (run 6 item 6b): while a round could go in now (the gun open for it, or a gate gun with room),
         // a row of the gun's rounds at the chest: as many as could go in, up to six
@@ -2113,7 +2074,7 @@ void holster_frame() {
                 add(c, 0.18f, kRing, fs, kZones);
             }
         }
-        if (points_shown && (round_held[off_h] || round_held[gun_h])) add(load_pt, lr, kRing, kGunIdle, kZones + 1);  // where the round goes in
+        if (points_shown && round_held[off_h]) add(load_pt, lr, kRing, kGunIdle, kZones + 1);  // where the round goes in
         // the action's want: the revolver open (where rounds go in), the bolt's zone, the lever or pump gun
         if (points_shown && ahint == 2) add(hint_pos, 0.05f, kRing, kHeld, kZones + 4);
         else if (points_shown && ahint) add(load_pt, ahint == 1 ? 0.06f : 0.04f, kRing, kHeld, kZones + 4);
