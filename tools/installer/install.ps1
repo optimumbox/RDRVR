@@ -174,6 +174,17 @@ function Copy-Retry([string] $src, [string] $dst) {
     }
     return $false
 }
+# RDRVR_shaders\ holds only this release's set: an older release's shader this one dropped (0.8.10.1's river water)
+# would still be loaded and drawn
+$shDir = Join-Path $GameDir 'RDRVR_shaders'
+if (Test-Path -LiteralPath $shDir) {
+    $keep = @{}
+    foreach ($f in $Files) { if ($f -like 'RDRVR_shaders\*') { $keep[$f.ToLowerInvariant()] = $true } }
+    $stale = @(Get-ChildItem -LiteralPath $shDir -File -Recurse | Where-Object {
+        -not $keep.ContainsKey(('RDRVR_shaders\' + $_.FullName.Substring($shDir.Length + 1)).ToLowerInvariant()) })
+    foreach ($s in $stale) { Remove-Item -LiteralPath $s.FullName -Force }
+    if ($stale.Count) { Say "  removed $($stale.Count) shader file(s) an older release left in RDRVR_shaders\" }
+}
 $record = @()
 foreach ($f in $Files) {
     $src = Join-Path $Payload $f

@@ -226,6 +226,10 @@ void load_shaders(const std::string& dir) {
             if (const uint64_t x = std::strtoull(line, nullptr, 16)) no_twin.insert(x);
         std::fclose(f);
     }
+    // (a converted pixel shader the list says to leave alone is not used: an older release's file left in the folder,
+    // e.g. 0.8.10.1's river water, broke the water)
+    for (const uint64_t x : no_twin)
+        if (ps.erase(x)) log::info("[vi] ps_%016llx.dxil ignored: listed in no_twin.txt (an older set's file)", (unsigned long long)x);
     if (FILE* f = nullptr; fopen_s(&f, (dir + "\\ps_safe.txt").c_str(), "r") == 0 && f) {
         char line[64];
         while (std::fgets(line, sizeof(line), f))
