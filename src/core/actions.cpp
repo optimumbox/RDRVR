@@ -1009,6 +1009,24 @@ void frame() {
     } else if (k == kLever && !g_needs && g_w[0] >= g_lever_speed && g_lever_down_ms > 0) {
         g_lever_down_ms = 0;
     }
+    {  // a lever waiting to be worked: the gun hand's pitch rates seen (the flick needs LeverFlickSpeed), every 3 s
+        static double wait_ms = 0.0;
+        static float lo = 0.0f, hi = 0.0f, wmax = 0.0f;
+        if (k == kLever && (g_needs || g_lever_open) && !deadeye) {
+            if (wait_ms <= 0.0) wait_ms = now, lo = hi = wmax = 0.0f;
+            lo = std::fmin(lo, g_w[0]);
+            hi = std::fmax(hi, g_w[0]);
+            wmax = std::fmax(wmax, std::sqrt(g_w[0] * g_w[0] + g_w[1] * g_w[1] + g_w[2] * g_w[2]));
+            if (now - wait_ms >= 3000.0) {
+                log::info("[actions] lever (%d) waiting (%s): the gun hand's pitch rate %.1f down to %.1f up rad/s, any axis %.1f (needs %.1f), "
+                          "valid %d, the gun steady %d", w, g_lever_open ? "open" : "shut", lo, hi, wmax, g_lever_speed, gh.valid ? 1 : 0,
+                          pts && bp.steady ? 1 : 0);
+                wait_ms = now, lo = hi = wmax = 0.0f;
+            }
+        } else {
+            wait_ms = 0.0;
+        }
+    }
     g_lever_pend.store(k == kLever && kind_on(k) && !deadeye && (g_needs || g_lever_open), std::memory_order_relaxed);
     g_lever_pend_ms.store(now, std::memory_order_relaxed);
     {  // RifleSteady: a shot to work off, the bolt back (or not home), the breech open or empty, or the gun hand on the part
