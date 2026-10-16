@@ -38,7 +38,7 @@ namespace {
 std::atomic<bool> g_barrel{true};  // [Hands] BarrelAim
 std::atomic<bool> g_fire{true};    // [Hands] FireInFirstPerson
 std::atomic<bool> g_reticle{false};      // [Hands] Reticle (off by default)
-std::atomic<bool> g_sight_log{true};     // [Aim] SightLog: a line per player shot against the sights (log_sight)
+std::atomic<bool> g_sight_log{false};    // [Aim] SightLog: a line per player shot against the sights (log_sight)
 std::atomic<float> g_reticle_deg{1.2f};  // [Hands] ReticleSize (degrees across)
 std::atomic<bool> g_reticle_dot{false};    // [Hands] ReticleStyle=dot: a dot only
 std::atomic<bool> g_ret_smooth{true};   // [Hands] ReticleSmooth (run 10 item 8)
@@ -881,7 +881,7 @@ void init() {
     g_perfect = config::get_bool("Aim", "PerfectAccuracy", true);
     g_pattern = config::get_bool("Aim", "ShotgunPattern", true);
     g_reticle = config::get_bool("Hands", "Reticle", false);
-    g_sight_log = config::get_bool("Aim", "SightLog", true);
+    g_sight_log = config::get_bool("Aim", "SightLog", false);
     g_ret_smooth = config::get_bool("Hands", "ReticleSmooth", true);  // run 10 item 8
     g_reticle_dot = config::get_string("Hands", "ReticleStyle", "ring") == "dot";
     {

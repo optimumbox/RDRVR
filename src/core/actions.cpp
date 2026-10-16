@@ -118,6 +118,7 @@ std::atomic<bool> g_lever_parts{false};
 // [Reload] LeverSteady: a lever gun held two-handed is carried by the front hand while its lever is worked (body.cpp);
 // g_lever_pend: a shot not cycled (or the lever open), with when it was last set (the frame-end listener)
 std::atomic<bool> g_lever_steady{true}, g_lever_pend{false};
+std::atomic<bool> g_lever_wait_log{false};  // [Debug] LeverWaitLog: a lever waiting to be worked, the gun hand's rates every 3 s
 std::atomic<double> g_steady_hold_ms{500.0};  // [Reload] SteadyHoldMs: the gun kept steady this long after its action is worked
 std::atomic<double> g_lever_pend_ms{0.0};
 // [Reload] RifleSteady (2026-10-15, the user: "the left hand can still stabilize the gun while the right hand performs
@@ -1013,7 +1014,7 @@ void frame() {
     {  // a lever waiting to be worked: the gun hand's pitch rates seen (the flick needs LeverFlickSpeed), every 3 s
         static double wait_ms = 0.0;
         static float lo = 0.0f, hi = 0.0f, wmax = 0.0f;
-        if (k == kLever && (g_needs || g_lever_open) && !deadeye) {
+        if (g_lever_wait_log.load(std::memory_order_relaxed) && k == kLever && (g_needs || g_lever_open) && !deadeye) {
             if (wait_ms <= 0.0) wait_ms = now, lo = hi = wmax = 0.0f;
             lo = std::fmin(lo, g_w[0]);
             hi = std::fmax(hi, g_w[0]);
@@ -1134,6 +1135,7 @@ void init() {
     g_open_cyl = config::get_bool("Reload", "OpenCylinder", false);
     g_lever_parts = config::get_bool("Reload", "LeverParts", false);
     g_lever_steady = config::get_bool("Reload", "LeverSteady", true);
+    g_lever_wait_log = config::get_bool("Debug", "LeverWaitLog", false);
     g_steady_hold_ms = std::fmin(std::fmax(config::get_float("Reload", "SteadyHoldMs", 500.0f), 0.0f), 3000.0f);
     g_rifle_steady = config::get_bool("Reload", "RifleSteady", false);
     g_pump_parts = config::get_bool("Reload", "PumpParts", false);
