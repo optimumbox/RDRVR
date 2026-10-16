@@ -48,6 +48,7 @@ enum State { kNone, kRequesting, kStreaming, kLoaded, kCreating, kLive, kDestroy
 // "props puts <n>" (1-64) for a session
 constexpr int kPuts = 64;  // the storage; g_puts_n of them used
 std::atomic<int> g_puts_n{8};
+std::atomic<bool> g_clear{false};  // set_clear
 struct Slot {
     // wanted (any thread, under g_mutex)
     const char* want = nullptr;
@@ -245,7 +246,7 @@ void frame(uint32_t actor) {
         bool angled;
         {
             std::lock_guard lock(g_mutex);
-            want = s.want;
+            want = g_clear.load(std::memory_order_relaxed) && i != kCensusSlot ? nullptr : s.want;
             std::memcpy(pose, s.pose, sizeof(pose));
             angled = s.angled;
             std::memcpy(ang, s.angles, sizeof(ang));
@@ -493,7 +494,9 @@ bool diag_on() { return g_diag.load(std::memory_order_relaxed); }
 std::atomic<bool> g_twins_on{true};  // "props twins on|off": the belt's twin hidden (the session; the perf test's control)
 void set_twins(bool on) { g_twins_on = on; }
 bool shown_at_holster(uintptr_t drawable) {
-    if (!drawable || !g_any.load(std::memory_order_relaxed) || !g_twins_on.load(std::memory_order_relaxed)) return false;
+    if (!drawable || !g_any.load(std::memory_order_relaxed) || !g_twins_on.load(std::memory_order_relaxed) ||
+        g_clear.load(std::memory_order_relaxed))
+        return false;
     bool known = false;  // the lock-free filter first (match's): most draws are of no prop's model
     for (const auto& k : g_known) known = known || k.load(std::memory_order_relaxed) == drawable;
     if (!known) return false;
@@ -564,6 +567,8 @@ std::string diag_command(const std::string& arg) {
     return o;
 }
 
+void set_clear(bool on) { g_clear = on; }
+
 int live_objects() { return g_live.load(std::memory_order_relaxed); }
 
 void publish_status() {  // the game thread, the end of each frame()
@@ -572,7 +577,7 @@ void publish_status() {  // the game thread, the end of each frame()
 }
 
 bool shown(int s) {
-    if (s < 0 || s >= kSlots || !g_any.load(std::memory_order_relaxed)) return false;
+    if (s < 0 || s >= kSlots || !g_any.load(std::memory_order_relaxed) || g_clear.load(std::memory_order_relaxed)) return false;
     std::lock_guard lock(g_mutex);
     return g_slot[s].want && log::now_ms() - g_slot[s].shown_ms < 100.0;
 }

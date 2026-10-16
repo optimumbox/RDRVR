@@ -1,5 +1,6 @@
 #include "core/test_channel.h"
 #include "core/hook_prof.h"
+#include "core/hogtie.h"
 
 #include <windows.h>
 
@@ -402,6 +403,14 @@ std::string execute(const std::vector<std::string>& t) {
         char st[1024];
         xr::submit_status(st, sizeof(st));
         return st;
+    }
+    if (c == "hogtie" && t.size() >= 3 && t[1] == "watch") {
+        hogtie::set_watch(t[2] == "on");
+        return "hogtie watch " + t[2];
+    }
+    if (c == "hogtie" && t.size() >= 3 && t[1] == "force") {
+        hogtie::set_force_session(t[2] == "on");
+        return "hogtie force " + t[2] + " (this session)";
     }
     if (c == "ui" && t.size() >= 3 && (t[1] == "redirect" || t[1] == "alphawrites" || t[1] == "dual")) {
         if (t[1] == "redirect") ui_layer::set_redirect(t[2] == "on");

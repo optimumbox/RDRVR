@@ -1729,7 +1729,7 @@ void page_gestures() {
     }
     sub_end();
     bool fh = hogtie::enabled();  // 2026-10-16: [Gestures] ForceHogtie
-    if (check("Hogtie with Y", &fh, "Y hogties the one on your lasso when you are on foot within 3 m of them, if the game does not."))
+    if (check("Hogtie with Y", &fh, "Y hogties the one on your lasso when you are on foot within 3 m of them, if the game does not. Such a hogtie does not count for missions."))
         hogtie::set_enabled(fh);
     sub_begin(me || la);
     if (nudge1("Swing speed", &sw, 0.25f, 1.0f, 8.0f, "%.2f m/s", "How fast a swing must be to punch or throw the lasso (a press 0.25 m/s)."))

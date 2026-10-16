@@ -58,6 +58,10 @@ bool diag_on();
 void diag_draw(uintptr_t drawable, const float* pos, uint64_t pass, const float* m = nullptr);  // m: the record's 4x4 (axes rows 0-2)
 std::string diag_command(const std::string& arg);
 int live_objects();  // made and not yet destroyed
+// Any thread: on, no slot's object is made or kept (but the census's) and none counts as shown, so the game's own
+// holstered gun shows; the wants are kept for when it is off. hogtie.cpp: while someone is on the player's lasso (the
+// game's hogtie check sweeps between the two, and these free objects are in its way).
+void set_clear(bool on);
 // Slot s's prop drawn (a draw of it moved) within the last 100 ms. Any thread.
 bool shown(int s);
 std::string status();
