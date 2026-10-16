@@ -561,7 +561,7 @@ Spawn_t o_spawn = nullptr;
 // sight line is taken parallel to the drawn barrel through the sighting eye (the eye nearer the bore line): "seen" is
 // where the bullet is at the target's distance (the probe's, else 25 m) from that line, as the eye sees it. "drawn" is
 // the bullet against the drawn barrel now (a stale aim ray); "eye" the sighting eye from the bore (cm: right, up, back)
-void log_sight(const float start[3], const float d[3]) {
+void log_sight(const float start[3], const float d[3], bool dead_eye, float game_deg) {
     if (!g_sight_log.load(std::memory_order_relaxed)) return;
     float m[3], g[3];
     body::BodyPoints bp;
@@ -580,22 +580,13 @@ void log_sight(const float start[3], const float d[3]) {
     const float deg = 57.29578f;
     const float dg = dot(d, g);
     const float drawn_r = std::atan2(dot(d, rt), dg) * deg, drawn_u = std::atan2(dot(d, up), dg) * deg;
-    // the eyes in the world: LOCAL to world by the inverse of world_to_local (the frame is rigid): three points' images
-    float o[3] = {0, 0, 0}, ex[3] = {1, 0, 0}, ey[3] = {0, 1, 0}, ez[3] = {0, 0, 1}, lo[3], lx[3], ly[3], lz[3];
-    if (!camera_lever::world_to_local(bp.cam, o, lo) || !camera_lever::world_to_local(bp.cam, ex, lx) ||
-        !camera_lever::world_to_local(bp.cam, ey, ly) || !camera_lever::world_to_local(bp.cam, ez, lz)) {
-        log::info("[aim] sight: no LOCAL frame");
-        return;
-    }
-    float M[9];  // columns: world x, y, z in LOCAL; the inverse is its transpose (scaled by the world scale's square)
-    for (int k = 0; k < 3; ++k) M[k * 3] = lx[k] - lo[k], M[k * 3 + 1] = ly[k] - lo[k], M[k * 3 + 2] = lz[k] - lo[k];
+    // the eyes in the world: camera_lever's own LOCAL to world (the rings' and the lens's mapping) with the frame's camera
     float eye[2][3], bore[2] = {};
     for (int e = 0; e < 2; ++e) {
-        float v[3];
-        for (int k = 0; k < 3; ++k) v[k] = ev[e].position[k] - lo[k];
-        float n2 = 0.0f;
-        for (int k = 0; k < 3; ++k) n2 += M[k * 3] * M[k * 3];
-        for (int c = 0; c < 3; ++c) eye[e][c] = (M[c] * v[0] + M[3 + c] * v[1] + M[6 + c] * v[2]) / n2;
+        if (!camera_lever::local_to_world(bp.cam, ev[e].position, nullptr, eye[e], nullptr)) {
+            log::info("[aim] sight: no LOCAL frame");
+            return;
+        }
         float w[3];
         for (int k = 0; k < 3; ++k) w[k] = eye[e][k] - m[k];
         const float t = dot(w, g);
@@ -616,6 +607,11 @@ void log_sight(const float start[3], const float d[3]) {
         if (log::now_ms() - g_rp.ms < 250.0 && g_rp.hit) dist = g_rp.dist, probe = true;
         if (g_rp.tgt != 0 && g_rp.tgt != -1 && log::now_ms() - g_rp.tgt_ms < 500.0) tgt = g_rp.tgt, std::memcpy(tp, g_rp.tgt_pos, sizeof(tp));
     }
+    int junk = 0;  // a handle whose position is not an actor's near here (seen: 65536, 393216 ... at 8-14 km)
+    if (tgt) {
+        const float dx = tp[0] - start[0], dy = tp[1] - start[1], dz = tp[2] - start[2];
+        if (!(dx * dx + dy * dy + dz * dz < 300.0f * 300.0f)) junk = tgt, tgt = 0;
+    }
     // the game's target actor (its handle while it aims, and its position: the feet): where a line passes it, across
     // (horizontal) and the height above its feet; on it: within 35 cm across, 0.2 m below to 2 m above (a body)
     const auto pass = [&](const float* o, const float* dir, float* across, float* above, float* range) {
@@ -634,7 +630,9 @@ void log_sight(const float start[3], const float d[3]) {
     // sighting: the eye behind the sights (within 5 cm across the bore, 0 to 10 cm above it: the sights' height)
     const float ex_cm = dot(w, rt) * 100.0f, ey_cm = dot(w, up) * 100.0f;
     const bool sighted = std::fabs(ex_cm) < 5.0f && ey_cm > -1.0f && ey_cm < 10.0f && -dot(w, g) > 0.0f;
-    char hit[256] = " | no target actor";
+    char hit[256];
+    if (junk) std::snprintf(hit, sizeof(hit), " | no target actor (handle %d not placed near)", junk);
+    else std::snprintf(hit, sizeof(hit), " | no target actor");
     float ba = 0, bu = 0, br = 0, sa = 0, su = 0, sr = 0;
     if (tgt && pass(start, d, &ba, &bu, &br) && pass(eye[se], g, &sa, &su, &sr)) {
         const bool b_on = on_body(ba, bu), s_on = on_body(sa, su);
@@ -654,9 +652,12 @@ void log_sight(const float start[3], const float d[3]) {
         const float off_cm = std::tan(std::hypot(seen_r, seen_u) / deg) * dist * 100.0f;
         if (off_cm > 20.0f) std::snprintf(hit, sizeof(hit), " | no target actor: OFF THE SIGHTS by %.0f cm at %.1f m", off_cm, dist);
     }
-    log::info("[aim] sight%s: seen %+.2f right %+.2f up deg (%+.0f %+.0f cm at %.1f m%s) | drawn %+.2f %+.2f deg | eye %d at %+.1f %+.1f %+.1f "
+    char de[64];
+    if (game_deg >= 0.0f) std::snprintf(de, sizeof(de), "%s, the game's aim %.2f deg off the barrel", dead_eye ? "DEAD EYE" : "normal", game_deg);
+    else std::snprintf(de, sizeof(de), "%s", dead_eye ? "DEAD EYE" : "normal");
+    log::info("[aim] sight%s (%s): seen %+.2f right %+.2f up deg (%+.0f %+.0f cm at %.1f m%s) | drawn %+.2f %+.2f deg | eye %d at %+.1f %+.1f %+.1f "
               "cm (the other %.1f cm off the bore) | two-hand %.2f%s, aim ray %.0f ms, points %.0f ms old%s",
-              sighted ? " (sighted)" : "", seen_r, seen_u, std::tan(seen_r / deg) * dist * 100.0f, std::tan(seen_u / deg) * dist * 100.0f, dist, probe ? ", the probe's" : "",
+              sighted ? " (sighted)" : "", de, seen_r, seen_u, std::tan(seen_r / deg) * dist * 100.0f, std::tan(seen_u / deg) * dist * 100.0f, dist, probe ? ", the probe's" : "",
               drawn_r, drawn_u, se, dot(w, rt) * 100.0f, dot(w, up) * 100.0f, -dot(w, g) * 100.0f, bore[1 - se] * 100.0f, holster::two_hand_blend(),
               bp.steady ? " steady" : "", log::now_ms() - g_last_override_ms.load(std::memory_order_relaxed), log::now_ms() - bp.ms, hit);
 }
@@ -800,7 +801,11 @@ void hk_spawn(uintptr_t W, uintptr_t proj, int32_t count, const float* pellets, 
                   t_first_start[0], t_first_start[1], t_first_start[2], t_first_dir[0], t_first_dir[1], t_first_dir[2], t_first_speed,
                   t_first_fresh ? "on" : "off", t_first_err, extra, wtype, sigma * 57.29578f, off[0], off[1], pa ? 1 : 0, block_fixed ? 1 : 0,
                   aligned_deg, vel_zeroed ? dropped : 0.0f, straight ? 0 : 1);
-        if (!second) log_sight(t_first_start, t_first_dir);
+        if (!second) {
+            RdrvrActorState ds{};
+            const bool de = dead_eye_firing_marks() || (api::actor_state(&ds) && (ds.weapon_flags & RDRVR_WEAPON_DEADEYE));
+            log_sight(t_first_start, t_first_dir, de, aligned_deg);
+        }
     }
 }
 
