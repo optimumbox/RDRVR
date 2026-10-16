@@ -26,6 +26,11 @@ bool last_jitter(float out[2]);
 void set_mv_scale(float k);
 // [XR] EyeShapeDlss: the eye shape applied or ended under DLSS (the render thread, the DRS controller): the options are
 // sent again (the eye's output size, or the game's) at the next post run, before its evaluate
+// [Render] DlssPreset (2026-10-15): the DLSS render preset for every quality mode, written into the game's
+// sl::DLSSOptions as it sends them (0: the game's own; else NGX's value: 6 F, 10 J, 11 K, 12 L, 13 M). A preset the
+// DLL does not have falls back to its default. Taken from the next start (the feature is made with it)
+int preset();
+void set_preset(int value);  // also written to the user ini
 void shape_changed();  // test aid ("dlss mvscale <k>"): both eyes' mvecScale times k (1 = as the game sets it)
 
 }  // namespace rdrvr::dlss

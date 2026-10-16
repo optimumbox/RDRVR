@@ -366,6 +366,12 @@ int hk_free(uint32_t feature, const void* vp) {
     return o_free(feature, vp);
 }
 
+// sl::DLSSOptions (SL 2.x): after the BaseStructure (0x20) mode, outputWidth/Height, sharpness, preExposure,
+// exposureScale, three one-byte Booleans (0x38-0x3a), then the presets (uint32): DLAA, Quality, Balanced, Performance,
+// UltraPerformance, UltraQuality
+constexpr size_t kOptsPresets = 0x3c;
+std::atomic<int> g_preset{0};  // [Render] DlssPreset (read at install: the next start's)
+
 // ---- slDLSSSetOptions (H4: the render thread, synchronous)
 int hk_set_options(const void* vp, const void* options) {
     // [XR] EyeShapeDlss: with the shape applied, the output size is the eye's for both viewports (the game's options
@@ -379,6 +385,25 @@ int hk_set_options(const void* vp, const void* options) {
         std::memcpy(o + kOptsOutW, &ew, 4);
         std::memcpy(o + kOptsOutH, &eh, 4);
         g_shape_opts.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (const int pv = g_preset.load(std::memory_order_relaxed); o && pv > 0) {
+        uint32_t was[6] = {};
+        if (raw_copy(o + kOptsPresets, was, sizeof(was))) {
+            bool sane = true;  // the game's own values: presets (small), else the layout is not what it should be
+            for (uint32_t v : was) sane = sane && v < 64;
+            static bool told = false;
+            if (sane) {
+                const uint32_t now[6] = {uint32_t(pv), uint32_t(pv), uint32_t(pv), uint32_t(pv), uint32_t(pv), uint32_t(pv)};
+                std::memcpy(o + kOptsPresets, now, sizeof(now));
+            }
+            if (!told) {
+                told = true;
+                log::info("[dlss] preset %c for every mode%s (the game's: DLAA %u, quality %u, balanced %u, performance %u, ultra "
+                          "performance %u, ultra quality %u)",
+                          'A' + pv - 1, sane ? "" : " NOT SET: the options' preset fields do not look like presets", was[0], was[1], was[2],
+                          was[3], was[4], was[5]);
+            }
+        }
     }
     const int r = o_set_options(vp, options);
     if (!g_killed.load(std::memory_order_relaxed) && reinterpret_cast<uintptr_t>(vp) != reinterpret_cast<uintptr_t>(g_vp1)) {
@@ -518,7 +543,14 @@ void hk_append(void* recorder, void* fn, const void* data, uint32_t size) {
 
 }  // namespace
 
+int preset() { return g_preset.load(std::memory_order_relaxed); }
+void set_preset(int value) {
+    config::set("Render", "DlssPreset", std::to_string(value));
+    log::info("[dlss] preset %s chosen (from the next start)", value > 0 ? std::string(1, static_cast<char>('A' + value - 1)).c_str() : "the game's");
+}
+
 bool install() {
+    g_preset = config::get_int("Render", "DlssPreset", 0);
     // on with DLSS by default (probe P2: both eyes within mono DLSS's flicker; the shared viewport fails); the hook is
     // installed only when the game's DLSS is forced at boot, so FXAA and TAA keep the render thread's path untouched
     g_cfg = config::get_int("Render", "ForceAntiAliasing", -1) == 3 && config::get_bool("Render", "DlssPerEye", true);

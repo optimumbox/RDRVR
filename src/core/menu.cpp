@@ -32,6 +32,7 @@
 #include "core/gun_melee.h"
 #include "core/camera_lever.h"
 #include "core/config.h"
+#include "core/dlss.h"
 #include "core/controllers.h"
 #include "core/dual.h"
 #include "core/controls.h"
@@ -622,6 +623,28 @@ void page_display() {
         track("DLSS quality");
         help("How much DLSS renders before it upscales. DLAA (native) is the sharpest and costs the most; the others are faster "
              "and softer.");
+        {  // [Render] DlssPreset: the DLSS 310 series' super-resolution presets (dlss.cpp writes it into every mode)
+            static const char* const kP[6] = {"The game's own", "F (CNN, the older model)", "J (transformer)", "K (transformer)",
+                                              "L (transformer 2, DLSS 4.5)", "M (transformer 2, DLSS 4.5)"};
+            static const int kV[6] = {0, 6, 10, 11, 12, 13};
+            static int chosen = -1;
+            if (chosen < 0) {
+                const int v = config::get_int("Render", "DlssPreset", 0);
+                chosen = 0;
+                for (int i = 0; i < 6; ++i)
+                    if (kV[i] == v) chosen = i;
+            }
+            int p = chosen;
+            ImGui::SetNextItemWidth(380);
+            if (ImGui::Combo("DLSS preset (restart)##DLSS preset", &p, kP, 6)) {
+                chosen = p;
+                dlss::set_preset(kV[p]);
+            }
+            track("DLSS preset");
+            help("The DLSS model. K is the transformer of DLSS 4; L and M are DLSS 4.5's (they need nvngx_dlss.dll 310.5 or newer); F is "
+                 "the older CNN. A preset the DLL lacks falls back to its default. Needs DLSS per eye, which is on by default.");
+            if (dlss::preset() != kV[p]) note("Restart the game to apply.");
+        }
         sub_end();
     }
     const int running = render_settings::forced_aa();
