@@ -11,8 +11,8 @@ Install
 - Install RedHook first (above).
 - Unzip this folder and run Install.cmd. It finds the game through Steam (or asks for the folder). To name it:
     Install.cmd -GameDir "D:\SteamLibrary\steamapps\common\Red Dead Redemption"
-- Quit the game first. Files it would replace are backed up to RDRVR_backup in the game folder. No game file is
-  changed.
+- Quit the game first. Files it would replace are backed up to RDRVR_backup in the game folder. Only the game's
+  nvngx_dlss.dll is replaced (below).
 - Its window stays open until you press a key. If it stops on an error, the text says why; everything it printed
   is also in %TEMP%\RDRVR_install.log (attach that file if you ask for help).
 
@@ -25,6 +25,8 @@ What is installed in the game folder
 - dinput8.dll, RDRVR.Gameplay.red, RDRVR.ini: the mod. RDRVR.ini holds the settings it starts with; what you change
   in the in-headset menu is saved in %LOCALAPPDATA%\RDRVR\RDRVR.user.ini and wins over it.
 - RDRVR_click_*.wav: the empty gun's clicks.
+- nvngx_dlss.dll: NVIDIA DLSS 310.9.1, in place of the older one the game ships (backed up; the uninstaller puts
+  it back). It has the presets the in-headset menu's "DLSS preset" offers (K by default).
 
 Note: the game sends its crash reports to Rockstar. RDRVR is not affiliated with Rockstar Games or Take-Two.
 Licence: MIT (LICENSE.txt); third-party notices in THIRD-PARTY-NOTICES.txt.

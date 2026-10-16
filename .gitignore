@@ -7,3 +7,5 @@ __pycache__/
 extern/
 # a maintainer's own copy of the game's executable, for tools/gen_anchors.py: never commit game files
 research/
+# NVIDIA's DLSS DLL for the release zip (tools/package.ps1): a 59 MB binary, never committed
+redist/

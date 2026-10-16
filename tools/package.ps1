@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     The zip holds the installer (Install.cmd, install.ps1, uninstall scripts, README.txt) and the payload: dinput8.dll,
-    RDRVR.Gameplay.red, config\RDRVR.ini, the click sounds (RDRVR_click_*.wav), LICENSE.txt and
+    RDRVR.Gameplay.red, config\RDRVR.ini, the click sounds (RDRVR_click_*.wav), nvngx_dlss.dll (redist\, DLSS 310.9.1), LICENSE.txt and
     THIRD-PARTY-NOTICES.txt. RedHook is not included: the player installs it (README).
 #>
 $ErrorActionPreference = 'Stop'
@@ -23,6 +23,8 @@ $map = [ordered]@{
     'RDRVR_click_revolver.wav' = Join-Path $root 'assets\sounds\revolver.wav'
     'RDRVR_click_rifle.wav'  = Join-Path $root 'assets\sounds\rifle.wav'
     'RDRVR_click_shotgun.wav' = Join-Path $root 'assets\sounds\shotgun.wav'
+    # NVIDIA's DLSS super-resolution DLL 310.9.1 (the game ships an older one; the installer backs it up), kept out of git
+    'nvngx_dlss.dll'         = Join-Path $root 'redist\nvngx_dlss.dll'
 }
 foreach ($k in $map.Keys) {
     if (-not (Test-Path $map[$k])) { throw "missing $($map[$k]) (build with the RedHook SDK first: README)" }

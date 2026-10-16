@@ -9,6 +9,9 @@ RDRVR's binaries are linked statically with these libraries (through vcpkg). The
 | Zydis / Zycore (SafetyHook's disassembler) | MIT | https://github.com/zyantific/zydis |
 | Dear ImGui | MIT | https://github.com/ocornut/imgui |
 
+This fork's release zip includes nvngx_dlss.dll (NVIDIA DLSS 310.9.1, unmodified and signed by NVIDIA), redistributed
+under the NVIDIA RTX SDKs licence (https://github.com/NVIDIA/DLSS). NVIDIA and DLSS are trademarks of NVIDIA Corporation.
+
 RDRVR.Gameplay.red links against RedHook's import library (RedHook SDK by K3rhos, MIT,
 https://github.com/K3rhos/RedHookSDK). RedHook itself is not part of RDRVR and is not distributed with it.
 
