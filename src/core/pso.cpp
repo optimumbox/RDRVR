@@ -20,6 +20,7 @@
 #include "core/replay_ops.h"
 #include "core/ring_probe.h"
 #include "core/stereo_vi.h"
+#include "core/ui_layer.h"
 
 namespace rdrvr::pso {
 namespace {
@@ -39,6 +40,21 @@ int g_cap_draws = 0;
 CreateGraphics_t o_CreateGraphics = nullptr;
 CreateStream_t o_CreateStream = nullptr;
 SetPipelineState_t o_SetPipelineState = nullptr;
+using SetStencilRef_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT);
+SetStencilRef_t o_SetStencilRef = nullptr;
+using SetBlendFactor_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, const FLOAT[4]);
+SetBlendFactor_t o_SetBlendFactor = nullptr;
+
+// "pso uidraws [n]" (HUD work, 2026-10-16): the next UI pass's draws into the UI target logged in order, each with its
+// pipeline's blend, write mask, depth and stencil state, the stencil reference and blend factor set, and its vertex count
+std::unordered_map<void*, std::string> g_ui_desc;  // under g_mutex: pipelines with one RGBA16F target and a depth view
+std::unordered_set<void*> g_dest_alpha;  // under g_mutex: those of them blending colour by the target's alpha (DA/IDA)
+std::atomic<int> g_uidraw_pending{0}, g_uidraw_left{0}, g_uidraw_n{0};
+thread_local ID3D12GraphicsCommandList* t_last_cl = nullptr;
+thread_local void* t_last_pso = nullptr;
+thread_local bool t_last_swapped = false;
+thread_local UINT t_stencil_ref = 0;
+thread_local float t_blend_factor[4] = {};
 
 std::mutex g_mutex;
 std::unordered_map<void*, uint64_t> g_vs_of;                 // pipeline -> vertex shader hash
@@ -212,6 +228,61 @@ void record_info(void* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d) {
     g_info[pso] = in;
 }
 
+// The UI target's copies of the game's alpha-only overwrites (ui_layer.h): the same pipeline, its alpha kept at the
+// larger of the two (blend MAX), so it can raise the UI's coverage but never take it away
+std::unordered_map<void*, ID3D12PipelineState*> g_no_alpha;  // under g_mutex
+void make_no_alpha(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, void* game) {
+    const auto& rt = d->BlendState.RenderTarget[0];
+    if (d->NumRenderTargets != 1 || d->RTVFormats[0] != DXGI_FORMAT_R16G16B16A16_FLOAT || d->DSVFormat == DXGI_FORMAT_UNKNOWN ||
+        rt.RenderTargetWriteMask != D3D12_COLOR_WRITE_ENABLE_ALPHA)
+        return;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d2 = *d;
+    auto& r2 = d2.BlendState.RenderTarget[0];
+    r2.BlendEnable = TRUE;
+    r2.LogicOpEnable = FALSE;
+    r2.SrcBlend = D3D12_BLEND_ONE;
+    r2.DestBlend = D3D12_BLEND_ZERO;
+    r2.BlendOp = D3D12_BLEND_OP_ADD;
+    r2.SrcBlendAlpha = D3D12_BLEND_ONE;
+    r2.DestBlendAlpha = D3D12_BLEND_ONE;
+    r2.BlendOpAlpha = D3D12_BLEND_OP_MAX;
+    ID3D12PipelineState* p = nullptr;
+    if (FAILED(o_CreateGraphics(dev, &d2, IID_PPV_ARGS(&p))) || !p) {
+        log::warn("[pso] the UI target's copy of an alpha-only pipeline refused: the game's used there");
+        return;
+    }
+    std::lock_guard lock(g_mutex);
+    g_no_alpha[game] = p;
+}
+
+void note_ui_pipeline(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, void* game) {
+    if (d->NumRenderTargets != 1 || d->RTVFormats[0] != DXGI_FORMAT_R16G16B16A16_FLOAT || d->DSVFormat == DXGI_FORMAT_UNKNOWN) return;
+    const auto& rt = d->BlendState.RenderTarget[0];
+    const auto& ds = d->DepthStencilState;
+    char buf[320];
+    std::snprintf(buf, sizeof(buf),
+                  "ps %016llx %s c %d/%d op%d a %d/%d op%d wm%x | depth %d func %d write %d | stencil %d r%02x w%02x "
+                  "front func %d pass %d fail %d dfail %d back func %d pass %d",
+                  static_cast<unsigned long long>(d->PS.pShaderBytecode && d->PS.BytecodeLength ? fnv(d->PS.pShaderBytecode, d->PS.BytecodeLength) : 0),
+                  rt.BlendEnable ? "blend" : "noblend", rt.SrcBlend, rt.DestBlend, rt.BlendOp, rt.SrcBlendAlpha, rt.DestBlendAlpha,
+                  rt.BlendOpAlpha, rt.RenderTargetWriteMask, ds.DepthEnable, ds.DepthFunc, ds.DepthWriteMask, ds.StencilEnable,
+                  ds.StencilReadMask, ds.StencilWriteMask, ds.FrontFace.StencilFunc, ds.FrontFace.StencilPassOp,
+                  ds.FrontFace.StencilFailOp, ds.FrontFace.StencilDepthFailOp, ds.BackFace.StencilFunc, ds.BackFace.StencilPassOp);
+    std::lock_guard lock(g_mutex);
+    g_ui_desc[game] = buf;
+    if (rt.BlendEnable && rt.SrcBlend == D3D12_BLEND_DEST_ALPHA) g_dest_alpha.insert(game);
+}
+
+void STDMETHODCALLTYPE hk_SetStencilRef(ID3D12GraphicsCommandList* cl, UINT r) {
+    t_stencil_ref = r;
+    o_SetStencilRef(cl, r);
+}
+
+void STDMETHODCALLTYPE hk_SetBlendFactor(ID3D12GraphicsCommandList* cl, const FLOAT f[4]) {
+    if (f) std::memcpy(t_blend_factor, f, sizeof(t_blend_factor));
+    o_SetBlendFactor(cl, f);
+}
+
 HRESULT STDMETHODCALLTYPE hk_CreateGraphics(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** out) {
     if (d && !g_dump_dir.empty()) dump_pso(d);
     if (d && out) {
@@ -224,6 +295,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateGraphics(ID3D12Device* dev, const D3D12_GRAPH
                 g_graphics.fetch_add(1, std::memory_order_relaxed);
                 record(*out, d->VS);  // counted under the game's own hash
                 record_info(*out, d);
+                note_ui_pipeline(d, *out);
                 vi::on_pipeline(dev, d, static_cast<ID3D12PipelineState*>(*out));
                 return hs;
             }
@@ -238,6 +310,8 @@ HRESULT STDMETHODCALLTYPE hk_CreateGraphics(ID3D12Device* dev, const D3D12_GRAPH
         record(*out, d->VS);
         record_info(*out, d);
         if (riid == __uuidof(ID3D12PipelineState)) vi::on_pipeline(dev, d, static_cast<ID3D12PipelineState*>(*out));
+        make_no_alpha(dev, d, *out);
+        note_ui_pipeline(d, *out);
     }
     return hr;
 }
@@ -325,6 +399,21 @@ void STDMETHODCALLTYPE hk_SetPipelineState(ID3D12GraphicsCommandList* cl, ID3D12
     hookprof::Scope hp_(hookprof::kPso);
     replay_ops::note(replay_ops::kPso);
     ID3D12PipelineState* ps = vi::on_set_pso(cl, game);  // the game's, or its view-instanced twin (stereo_vi.h)
+    if (ps == game && ui_layer::on_ui_target(cl) && ui_layer::drop_alpha_writes() && !ui_layer::dual_active()) {
+        std::lock_guard lock(g_mutex);
+        if (g_dest_alpha.count(game)) {
+            ui_layer::note_mask_read();
+        } else if (ui_layer::mask_read()) {
+            auto it = g_no_alpha.find(game);
+            if (it != g_no_alpha.end()) {
+                ps = it->second;
+                ui_layer::count_alpha_write_dropped();
+            }
+        }
+    }
+    t_last_cl = cl;
+    t_last_pso = game;
+    t_last_swapped = ps != game;
     if (!g_census.load(std::memory_order_relaxed)) {
         HP_ORIG(hp_, o_SetPipelineState(cl, ps));
         return;
@@ -353,6 +442,11 @@ void STDMETHODCALLTYPE hk_SetVB(ID3D12GraphicsCommandList* cl, UINT start, UINT 
 }
 
 void on_frame_end(uint64_t) {
+    if (g_uidraw_n.load() > 0) g_uidraw_left = 0;  // one UI pass
+    if (int n = g_uidraw_pending.exchange(0)) {
+        g_uidraw_n = 0;
+        g_uidraw_left = n;
+    }
     int st = g_cap_state.load();
     if (st == 1) g_cap_state = 2;
     else if (st == 2) {
@@ -414,6 +508,17 @@ void install_device_hooks(ID3D12Device* dev) {
 }
 
 void on_draw_args(ID3D12GraphicsCommandList* cl, int64_t first_vertex, uint32_t count) {
+    if (g_uidraw_left.load(std::memory_order_relaxed) > 0 && ui_layer::on_ui_target(cl) && g_uidraw_left.fetch_sub(1) > 0) {
+        std::string desc = "pipeline not seen";
+        if (cl == t_last_cl) {
+            std::lock_guard lock(g_mutex);
+            auto it = g_ui_desc.find(t_last_pso);
+            desc = it != g_ui_desc.end() ? it->second : "pipeline not a UI-target one";
+        }
+        log::info("[uidraw] %d: %s%s | ref %02x bf %.2f %.2f %.2f %.2f | first %lld count %u", ++g_uidraw_n, desc.c_str(),
+                  cl == t_last_cl && t_last_swapped ? " [MAX copy]" : "", t_stencil_ref, t_blend_factor[0], t_blend_factor[1],
+                  t_blend_factor[2], t_blend_factor[3], static_cast<long long>(first_vertex), count);
+    }
     if (g_cap_state.load(std::memory_order_relaxed) != 2 || cl != t_cl || t_vs != g_cap_vs.load(std::memory_order_relaxed)) return;
     std::lock_guard lock(g_mutex);
     if (g_cap_draws >= 16) return;
@@ -447,6 +552,8 @@ void on_draw_args(ID3D12GraphicsCommandList* cl, int64_t first_vertex, uint32_t 
 void install_list_hooks(ID3D12GraphicsCommandList* cl) {
     hooks::install("CL::IASetVertexBuffers", hooks::vtable_entry(cl, 44), hk_SetVB, &o_SetVB);
     hooks::install("CL::SetPipelineState", hooks::vtable_entry(cl, 25), hk_SetPipelineState, &o_SetPipelineState);
+    hooks::install("CL::OMSetStencilRef", hooks::vtable_entry(cl, 24), hk_SetStencilRef, &o_SetStencilRef);
+    hooks::install("CL::OMSetBlendFactor", hooks::vtable_entry(cl, 23), hk_SetBlendFactor, &o_SetBlendFactor);
     vi::install_list_hooks(cl);
 }
 
@@ -484,6 +591,11 @@ std::string command(const std::string& line) {
     if (!g_census.exchange(true)) {
         Sleep(250);  // a few frames counted (a pipeline set before now counts from its next set)
         log::info("[pso] the draw census started");
+    }
+    if (sub == "uidraws") {
+        const int n = arg.empty() ? 80 : std::atoi(arg.c_str());
+        g_uidraw_pending = n > 0 ? n : 80;
+        return "armed: the next UI pass's draws into the UI target go to the log as [uidraw]";
     }
     if (sub == "vbcap") {
         // pso vbcap <vs hash> <file>: capture the next frame's draws of that vertex shader

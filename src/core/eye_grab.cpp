@@ -38,7 +38,7 @@ struct Slot {
     std::string note;              // recording thread writes it before `recorded` is stored
     std::vector<uint8_t> pixels;   // copied out at finish
 };
-Slot g_slot[6];                    // 0 mono, 1 left, 2 right, 3..5 the content before the 2nd..4th bind
+Slot g_slot[7];                    // 0 mono, 1 left, 2 right, 3..5 the content before the 2nd..4th bind, 6 after the UI
 int g_first = 0, g_pick = 0;       // the first eye's slot (1 or 2) is written from slot g_pick (0: none)
 const char* const kEyeTag[3] = {"M", "L", "R"};
 
@@ -46,8 +46,11 @@ std::mutex g_mutex;                // one grab at a time
 std::string g_prefix, g_result;
 HANDLE g_done = nullptr;
 // 0 idle, 1 armed (set up at the next frame end), 2 waiting for a UI bind to start a sequence, 3 recording a sequence,
-// 4 sequence recorded (one more frame end, then finish)
+// 4 sequence recorded (one more frame end, then finish), 6 waiting for the next frame's first bind (after_ui)
 std::atomic<int> g_phase{0};
+// HUD work (2026-10-16): also the target's content before the next frame's first bind after the UI bind, the frame's
+// final image with the UI the game drew into it (with "ui redirect off"), as <prefix>-UI.rde
+std::atomic<bool> g_after_ui{false};
 int g_frames_waited = 0;           // presenting thread
 int g_fxaa_binds = 0;              // recording thread
 bool g_swap = false;               // the first pass is the right eye
@@ -126,11 +129,18 @@ void record(ID3D12GraphicsCommandList* cl, int i) {
 void bind_tap(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, BOOL,
               const D3D12_CPU_DESCRIPTOR_HANDLE* ds) {
     int ph = g_phase.load(std::memory_order_acquire);
-    if ((ph != 2 && ph != 3) || n == 0 || !rts) return;
+    if ((ph != 2 && ph != 3 && ph != 6) || n == 0 || !rts) return;
     bool target = false;
     for (int i = 0; i < g_nrtv; ++i) target = target || rts[0].ptr == g_rtv[i];
     if (!target) return;
     bool ui = ds != nullptr;
+    if (ph == 6) {
+        if (!ui) {
+            record(cl, 6);
+            g_phase.store(4, std::memory_order_release);
+        }
+        return;
+    }
     if (ph == 2) {  // start at a sequence boundary
         if (ui) {
             g_fxaa_binds = 0;
@@ -157,7 +167,7 @@ void bind_tap(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_CPU_DESCRIPTOR_
     std::snprintf(g_sequence, sizeof(g_sequence), "%d FXAA bind(s) then the UI bind%s", g_fxaa_binds,
                   g_fxaa_binds >= 2 ? (k == 1 ? ", first eye before bind 2" : k == 2 ? ", first eye before bind 3" : ", first eye before bind 4") : "");
     g_fxaa_binds = 0;
-    g_phase.store(4, std::memory_order_release);
+    g_phase.store(g_after_ui.load() ? 6 : 4, std::memory_order_release);
 }
 
 // Presenting thread: find the live target and its RTVs, watch its barriers, and make sure each slot has a readback
@@ -263,7 +273,7 @@ void on_frame_end(uint64_t frame) {
         g_frames_waited = 0;
         d3d::set_bind_tap(d3d::kBindTapGrab, bind_tap);
         g_phase.store(2, std::memory_order_release);
-    } else if (ph == 2 || ph == 3) {
+    } else if (ph == 2 || ph == 3 || ph == 6) {
         if (++g_frames_waited > 12) stop("ERROR the bind sequence of the post output target was not seen in 12 frames (NOT MEASURED)");
     } else if (ph == 4) {
         g_phase = 5;  // the sequence's list is submitted before the next Present
@@ -293,9 +303,10 @@ void init() {
     d3d::add_frame_end_listener(on_frame_end);
 }
 
-std::string grab(const std::string& prefix, unsigned timeout_ms) {
+std::string grab(const std::string& prefix, unsigned timeout_ms, bool after_ui) {
     std::lock_guard lock(g_mutex);
     g_prefix = prefix;
+    g_after_ui = after_ui;
     ResetEvent(g_done);
     g_phase.store(1, std::memory_order_release);
     if (WaitForSingleObject(g_done, timeout_ms) != WAIT_OBJECT_0) {
@@ -315,6 +326,11 @@ std::string grab(const std::string& prefix, unsigned timeout_ms) {
             continue;
         }
         out += " | " + write_rde(g_prefix + "-" + kEyeTag[i] + ".rde", s, i - 1) + " (" + s.note + ")";
+    }
+    if (g_after_ui.load()) {
+        const Slot& s = g_slot[6];
+        out += s.recorded.load(std::memory_order_acquire) ? " | " + write_rde(g_prefix + "-UI.rde", s, -1) + " (" + s.note + ")"
+                                                          : " | UI NOT MEASURED: " + (s.note.empty() ? std::string("not reached") : s.note);
     }
     for (Slot& s : g_slot) {
         s.pixels.clear();

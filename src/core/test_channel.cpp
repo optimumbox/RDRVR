@@ -282,7 +282,7 @@ std::string execute(const std::vector<std::string>& t) {
         dual_pass::status_text(st, sizeof(st));
         return st;
     }
-    if (c == "grabeyes" && t.size() >= 2) return eye_grab::grab(t[1]);
+    if (c == "grabeyes" && t.size() >= 2) return eye_grab::grab(t[1], 4000, t.size() >= 3 && t[2] == "ui");
     if (c == "eyecap") return eye_capture::command(t);  // both eyes every N s or now (eye_capture.h)
     if (c == "renderres") return render_res::command(c);  // renderres: [Render] RenderResolution's state this start
     if (c == "eyeshape") {  // eyeshape [on|off|scale <x>|status|rts]: the eyes in the headset's own shape (EyeShape; the session)
@@ -403,8 +403,10 @@ std::string execute(const std::vector<std::string>& t) {
         xr::submit_status(st, sizeof(st));
         return st;
     }
-    if (c == "ui" && t.size() >= 3 && t[1] == "redirect") {
-        ui_layer::set_redirect(t[2] == "on");
+    if (c == "ui" && t.size() >= 3 && (t[1] == "redirect" || t[1] == "alphawrites" || t[1] == "dual")) {
+        if (t[1] == "redirect") ui_layer::set_redirect(t[2] == "on");
+        else if (t[1] == "dual") ui_layer::set_dual(t[2] == "on");
+        else ui_layer::set_drop_alpha_writes(t[2] == "max");
         char st[256];
         ui_layer::status_text(st, sizeof(st));
         return st;

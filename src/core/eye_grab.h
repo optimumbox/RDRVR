@@ -15,6 +15,8 @@ void init();  // frame-end listener
 // "<prefix>-L.rde" and "<prefix>-R.rde", a single post run "<prefix>-M.rde". File: uint32 "RDE1", width, height, DXGI
 // format, eye (-1 mono, 0 left, 1 right), frame (low 32 bits), bytes per row, 0; then the rows, top first. Absolute
 // prefix. Blocks up to timeout_ms; an eye that could not be captured is reported as NOT MEASURED with the reason.
-std::string grab(const std::string& prefix, unsigned timeout_ms = 4000);
+// after_ui: also "<prefix>-UI.rde", the target before the next frame's first bind: the frame's final image with the UI
+// the game drew into it (test channel "grabeyes <prefix> ui", with "ui redirect off").
+std::string grab(const std::string& prefix, unsigned timeout_ms = 4000, bool after_ui = false);
 
 }  // namespace rdrvr::eye_grab

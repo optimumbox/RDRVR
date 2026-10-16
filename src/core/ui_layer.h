@@ -22,6 +22,26 @@ void set_redirect(bool on);
 void stop(const char* why);
 bool stopped();
 std::string grab(const std::string& path, unsigned timeout_ms = 3000);
+// The game's alpha-only overwrites (write mask alpha, ONE/ZERO: unseen on the game's own image, whose alpha nothing
+// reads) set the UI target's coverage: they give the radar ring's lines theirs, but also zero it over what the UI drew
+// before (2026-10-16 capture of the game's own HUD: the health meter's red fill is in the UI target's colour, alpha 0,
+// so it showed as thin outlines). The pass's draw log ("pso uidraws"): alpha-only draws write a mask (the meters' arcs),
+// then the meters' wedges are drawn through it (colour DestAlpha/InvDestAlpha), then more alpha-only draws. So the
+// alpha-only draws before the pass's first DestAlpha draw run as the game's (the mask cut exactly; with MAX the whole
+// wedges showed in the radar), those after it are swapped for a copy that keeps the larger alpha (blend MAX; pso.cpp),
+// so they no longer erase the fill. "ui alphawrites max|keep" (test; max by default).
+bool on_ui_target(ID3D12GraphicsCommandList* cl);  // recording thread: this list's render target is the UI target now
+bool drop_alpha_writes();
+void set_drop_alpha_writes(bool on);
+void count_alpha_write_dropped();
+// "ui dual on|off" (on by default since 2026-10-16: the user judged it right in the headset): the UI also drawn onto a white target (~100 MB at 4778x2688), each draw
+// twice with the game's own pipelines, the composite from both (ui_layer.cpp); the MAX copies are not used then.
+void set_dual(bool on);
+bool dual_active();
+bool dual_draw_begin(ID3D12GraphicsCommandList* cl);  // recording thread, before a draw: the white target bound, draw now
+void dual_draw_end(ID3D12GraphicsCommandList* cl);    // then the UI target bound again for the game's own draw
+void note_mask_read();  // recording thread: this UI pass drew through the target's alpha (DestAlpha blend)
+bool mask_read();
 void status_text(char* out, size_t len);
 // Step 2. While the redirect is on, each frame's UI is also drawn back onto the monitor's back buffer (blended in
 // display space, the game's Gamma applied), so the desktop keeps its HUD. For the XR quad layer (presenting thread,

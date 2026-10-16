@@ -1,3 +1,4 @@
+#include "core/ui_layer.h"
 #include "core/d3d_hooks.h"
 #include "core/hook_prof.h"
 
@@ -419,6 +420,10 @@ void STDMETHODCALLTYPE hk_DrawInstanced(ID3D12GraphicsCommandList* cl, UINT a, U
     ++t_draws;
     fg_draw(cl);
     pso::on_draw_args(cl, c, a);
+    if (ui_layer::dual_draw_begin(cl)) {
+        o_DrawInstanced(cl, a, b, c, d);
+        ui_layer::dual_draw_end(cl);
+    }
     HP_ORIG(hp_, o_DrawInstanced(cl, a, b, c, d));
 }
 void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, INT d, UINT e) {
@@ -431,6 +436,10 @@ void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D12GraphicsCommandList* cl, UI
     ++t_draws;
     fg_draw(cl);
     pso::on_draw_args(cl, d, a);
+    if (ui_layer::dual_draw_begin(cl)) {
+        o_DrawIndexedInstanced(cl, a, b, c, d, e);
+        ui_layer::dual_draw_end(cl);
+    }
     HP_ORIG(hp_, o_DrawIndexedInstanced(cl, a, b, c, d, e));
 }
 void STDMETHODCALLTYPE hk_Dispatch(ID3D12GraphicsCommandList* cl, UINT x, UINT y, UINT z) {

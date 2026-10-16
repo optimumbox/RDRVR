@@ -38,6 +38,22 @@ uint64_t g_target_rtv[2][8];
 int g_target_nrtv[2] = {};
 std::atomic<bool> g_targets_found{false};
 bool g_cleared = false;  // recording thread: the UI target was cleared since the target's last bind without depth
+thread_local ID3D12GraphicsCommandList* t_ui_cl = nullptr;  // the list whose last bind was the UI target (this thread)
+std::atomic<bool> g_drop_alpha{true};
+std::atomic<uint64_t> g_alpha_dropped{0};
+std::atomic<bool> g_mask_read{false};  // this frame's UI pass drew through the target's alpha
+// Dual (2026-10-16, "ui dual on|off"): every UI draw also drawn into a second target, cleared to white where the first
+// is cleared to black (both alpha 1, as the game's image), each with the game's own pipelines (its alpha masks as the
+// game's). Black gives the UI's premultiplied colour, white minus black its transmittance, so the composite is the
+// game's own for any blend that is linear in what is under it.
+std::atomic<bool> g_dual{true};
+std::atomic<bool> g_dual_frame{false};  // the pass being drawn (and the last one drawn) is dual
+ID3D12Resource* g_ui_b = nullptr;
+ID3D12DescriptorHeap* g_rtv_heap_b = nullptr;
+D3D12_CPU_DESCRIPTOR_HANDLE g_rtv_b{};
+std::atomic<bool> g_b_ready{false};
+std::atomic<bool> g_b_srv_written{false};
+thread_local D3D12_CPU_DESCRIPTOR_HANDLE t_ds{};
 std::atomic<uint64_t> g_subst{0}, g_frames_drawn{0}, g_subst_at_frame_end{0};
 
 // grab
@@ -127,18 +143,28 @@ void ensure() {
 // of the menu's UI pixels exactly, mean error 1.0/255; overlapping translucent layers make the rest).
 const char kShader[] = R"(
 Texture2D<float4> ui : register(t0);
+Texture2D<float4> uiw : register(t1);  // dual: the UI drawn onto white
 // src: the UI pixel drawn at the destination's origin (the wrist HUD's crop); hole, hole2: UI pixels left out (x0 y0
 // x1 y1; the wrist HUD's corner, the hand-placed wheel's rect); scale: UI pixels a destination pixel, size: the UI
 // target's (ps_quad_box only)
-cbuffer K : register(b0) { float gamma; float2 src; float pad; float4 hole; float2 scale; float2 size; float4 hole2; };
+cbuffer K : register(b0) { float gamma; float2 src; float dual; float4 hole; float2 scale; float2 size; float4 hole2; };
+// premultiplied colour and coverage: dual, black's colour and 1 - (white - black); else colour and sqrt(stored alpha)
+float4 layer(int2 p) {
+    float4 u = ui.Load(int3(p, 0));
+    if (dual > 0.5) {
+        float4 w = uiw.Load(int3(p, 0));
+        return float4(max(u.rgb, 0), saturate(1 - dot(w.rgb - u.rgb, 1.0 / 3)));
+    }
+    return float4(u.rgb, sqrt(saturate(u.a)));
+}
 bool cut(int2 p) { return (p.x >= hole.x && p.x < hole.z && p.y >= hole.y && p.y < hole.w) || (p.x >= hole2.x && p.x < hole2.z && p.y >= hole2.y && p.y < hole2.w); }
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 t = float2((id << 1) & 2, id & 2);
     return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
 }
 float3 display(int2 p, out float a) {
-    float4 u = ui.Load(int3(p, 0));
-    a = sqrt(saturate(u.a));
+    float4 u = layer(p);
+    a = u.a;
     float3 s = a > 1e-4 ? saturate(u.rgb / a) : float3(0, 0, 0);
     return pow(s, gamma);
 }
@@ -169,8 +195,8 @@ float4 ps_quad_box(float4 pos : SV_Position) : SV_Target {
             float w = wy * (min(hi.x, x + 1.0) - max(lo.x, (float)x));
             float4 t = 0;
             if (!cut(int2(x, y))) {  // display(), then ps_quad's
-                float4 u = ui.Load(int3(x, y, 0));
-                float al = sqrt(saturate(u.a));
+                float4 u = layer(int2(x, y));
+                float al = u.a;
                 float3 d = al > 1e-4 ? pow(saturate(u.rgb / al), gamma) : float3(0, 0, 0);
                 float3 lin = d <= 0.04045 ? d / 12.92 : pow(saturate((d + 0.055) / 1.055), 2.4);
                 t = float4(lin * al, al);
@@ -273,7 +299,7 @@ bool ensure_draw(ID3D12Device* dev) {
     g_ps_quad_box = compile(fn, "ps_quad_box", "ps_5_0");
     g_ps_mirror = compile(fn, "ps_mirror", "ps_5_0");
     if (!g_vs || !g_ps_quad || !g_ps_quad_box || !g_ps_mirror) return false;
-    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0};
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants = {0, 0, 16};  // gamma, src x y, pad, hole x0 y0 x1 y1, scale x y, size x y, hole2 x0 y0 x1 y1
@@ -288,7 +314,7 @@ bool ensure_draw(ID3D12Device* dev) {
     ok = ok && SUCCEEDED(dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&root)));
     if (sig) sig->Release();
     if (err) err->Release();
-    D3D12_DESCRIPTOR_HEAP_DESC hs{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC hs{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     D3D12_DESCRIPTOR_HEAP_DESC hr{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     ok = ok && SUCCEEDED(dev->CreateDescriptorHeap(&hs, IID_PPV_ARGS(&g_srv_heap))) &&
          SUCCEEDED(dev->CreateDescriptorHeap(&hr, IID_PPV_ARGS(&g_draw_rtv_heap))) && make_draw(dev, g_draw_mirror) &&
@@ -301,6 +327,15 @@ bool ensure_draw(ID3D12Device* dev) {
     g_draw_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_rtv_step = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     dev->CreateShaderResourceView(g_ui, nullptr, g_srv_heap->GetCPUDescriptorHandleForHeapStart());
+    D3D12_CPU_DESCRIPTOR_HANDLE s1 = g_srv_heap->GetCPUDescriptorHandleForHeapStart();
+    s1.ptr += dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_SHADER_RESOURCE_VIEW_DESC nd{};
+    nd.Format = g_fmt;
+    nd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    nd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    nd.Texture2D.MipLevels = 1;
+    dev->CreateShaderResourceView(g_b_ready.load() ? g_ui_b : nullptr, &nd, s1);  // null until the white target exists
+    g_b_srv_written = g_b_ready.load();
     g_root = root;
     g_draw_failed = false;
     return true;
@@ -312,7 +347,8 @@ bool ensure_draw(ID3D12Device* dev) {
 bool draw_ui(ID3D12CommandQueue* q, Draw& d, ID3D12PipelineState* pso, ID3D12Resource* dst, DXGI_FORMAT view_fmt, D3D12_RESOURCE_STATES dst_state,
              int rtv_slot, float gamma, const float src[2] = nullptr, const int hole[4] = nullptr, const float scale[2] = nullptr,
              const int hole2[4] = nullptr) {
-    const float k[16] = {gamma, src ? src[0] : 0.0f, src ? src[1] : 0.0f, 0.0f, hole ? static_cast<float>(hole[0]) : 0.0f,
+    const bool dual = g_dual_frame.load() && g_b_srv_written.load();
+    const float k[16] = {gamma, src ? src[0] : 0.0f, src ? src[1] : 0.0f, dual ? 1.0f : 0.0f, hole ? static_cast<float>(hole[0]) : 0.0f,
                          hole ? static_cast<float>(hole[1]) : 0.0f, hole ? static_cast<float>(hole[2]) : 0.0f,
                          hole ? static_cast<float>(hole[3]) : 0.0f, scale ? scale[0] : 1.0f, scale ? scale[1] : 1.0f,
                          static_cast<float>(g_w), static_cast<float>(g_h), hole2 ? static_cast<float>(hole2[0]) : 0.0f,
@@ -335,7 +371,7 @@ bool draw_ui(ID3D12CommandQueue* q, Draw& d, ID3D12PipelineState* pso, ID3D12Res
     rv.Format = view_fmt;
     rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
     dev->CreateRenderTargetView(dst, &rv, rtv);
-    D3D12_RESOURCE_BARRIER b[2]{};
+    D3D12_RESOURCE_BARRIER b[3]{};
     for (auto& x : b) {
         x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         x.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -347,7 +383,13 @@ bool draw_ui(ID3D12CommandQueue* q, Draw& d, ID3D12PipelineState* pso, ID3D12Res
     b[1].Transition.StateBefore = dst_state;
     b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     bool dst_transition = dst_state != D3D12_RESOURCE_STATE_RENDER_TARGET;
-    d.list->ResourceBarrier(dst_transition ? 2 : 1, b);
+    UINT nb = dst_transition ? 2 : 1;
+    if (g_b_ready.load()) {  // the white target with the black one
+        b[nb] = b[0];
+        b[nb].Transition.pResource = g_ui_b;
+        ++nb;
+    }
+    d.list->ResourceBarrier(nb, b);
     d.list->SetGraphicsRootSignature(g_root);
     d.list->SetDescriptorHeaps(1, &g_srv_heap);
     d.list->SetGraphicsRoot32BitConstants(0, static_cast<UINT>(sizeof(k) / sizeof(k[0])), k, 0);  // all 16 (hole2 too)
@@ -361,7 +403,7 @@ bool draw_ui(ID3D12CommandQueue* q, Draw& d, ID3D12PipelineState* pso, ID3D12Res
     d.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     d.list->DrawInstanced(3, 1, 0, 0);
     for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
-    d.list->ResourceBarrier(dst_transition ? 2 : 1, b);
+    d.list->ResourceBarrier(nb, b);
     if (FAILED(d.list->Close())) return false;
     d3d::submit_internal(q, d.list);
     d.slot_value[s] = ++g_draw_value;
@@ -403,6 +445,7 @@ void mirror() {
 // Recording thread, inside the game's OMSetRenderTargets: the UI pass binds the post output with its depth view.
 bool subst(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, const D3D12_CPU_DESCRIPTOR_HANDLE* ds,
            D3D12_CPU_DESCRIPTOR_HANDLE* out) {
+    if (t_ui_cl == cl) t_ui_cl = nullptr;
     if (!g_redirect.load(std::memory_order_relaxed) || !g_ready.load(std::memory_order_acquire) || n != 1 || !rts) return false;
     int t = active_target();
     bool target = false;
@@ -413,17 +456,54 @@ bool subst(ID3D12GraphicsCommandList* cl, unsigned n, const D3D12_CPU_DESCRIPTOR
         return false;
     }
     if (!g_cleared) {
-        const float clear[4] = {0, 0, 0, 0};
+        const bool dual = g_dual.load() && g_b_ready.load();
+        const float clear[4] = {0, 0, 0, dual ? 1.0f : 0.0f}, white[4] = {1, 1, 1, 1};
         cl->ClearRenderTargetView(g_rtv, clear, 0, nullptr);
+        if (dual) cl->ClearRenderTargetView(g_rtv_b, white, 0, nullptr);
+        g_dual_frame = dual;
         g_cleared = true;
+        g_mask_read = false;
     }
+    t_ds = *ds;
     *out = g_rtv;
+    t_ui_cl = cl;
     g_subst.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
+// Presenting thread: the white target, the first time dual is on (the UI target's size and format), and its view.
+void ensure_b() {
+    if (g_b_ready.load() || !g_ready.load()) return;
+    ID3D12Device* dev = state::device.load();
+    if (!dev) return;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC d = g_ui->GetDesc();
+    D3D12_CLEAR_VALUE cv{};
+    cv.Format = g_fmt;
+    cv.Color[0] = cv.Color[1] = cv.Color[2] = cv.Color[3] = 1.0f;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, IID_PPV_ARGS(&g_ui_b))) ||
+        FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_rtv_heap_b)))) {
+        log::error("[ui] the dual (white) UI target could not be created; dual stays off");
+        g_dual = false;
+        return;
+    }
+    g_ui_b->SetName(L"RDRVR UI layer (white)");
+    g_rtv_b = g_rtv_heap_b->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateRenderTargetView(g_ui_b, nullptr, g_rtv_b);
+    if (g_srv_heap) {
+        D3D12_CPU_DESCRIPTOR_HANDLE s1 = g_srv_heap->GetCPUDescriptorHandleForHeapStart();
+        s1.ptr += dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        dev->CreateShaderResourceView(g_ui_b, nullptr, s1);
+        g_b_srv_written = true;
+    }
+    g_b_ready = true;
+    log::info("[ui] dual: the white UI target made (%ux%u)", g_w, g_h);
+}
+
 void on_frame_end(uint64_t frame) {
     if (g_redirect.load(std::memory_order_relaxed)) ensure();
+    if (g_dual.load()) ensure_b();
     uint64_t n = g_subst.load();
     bool drawn = n != g_subst_at_frame_end.exchange(n);
     g_drawn_this_frame = drawn;
@@ -577,14 +657,35 @@ bool draw_crop(ID3D12Resource* dst, DXGI_FORMAT fmt, int x0, int y0, uint32_t cw
                    nullptr, box ? scale : nullptr);
 }
 
+bool on_ui_target(ID3D12GraphicsCommandList* cl) { return t_ui_cl == cl && cl && g_redirect.load(std::memory_order_relaxed); }
+bool drop_alpha_writes() { return g_drop_alpha.load(std::memory_order_relaxed); }
+void set_drop_alpha_writes(bool on) {
+    if (g_drop_alpha.exchange(on) != on) log::info("[ui] the game's alpha-only overwrites on the UI target %s", on ? "kept at the larger alpha (MAX)" : "as the game's");
+}
+void set_dual(bool on) {
+    if (g_dual.exchange(on) != on) log::info("[ui] dual %s", on ? "on: the UI also drawn onto white, the composite the game's own" : "off");
+}
+bool dual_active() { return g_dual_frame.load(std::memory_order_relaxed); }
+bool dual_draw_begin(ID3D12GraphicsCommandList* cl) {
+    if (!on_ui_target(cl) || !g_dual_frame.load(std::memory_order_relaxed)) return false;
+    d3d::raw_bind(cl, 1, &g_rtv_b, FALSE, &t_ds);
+    return true;
+}
+void dual_draw_end(ID3D12GraphicsCommandList* cl) { d3d::raw_bind(cl, 1, &g_rtv, FALSE, &t_ds); }
+void note_mask_read() { g_mask_read.store(true, std::memory_order_relaxed); }
+bool mask_read() { return g_mask_read.load(std::memory_order_relaxed); }
+void count_alpha_write_dropped() { g_alpha_dropped.fetch_add(1, std::memory_order_relaxed); }
+
 void status_text(char* out, size_t len) {
     std::snprintf(out, len,
                   "ui target %s, redirect %s, binds redirected %llu, frames with UI %llu, mirrored %llu, quads %llu, skipped %llu | "
-                  "target %ux%u, quads filtered %llu%s",
+                  "target %ux%u, quads filtered %llu, alpha-only overwrites %s (%llu), dual %s%s",
                   g_ready.load() ? "made" : "not made", g_redirect.load() ? "on" : "off", static_cast<unsigned long long>(g_subst.load()),
                   static_cast<unsigned long long>(g_frames_drawn.load()), static_cast<unsigned long long>(g_mirrors.load()),
                   static_cast<unsigned long long>(g_quads.load()), static_cast<unsigned long long>(g_draw_skips.load()), g_w, g_h,
-                  static_cast<unsigned long long>(g_boxed.load()), g_stopped.load() ? ", STOPPED (the game's frame made again)" : "");
+                  static_cast<unsigned long long>(g_boxed.load()), g_drop_alpha.load() ? "MAX" : "kept",
+                  static_cast<unsigned long long>(g_alpha_dropped.load()),
+                  g_dual.load() ? (g_b_ready.load() ? "on" : "on (white target not made yet)") : "off", g_stopped.load() ? ", STOPPED (the game's frame made again)" : "");
 }
 
 }  // namespace rdrvr::ui_layer
