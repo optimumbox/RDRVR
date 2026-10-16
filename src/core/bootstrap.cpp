@@ -47,6 +47,7 @@
 #include "core/aim.h"
 #include "core/reload.h"
 #include "core/gestures.h"
+#include "core/hogtie.h"
 #include "core/gun_melee.h"
 #include "core/controls.h"
 #include "core/test_channel.h"
@@ -159,6 +160,7 @@ DWORD WINAPI bootstrap_thread(void*) {
     reload::init();
     audio::init();
     gestures::init();
+    hogtie::init();
     gun_melee::init();
     whistle::init();
     wheel::init();

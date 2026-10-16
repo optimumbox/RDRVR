@@ -21,6 +21,7 @@
 #include "core/dual.h"
 #include "core/gestures.h"
 #include "core/hands.h"
+#include "core/hogtie.h"
 #include "core/holster.h"
 #include "core/physics.h"
 #include "core/log.h"
@@ -734,6 +735,7 @@ bool pad(xinput::PadState* out) {
     g_frames_in_use.fetch_add(1, std::memory_order_relaxed);
     if (p.lt > 64) g_lt_ms.store(now, std::memory_order_relaxed);  // 2026-10-12: the fists' fighting stance (pose.cpp's height hold)
     if (p.buttons & XINPUT_GAMEPAD_Y) g_y_frames.fetch_add(1, std::memory_order_relaxed);  // run 9: the Ys the game got (the tests)
+    if ((p.buttons & XINPUT_GAMEPAD_Y) && !(g_last.buttons & XINPUT_GAMEPAD_Y)) hogtie::on_game_y();  // [Gestures] ForceHogtie
     g_last = p;
     *out = p;
     return true;

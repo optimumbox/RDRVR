@@ -29,6 +29,7 @@
 #include "core/holster.h"
 #include "core/reload.h"
 #include "core/gestures.h"
+#include "core/hogtie.h"
 #include "core/gun_melee.h"
 #include "core/camera_lever.h"
 #include "core/config.h"
@@ -1727,6 +1728,9 @@ void page_gestures() {
         if (am != am0) gestures::set_lasso_aim(am, true);
     }
     sub_end();
+    bool fh = hogtie::enabled();  // 2026-10-16: [Gestures] ForceHogtie
+    if (check("Hogtie with Y", &fh, "Y hogties the one on your lasso when you are on foot within 3 m of them, if the game does not."))
+        hogtie::set_enabled(fh);
     sub_begin(me || la);
     if (nudge1("Swing speed", &sw, 0.25f, 1.0f, 8.0f, "%.2f m/s", "How fast a swing must be to punch or throw the lasso (a press 0.25 m/s)."))
         gestures::set_tuning(sw, tg, true);
