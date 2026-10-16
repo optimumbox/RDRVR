@@ -17,6 +17,10 @@ void install_list_hooks(ID3D12GraphicsCommandList* cl);
 bool on_draw(ID3D12GraphicsCommandList* cl);
 // After a draw that was not skipped: its first vertex and count (for the vertex capture).
 void on_draw_args(ID3D12GraphicsCommandList* cl, int64_t first_vertex, uint32_t count);
+// The dual UI's white-target draw (ui_layer.h): the current pipeline's copy writing no depth or stencil set, if it has
+// one (true), and the pipeline set before it back after the draw.
+bool dual_copy_begin(ID3D12GraphicsCommandList* cl);
+void dual_copy_end(ID3D12GraphicsCommandList* cl);
 // "pso census [n]" / "pso skip <hash>|off" / "pso dump <dir>" (the vertex shaders drawn last frame, as .dxbc).
 std::string command(const std::string& line);
 // The census on from now (the frame graph arms it); the list's current pipeline as the census knows it: its vertex and

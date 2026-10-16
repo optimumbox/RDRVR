@@ -53,6 +53,11 @@ std::atomic<int> g_uidraw_pending{0}, g_uidraw_left{0}, g_uidraw_n{0};
 thread_local ID3D12GraphicsCommandList* t_last_cl = nullptr;
 thread_local void* t_last_pso = nullptr;
 thread_local bool t_last_swapped = false;
+thread_local ID3D12PipelineState* t_last_set = nullptr;  // the pipeline actually set (a MAX copy or twin included)
+// The dual UI's white-target draws (ui_layer.h) with depth and stencil tested as the game's but never written: the
+// game's own draw after it writes them (the route trails on the radar test depth NOT_EQUAL and write it, so a written
+// copy first made the game's own draw fail)
+std::unordered_map<void*, ID3D12PipelineState*> g_no_ds_write;  // under g_mutex
 thread_local UINT t_stencil_ref = 0;
 thread_local float t_blend_factor[4] = {};
 
@@ -283,6 +288,24 @@ void STDMETHODCALLTYPE hk_SetBlendFactor(ID3D12GraphicsCommandList* cl, const FL
     o_SetBlendFactor(cl, f);
 }
 
+void make_no_ds_write(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, void* game) {
+    if (d->NumRenderTargets != 1 || d->RTVFormats[0] != DXGI_FORMAT_R16G16B16A16_FLOAT || d->DSVFormat == DXGI_FORMAT_UNKNOWN) return;
+    const auto& ds = d->DepthStencilState;
+    const bool depth_write = ds.DepthEnable && ds.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ZERO;
+    const bool stencil_write = ds.StencilEnable && ds.StencilWriteMask;
+    if (!depth_write && !stencil_write) return;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d2 = *d;
+    d2.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    d2.DepthStencilState.StencilWriteMask = 0;
+    ID3D12PipelineState* p = nullptr;
+    if (FAILED(o_CreateGraphics(dev, &d2, IID_PPV_ARGS(&p))) || !p) {
+        log::warn("[pso] the dual UI's no-depth-write copy refused: the game's used for the white target too");
+        return;
+    }
+    std::lock_guard lock(g_mutex);
+    g_no_ds_write[game] = p;
+}
+
 HRESULT STDMETHODCALLTYPE hk_CreateGraphics(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID riid, void** out) {
     if (d && !g_dump_dir.empty()) dump_pso(d);
     if (d && out) {
@@ -295,6 +318,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateGraphics(ID3D12Device* dev, const D3D12_GRAPH
                 g_graphics.fetch_add(1, std::memory_order_relaxed);
                 record(*out, d->VS);  // counted under the game's own hash
                 record_info(*out, d);
+                make_no_ds_write(dev, &d2, *out);
                 note_ui_pipeline(d, *out);
                 vi::on_pipeline(dev, d, static_cast<ID3D12PipelineState*>(*out));
                 return hs;
@@ -311,6 +335,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateGraphics(ID3D12Device* dev, const D3D12_GRAPH
         record_info(*out, d);
         if (riid == __uuidof(ID3D12PipelineState)) vi::on_pipeline(dev, d, static_cast<ID3D12PipelineState*>(*out));
         make_no_alpha(dev, d, *out);
+        make_no_ds_write(dev, d, *out);
         note_ui_pipeline(d, *out);
     }
     return hr;
@@ -414,6 +439,7 @@ void STDMETHODCALLTYPE hk_SetPipelineState(ID3D12GraphicsCommandList* cl, ID3D12
     t_last_cl = cl;
     t_last_pso = game;
     t_last_swapped = ps != game;
+    t_last_set = ps;
     if (!g_census.load(std::memory_order_relaxed)) {
         HP_ORIG(hp_, o_SetPipelineState(cl, ps));
         return;
@@ -548,6 +574,21 @@ void on_draw_args(ID3D12GraphicsCommandList* cl, int64_t first_vertex, uint32_t 
         g_cap_text += line + "\n";
     }
 }
+
+bool dual_copy_begin(ID3D12GraphicsCommandList* cl) {
+    if (cl != t_last_cl || !t_last_set) return false;
+    ID3D12PipelineState* p = nullptr;
+    {
+        std::lock_guard lock(g_mutex);
+        auto it = g_no_ds_write.find(t_last_pso);
+        if (it == g_no_ds_write.end()) return false;
+        p = it->second;
+    }
+    o_SetPipelineState(cl, p);
+    return true;
+}
+
+void dual_copy_end(ID3D12GraphicsCommandList* cl) { o_SetPipelineState(cl, t_last_set); }
 
 void install_list_hooks(ID3D12GraphicsCommandList* cl) {
     hooks::install("CL::IASetVertexBuffers", hooks::vtable_entry(cl, 44), hk_SetVB, &o_SetVB);

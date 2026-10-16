@@ -421,7 +421,9 @@ void STDMETHODCALLTYPE hk_DrawInstanced(ID3D12GraphicsCommandList* cl, UINT a, U
     fg_draw(cl);
     pso::on_draw_args(cl, c, a);
     if (ui_layer::dual_draw_begin(cl)) {
+        const bool copy = pso::dual_copy_begin(cl);
         o_DrawInstanced(cl, a, b, c, d);
+        if (copy) pso::dual_copy_end(cl);
         ui_layer::dual_draw_end(cl);
     }
     HP_ORIG(hp_, o_DrawInstanced(cl, a, b, c, d));
@@ -437,7 +439,9 @@ void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D12GraphicsCommandList* cl, UI
     fg_draw(cl);
     pso::on_draw_args(cl, d, a);
     if (ui_layer::dual_draw_begin(cl)) {
+        const bool copy = pso::dual_copy_begin(cl);
         o_DrawIndexedInstanced(cl, a, b, c, d, e);
+        if (copy) pso::dual_copy_end(cl);
         ui_layer::dual_draw_end(cl);
     }
     HP_ORIG(hp_, o_DrawIndexedInstanced(cl, a, b, c, d, e));
