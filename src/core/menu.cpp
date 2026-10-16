@@ -629,7 +629,7 @@ void page_display() {
             static const int kV[6] = {0, 6, 10, 11, 12, 13};
             static int chosen = -1;
             if (chosen < 0) {
-                const int v = config::get_int("Render", "DlssPreset", 0);
+                const int v = config::get_int("Render", "DlssPreset", 11);
                 chosen = 0;
                 for (int i = 0; i < 6; ++i)
                     if (kV[i] == v) chosen = i;

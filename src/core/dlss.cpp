@@ -370,7 +370,7 @@ int hk_free(uint32_t feature, const void* vp) {
 // exposureScale, three one-byte Booleans (0x38-0x3a), then the presets (uint32): DLAA, Quality, Balanced, Performance,
 // UltraPerformance, UltraQuality
 constexpr size_t kOptsPresets = 0x3c;
-std::atomic<int> g_preset{0};  // [Render] DlssPreset (read at install: the next start's)
+std::atomic<int> g_preset{11};  // [Render] DlssPreset (read at install: the next start's)
 
 // ---- slDLSSSetOptions (H4: the render thread, synchronous)
 int hk_set_options(const void* vp, const void* options) {
@@ -550,7 +550,7 @@ void set_preset(int value) {
 }
 
 bool install() {
-    g_preset = config::get_int("Render", "DlssPreset", 0);
+    g_preset = config::get_int("Render", "DlssPreset", 11);
     // on with DLSS by default (probe P2: both eyes within mono DLSS's flicker; the shared viewport fails); the hook is
     // installed only when the game's DLSS is forced at boot, so FXAA and TAA keep the render thread's path untouched
     g_cfg = config::get_int("Render", "ForceAntiAliasing", -1) == 3 && config::get_bool("Render", "DlssPerEye", true);
