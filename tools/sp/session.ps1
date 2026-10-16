@@ -14,7 +14,7 @@ param(
     [switch] $Install,
     [switch] $Vr,
     [string] $GameDir = 'G:\Games\Red Dead Redemption',
-    [string] $Shaders = 'C:\Games\RDRVR-src\research\stereo_all18',
+    [string] $Shaders = 'C:\Games\RDRVR-src\research\stereo_all19',
     [string] $ExtraIni = ''
 )
 $ErrorActionPreference = 'Stop'

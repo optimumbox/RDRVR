@@ -32,6 +32,10 @@ NO_TWIN_PS = {
     'PSRiverWaterJointSplash': 'the river water (view 1 wrong when twinned)',
     'PSRiverWaterNotRefracted': 'the river water (view 1 wrong when twinned)',
     'PSRiverWaterJointNoRefraction': 'the river water (view 1 wrong when twinned)',
+    # 2026-10-16, the user: rain puddles' reflections wrong in both eyes (twinned); a test, each eye draws its own
+    'PSTerrainPuddle': 'rain puddles on the terrain (wrong when twinned?)',
+    'PSPondWater': 'puddle and pond water (wrong when twinned?)',
+    'PSPondWaterNoRefraction': 'puddle and pond water (wrong when twinned?)',
 }
 import os
 for _n in filter(None, os.environ.get('RDRVR_NO_TWIN_EXTRA', '').split(',')):  # (experiments)
