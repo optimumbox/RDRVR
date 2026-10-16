@@ -7213,12 +7213,12 @@ bool install() {
         }
         g_fixed_grip = config::get_bool("Hands", "FixedGunGrip", false);
         g_fixed_sidearm = config::get_bool("Hands", "FixedSidearmGrip", false);
-        g_follow_auto = config::get_bool("Debug", "FollowLog", true);
+        g_follow_auto = config::get_bool("Debug", "FollowLog", false);
         load_gun_rels();
         g_copy_grip_cfg = config::get_bool("Hands", "CopyGrip", true);
         g_same_frame_cfg = config::get_bool("Reload", "TwoHandedSteady", true);
         g_snap_drawn_cfg = config::get_bool("Reload", "SnapToDrawnGun", true);
-        g_shotlog_cfg = config::get_bool("Debug", "TwoHandShotLog", true);
+        g_shotlog_cfg = config::get_bool("Debug", "TwoHandShotLog", false);
         log::info("[body] the front hand's snap from the gun as drawn with FixedGunGrip (SnapToDrawnGun) %d", g_snap_drawn_cfg.load() ? 1 : 0);
         g_twist_cfg = config::get_bool("Hands", "ArmTwist", true);
         g_fallback_cfg = config::get_bool("Reload", "GripFallback", true);
