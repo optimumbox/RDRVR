@@ -44,6 +44,12 @@ float g_bolt_off[3] = {0.035f, 0.030f, 0.090f};  // right, up, forward from the 
 std::atomic<bool> g_break{false};
 // [Reload] BreechParts (off; run 6 item 9g): the single-shot rifles (the Springfield, the Rolling Block, the Buffalo)
 std::atomic<bool> g_breech_parts{false};
+// [Reload] BreechFlick (on; 2026-10-17, the user: "I can't charge the springfield rifle with the right hand ... I want it
+// to work like the repeaters do"): the hand-worked breeches (the Springfield's trapdoor, the Rolling Block's block) also
+// opened by a flick of the gun down and shut by a flick up, as the lever guns, and held two-handed the gun stays in the
+// front hand meanwhile (LeverSteady's hold). The off hand's grip on the part still works
+std::atomic<bool> g_breech_flick{true};
+bool g_breech_by_flick = false;  // the breech's state last set by a flick: drawn eased toward it
 // [Reload] SemiAutoParts (off; run 6 item 9h): the Semi-Auto Shotgun's bolt racked by the off hand after a load from empty
 std::atomic<bool> g_semi_parts{false};
 float g_break_deg = kBreakOpenDeg;  // the barrels' opening (the game's reload: 31 held, 33.5 at the swing's end; round 13: 45)
@@ -179,6 +185,10 @@ const Breech* breech_of(int w) {
 std::atomic<float> g_breech_amt{0.0f}, g_breech_hammer{1.0f};  // the drawn opening (0 shut - 1 open), the hammer (1 cocked)
 std::atomic<int> g_breech_weapon{-1};
 std::atomic<bool> g_breech_round{true};  // a live round chambered (holster.cpp's round in sets it)
+// 2026-10-17 (the user: "The springfield rifle can load 4 bullets at a time. You fire, rack the charge hammer, then fire
+// again"): the breech gun's own count and its capacity, from the tick. A breech worked after a shot chambers the next
+// round from the rifle's count while it has any; its rounds go in any time it has room, as a repeater's
+std::atomic<float> g_breech_clip{0.0f}, g_breech_cap{1.0f};
 std::atomic<bool> g_breech_want[2] = {false, false};
 bool g_breech_open = false, g_breech_grip = false, g_breech_grip_was = false;
 int g_breech_ctrl = -1;  // the controller gripping the part
@@ -460,7 +470,8 @@ void frame() {
         if (k == kBreech && !deadeye) {  // a single shot: the spent case in the chamber, whatever the game's count
             g_needs = true;
             g_breech_round.store(false, std::memory_order_relaxed);
-            log::info("[actions] breech (%d): shot, open it and put a round in (clip %.0f/%.0f, spare %.0f)", w, st.clip, st.clip_max, st.spare);
+            log::info("[actions] breech (%d): shot, open and shut it%s (clip %.0f/%.0f, spare %.0f)", w,
+                      st.clip >= 0.5f ? " for the next round" : ", a round in", st.clip, st.clip_max, st.spare);
         }
     }
     if (k == kBreech && g_last_clip >= 0.0f && st.clip > g_last_clip + 0.5f && !reloading_by_hand_ms(now)) {
@@ -470,6 +481,10 @@ void frame() {
             g_needs = false;
             log::info("[actions] breech (%d): reloaded by the game (clip %.0f -> %.0f): ready", w, g_last_clip, st.clip);
         }
+    }
+    if (k == kBreech) {
+        g_breech_clip.store(st.clip, std::memory_order_relaxed);
+        g_breech_cap.store(st.clip_max, std::memory_order_relaxed);
     }
     if (st.clip < 0.5f) g_was_empty = true;
     if (g_was_empty && st.clip >= 0.5f) {  // loaded from empty: a bolt, lever or pump gun (or the semi-auto) chambers first
@@ -734,6 +749,7 @@ void frame() {
                 g_breech_grip = true;
                 g_breech_ctrl = wk;
                 g_breech_s0 = s - bdrawn * brz->travel;  // taken where it is drawn
+                g_breech_by_flick = false;
                 controllers::pulse(wk, 0.35f, 25);
                 log::info("[actions] breech (%d): gripped (%.3f m from its zone, drawn %.2f)", w, g_breech_d, bdrawn);
             }
@@ -749,6 +765,21 @@ void frame() {
         } else {  // the hands not tracked: the part let go where it is
             g_breech_grip = false;
             g_breech_grip_was = hands::get(wk).grip > 0.6f;
+        }
+        // [Reload] BreechFlick: the part not held, the gun's flicks work it as the Buffalo's (down opens, up shuts)
+        if (brz->gesture != 0 && !g_breech_grip && g_breech_flick.load(std::memory_order_relaxed)) {
+            const bool down = !g_breech_open && (g_needs || !g_breech_round.load(std::memory_order_relaxed)) && now - g_breech_shut_ms >= 200.0 &&
+                              g_w[0] <= -g_lever_speed;
+            g_breech_flicks = down ? g_breech_flicks + 1 : 0;
+            if (g_breech_flicks >= 2 && !want_open) {
+                want_open = true;
+                g_breech_by_flick = true;
+                log::info("[actions] breech (%d): opened by a flick down (%.1f rad/s)", w, g_w[0]);
+            } else if (g_breech_open && want_open && now - g_breech_ms >= 150.0 && g_w[0] >= g_lever_speed) {
+                want_open = false;
+                g_breech_by_flick = true;
+                log::info("[actions] breech (%d): shut by a flick up (%.1f rad/s)", w, g_w[0]);
+            }
         }
         if (want_open != g_breech_open) {
             g_breech_open = want_open;
@@ -770,10 +801,10 @@ void frame() {
                     play_at(gs->close2, at);
                 }
                 g_hammer_down = false;
-                // no spare rounds left but the game's count has some (the Springfield's clip holds four): from those
-                if (!g_breech_round.load(std::memory_order_relaxed) && st.spare < 1.0f && st.clip >= 0.5f) {
+                // the game's count has rounds left (the Springfield's holds four): the next one chambered from it
+                if (!g_breech_round.load(std::memory_order_relaxed) && st.clip >= 0.5f) {
                     g_breech_round.store(true, std::memory_order_relaxed);
-                    log::info("[actions] breech (%d): no spare rounds: chambered from the gun's own count (clip %.0f)", w, st.clip);
+                    log::info("[actions] breech (%d): the next round chambered from the gun's own count (clip %.0f/%.0f)", w, st.clip, st.clip_max);
                 }
                 controllers::pulse(gun_h, 0.6f, 20);
                 if (g_breech_round.load(std::memory_order_relaxed)) {
@@ -785,7 +816,7 @@ void frame() {
                 }
             }
         }
-        if (!moved && brz->gesture == 0) {  // the flicked block drawn toward its state, 80 ms either way
+        if (!moved && (brz->gesture == 0 || g_breech_by_flick)) {  // the flicked block drawn toward its state, 80 ms either way
             static double last = 0;
             const float step = last > 0 ? static_cast<float>((now - last) / 80.0) : 1.0f;
             last = now;
@@ -1029,7 +1060,12 @@ void frame() {
             wait_ms = 0.0;
         }
     }
-    g_lever_pend.store(k == kLever && kind_on(k) && !deadeye && (g_needs || g_lever_open), std::memory_order_relaxed);
+    // (BreechFlick: a hand-worked breech to be flicked open or shut is held as a lever is)
+    g_lever_pend.store(!deadeye && kind_on(k) &&
+                           ((k == kLever && (g_needs || g_lever_open)) ||
+                            (k == kBreech && brz && brz->gesture != 0 && g_breech_flick.load(std::memory_order_relaxed) && !g_breech_grip &&
+                             (g_needs || g_breech_open))),
+                       std::memory_order_relaxed);
     g_lever_pend_ms.store(now, std::memory_order_relaxed);
     {  // RifleSteady: a shot to work off, the bolt back (or not home), the breech open or empty, or the gun hand on the part
         bool pend = false;
@@ -1141,6 +1177,7 @@ void init() {
     g_pump_parts = config::get_bool("Reload", "PumpParts", false);
     g_bolt_parts = config::get_bool("Reload", "BoltParts", false);
     g_breech_parts = config::get_bool("Reload", "BreechParts", false);
+    g_breech_flick = config::get_bool("Reload", "BreechFlick", true);
     g_semi_parts = config::get_bool("Reload", "SemiAutoParts", false);
     g_break = config::get_bool("Reload", "ManualBreak", false);
     g_barrel_r = config::get_float("Reload", "BarrelGripRadius", 0.15f);
@@ -1229,10 +1266,11 @@ int hint(float pos[3]) {
     if (!g_on.load(std::memory_order_relaxed) || !g_hints.load(std::memory_order_relaxed)) return 0;
     std::lock_guard lock(g_mutex);
     if (kind_of(g_weapon) == kBreech && g_breech_parts.load(std::memory_order_relaxed)) {  // BreechParts
-        if (g_breech_open && !g_breech_round.load(std::memory_order_relaxed)) return 1;  // open: a round goes in
+        if (g_breech_open && !g_breech_round.load(std::memory_order_relaxed) && g_breech_cap.load(std::memory_order_relaxed) <= 1.5f)
+            return 1;  // a single shot open: a round goes in
         if (!g_needs || g_breech_open) return 0;
         const Breech* b = breech_of(g_weapon);
-        if (b && b->gesture) {
+        if (b && b->gesture && !g_breech_flick.load(std::memory_order_relaxed)) {
             if (pos) std::memcpy(pos, g_breech_zone, sizeof(g_breech_zone));
             return 2;  // the part's zone
         }
@@ -1276,7 +1314,9 @@ void round_in(int weapon, const float at[3]) {
     if (const GunSounds* gs = gun_sounds(weapon)) play_at(gs->insert, at);
     const Kind k = kind_of(weapon);
     if ((k == kRevolver || k == kTopBreak) && weapon >= 0 && weapon < 40) g_cyl_rounds[weapon].fetch_add(1, std::memory_order_relaxed);
-    if (k == kBreech && g_breech_parts.load(std::memory_order_relaxed)) g_breech_round.store(true, std::memory_order_relaxed);
+    // (the Springfield's rounds go into its magazine: chambered only by working the breech, unless put in with it open)
+    if (k == kBreech && g_breech_parts.load(std::memory_order_relaxed) && (g_breech_open || g_breech_cap.load(std::memory_order_relaxed) <= 1.5f))
+        g_breech_round.store(true, std::memory_order_relaxed);
 }
 unsigned gun_drivers(int* weapon, float* d) {
     for (int i = 0; i < kDrvCount; ++i) d[i] = 0.0f;
@@ -1339,6 +1379,11 @@ void set_semi_auto_parts(bool on) {
     config::set("Reload", "SemiAutoParts", on ? "1" : "0");
 }
 bool breech_parts() { return g_breech_parts.load(std::memory_order_relaxed); }
+bool breech_flick() { return g_breech_flick.load(std::memory_order_relaxed); }
+void set_breech_flick(bool on) {
+    if (g_breech_flick.exchange(on) != on) log::info("[actions] the Springfield and the Rolling Block worked by the gun's flicks: %s", on ? "on" : "off");
+    config::set("Reload", "BreechFlick", on ? "1" : "0");
+}
 void set_breech_parts(bool on) {
     if (g_breech_parts.exchange(on) != on) log::info("[actions] the single-shot breeches worked by hand, drawn: %s", on ? "on" : "off");
     config::set("Reload", "BreechParts", on ? "1" : "0");
@@ -1418,7 +1463,8 @@ void set_open_cylinder(bool on) {
 bool can_load(int weapon) {
     if (!g_on.load(std::memory_order_relaxed) || !g_load_open.load(std::memory_order_relaxed)) return true;
     const Kind k = kind_of(weapon);
-    if (k == kBreech && kind_on(k)) {  // BreechParts: open, and one round at most
+    if (k == kBreech && kind_on(k)) {  // BreechParts: open, and one round at most; the Springfield as a repeater (any time)
+        if (g_breech_cap.load(std::memory_order_relaxed) > 1.5f) return true;
         std::lock_guard lock(g_mutex);
         return weapon == g_weapon && g_breech_open && !g_breech_round.load(std::memory_order_relaxed);
     }

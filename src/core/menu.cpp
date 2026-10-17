@@ -1354,6 +1354,20 @@ void page_guns() {
         if (radio("Dot only", dot, kStyleTip)) aim::set_reticle_dot(true);
         sub_end();
     }
+    {  // 2026-10-17: [Hands] LaserSight
+        bool ls = aim::laser_on();
+        if (check("Laser sight", &ls,
+                  "With a gun in hand, a red laser from the muzzle to where the bullet will hit, and a dot there. It follows the "
+                  "shot's own line, so it shows where the game will really send the bullet."))
+            aim::set_laser_on(ls);
+    }
+    {  // 2026-10-17: [Hands] ShotFromBarrel
+        bool sb = aim::shot_from_barrel();
+        if (check("Bullets from the gun's barrel", &sb,
+                  "Every shot leaves your gun's muzzle straight along its barrel, as your iron sights line up, and the laser "
+                  "and the reticle sit on that line. Off: the game's own aim, as before."))
+            aim::set_shot_from_barrel(sb);
+    }
     bool kd = holster::keeps_drawn();
     if (check("Keep the gun drawn", &kd, "A drawn gun stays in your hand until you put it away (the game holsters it 3 s after your last shot).")) {
         holster::set_keeps_drawn(kd);
@@ -1637,6 +1651,15 @@ void page_reloading() {
               "Open the Springfield's trapdoor and the Rolling Block's block with your other hand (the Buffalo by a flick down and "
               "up), load one round, shut."))
         actions::set_breech_parts(br);
+    {
+        sub_begin(br);
+        bool bf = actions::breech_flick();
+        if (check("Springfield and Rolling Block: by your flick", &bf,
+                  "As the lever guns: flick the gun down to open the breech, put a round in, flick it up to shut it. Held "
+                  "two-handed, the gun stays in your front hand meanwhile. Gripping the part with your other hand still works."))
+            actions::set_breech_flick(bf);
+        sub_end();
+    }
     bool sa = actions::semi_auto_parts();
     if (check("Semi-Auto Shotgun: the bolt racked by hand", &sa,
               "After loading it from empty, pull back the bolt's handle (right of the receiver) with your other hand and let go."))

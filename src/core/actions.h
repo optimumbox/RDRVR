@@ -70,6 +70,10 @@ void set_bolt_parts(bool on);  // also written to the user ini
 // gun's flicks); open, one round in by hand; shut with it, ready; the game's own reload after each shot stopped.
 bool breech_parts();
 void set_breech_parts(bool on);  // also written to the user ini
+// [Reload] BreechFlick (on): the Springfield and the Rolling Block also opened by a flick of the gun down and shut by a
+// flick up (as the lever guns), the gun steady in the front hand meanwhile when held two-handed
+bool breech_flick();
+void set_breech_flick(bool on);  // also written to the user ini
 // [Reload] SemiAutoParts (off; run 6 item 9h): the Semi-Auto Shotgun's bolt racked by the off hand after loading it
 // from empty (drawn back with the hand, it springs forward let go: a shell chambered); its cycling between shots stays.
 bool semi_auto_parts();

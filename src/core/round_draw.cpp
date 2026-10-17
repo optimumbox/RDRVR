@@ -11,6 +11,7 @@
 #include <sstream>
 #include <vector>
 
+#include "core/aim.h"
 #include "core/body.h"
 #include "core/camera_lever.h"
 #include "core/config.h"
@@ -22,7 +23,7 @@ namespace rdrvr::round_draw {
 namespace {
 
 // ---- the models: lathe profiles (radius, height along the axis, mm; the material), base at 0, tip up
-enum Mat { kBrass = 0, kLead = 1, kHull = 2 };
+enum Mat { kBrass = 0, kLead = 1, kHull = 2, kLaser = 3 };
 struct Pt {
     float r, y;
     int mat;  // the band from this point to the next
@@ -41,6 +42,11 @@ const Pt kRifle[] = {{0, 0, kBrass},        {6.43f, 0, kBrass},     {6.43f, 1.6f
 const Pt kShell[] = {{0, 0, kBrass},       {11.1f, 0, kBrass},    {11.1f, 1.5f, kBrass}, {10.3f, 1.5f, kBrass},
                      {10.3f, 13, kHull},    {10.15f, 13, kHull},   {10.15f, 61.5f, kHull}, {9.6f, 63, kHull},
                      {8.6f, 63.5f, kHull},  {0, 63.5f, kHull}};
+// [Hands] LaserSight: its beam, a unit cylinder (1 m across the radius, 1 m long: scaled per segment), and its dot, a
+// unit sphere about its centre
+const Pt kBeam[] = {{0, 0, kLaser}, {1000, 0, kLaser}, {1000, 1000, kLaser}, {0, 1000, kLaser}};
+const Pt kDot[] = {{0, -1000, kLaser},     {383, -924, kLaser}, {707, -707, kLaser}, {924, -383, kLaser}, {1000, 0, kLaser},
+                   {924, 383, kLaser},     {707, 707, kLaser},  {383, 924, kLaser},  {0, 1000, kLaser}};
 constexpr int kSeg = 24;  // around the axis
 
 struct Vtx {
@@ -51,6 +57,7 @@ struct Model {
     uint32_t first = 0, count = 0;
 };
 Model g_model[3];  // handgun, rifle, shotgun
+Model g_beam, g_dot;  // the laser's
 std::vector<Vtx> g_mesh;
 
 void lathe(const Pt* pts, int n, Model* out) {
@@ -115,7 +122,8 @@ float4 ps(V i) : SV_Target {
     float sh;
     if (i.mat < 0.5) { alb = float3(0.50, 0.33, 0.10); spc = float3(0.85, 0.68, 0.38); sh = 48; }
     else if (i.mat < 1.5) { alb = float3(0.20, 0.20, 0.22); spc = float3(0.25, 0.25, 0.27); sh = 18; }
-    else { alb = float3(0.33, 0.03, 0.02); spc = float3(0.06, 0.05, 0.05); sh = 8; }
+    else if (i.mat < 2.5) { alb = float3(0.33, 0.03, 0.02); spc = float3(0.06, 0.05, 0.05); sh = 8; }
+    else return float4(1.0, 0.06, 0.03, 1);  // the laser: its own light
     float dif = saturate(dot(N, Ld)), rim = saturate(1 - abs(dot(N, V)));
     float3 c = alb * (0.22 + 0.78 * dif) + spc * pow(saturate(dot(N, H)), sh) * (dif > 0) + alb * rim * rim * 0.25;
     return float4(c * scale.z, 1);
@@ -155,6 +163,10 @@ std::atomic<double> g_held_ms{0};
 bool held_now() {
     return g_hand.load(std::memory_order_relaxed) >= 0 && log::now_ms() - g_held_ms.load(std::memory_order_relaxed) < 250.0;
 }
+
+// [Hands] LaserSight: a laser wanted within the last 250 ms (record sets it before it needs the depth)
+std::atomic<double> g_laser_ms{-1e9};
+bool laser_now() { return aim::laser_on() && log::now_ms() - g_laser_ms.load(std::memory_order_relaxed) < 250.0; }
 
 // ---- the ammo row ([Reload] ShowAmmo, run 6 item 6b)
 std::atomic<bool> g_row_on{false};
@@ -363,7 +375,7 @@ void copy_tap(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, ID3D12Resource
     if (dst != cur) {
         // (the cheap tests first: the game records many copies; the review's) the one in use copied into lately: none other
         if (cur && frame - g_resolve_frame.load(std::memory_order_relaxed) <= 3) return;
-        if (!((g_on.load(std::memory_order_relaxed) && held_now()) || row_now())) return;
+        if (!((g_on.load(std::memory_order_relaxed) && held_now()) || row_now() || laser_now())) return;
         if (!d3d::resource_named(dst, "Depth Resolve")) return;
         // another Depth Resolve: taken once the one in use has had no copy for a few frames (a resize, DLSS on or off)
         g_resolve_other.fetch_add(cur ? 1 : 0, std::memory_order_relaxed);
@@ -371,7 +383,7 @@ void copy_tap(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, ID3D12Resource
         const D3D12_RESOURCE_DESC dd = dst->GetDesc();
         log::info("[round] the scene depth taken from \"Depth Resolve\" %p (%llux%u)%s", static_cast<const void*>(dst),
                   static_cast<unsigned long long>(dd.Width), dd.Height, cur ? " (another than before)" : "");
-    } else if (!((g_on.load(std::memory_order_relaxed) && held_now()) || row_now())) {
+    } else if (!((g_on.load(std::memory_order_relaxed) && held_now()) || row_now() || laser_now())) {
         return;
     }
     g_resolve_frame.store(frame, std::memory_order_relaxed);
@@ -655,6 +667,8 @@ void init() {
     lathe(kHandgun, static_cast<int>(sizeof(kHandgun) / sizeof(kHandgun[0])), &g_model[0]);
     lathe(kRifle, static_cast<int>(sizeof(kRifle) / sizeof(kRifle[0])), &g_model[1]);
     lathe(kShell, static_cast<int>(sizeof(kShell) / sizeof(kShell[0])), &g_model[2]);
+    lathe(kBeam, static_cast<int>(sizeof(kBeam) / sizeof(kBeam[0])), &g_beam);
+    lathe(kDot, static_cast<int>(sizeof(kDot) / sizeof(kDot[0])), &g_dot);
     g_grab_done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     {
         const int m = config::get_int("Reload", "RoundInHand", 0);
@@ -745,7 +759,7 @@ void set_mode(int m) {
 void set_enabled(bool on) { set_mode(on ? (g_mode.load() ? g_mode.load() : 1) : 0); }
 
 void note_pass(int eye, const float* cam, float l, float r, float u, float d) {
-    if (!(g_on.load(std::memory_order_relaxed) || g_row_on.load(std::memory_order_relaxed)) || eye < 0 || eye > 1 || !cam) return;
+    if (!(g_on.load(std::memory_order_relaxed) || g_row_on.load(std::memory_order_relaxed) || aim::laser_on()) || eye < 0 || eye > 1 || !cam) return;
     const uint64_t frame = state::presents.load(std::memory_order_relaxed);
     g_pass_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
     std::lock_guard lock(g_cam_mutex);
@@ -795,7 +809,7 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
         g_q_pending[slot] = false;
     }
     if (g_grab_phase.load(std::memory_order_acquire) == 2 && g_grab_slot == slot) write_grab();
-    if (!g_on.load(std::memory_order_relaxed) && !g_row_on.load(std::memory_order_relaxed)) return;
+    if (!g_on.load(std::memory_order_relaxed) && !g_row_on.load(std::memory_order_relaxed) && !aim::laser_on()) return;
     const uint64_t frame = state::presents.load(std::memory_order_relaxed);
     if (!g_ready && !g_failed) {
         g_ready = make(dev, w, h, fmt);
@@ -826,7 +840,11 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
     }
     const bool want_row = g_row_on.load(std::memory_order_relaxed) && row.n > 0 && row.family > 0 && log::now_ms() - row.ms < 250.0;
     if (!want_row) g_row_px[0] = g_row_px[1] = 0;  // no row drawn: none of it seen (its last count would stay)
-    if (!want_round && !want_row) return;
+    float ls[3], le[3];
+    bool lhit = false;
+    const bool want_laser = aim::laser_ray(ls, le, &lhit);
+    if (want_laser) g_laser_ms.store(log::now_ms(), std::memory_order_relaxed);
+    if (!want_round && !want_row && !want_laser) return;
     // the newest frame with both eyes' cameras (and depths, if they are used)
     PassCam cam[2];
     uint64_t use = ~0ull;
@@ -880,7 +898,7 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
     }
     const int fam = g_family.load(std::memory_order_relaxed);
     if (fam == 3 && g_mode.load(std::memory_order_relaxed) == 2) round_ok = false;  // the game's own shell is held (held_prop)
-    if (!round_ok && !want_row) return;
+    if (!round_ok && !want_row && !want_laser) return;
     const Model& m = g_model[fam == 2 ? 1 : fam == 3 ? 2 : 0];
     const Model& rm = g_model[row.family == 2 ? 1 : row.family == 3 ? 2 : 0];
     // the row: standing (base to tip up), side by side along the body's right, centred on the zone; a shell's width
@@ -991,7 +1009,48 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
             }
         }
         cl->EndQuery(g_qheap, D3D12_QUERY_TYPE_OCCLUSION, static_cast<UINT>(slot * 4 + 2 + e));
+        if (want_laser) {
+            // the beam in segments growing away from the muzzle (s_i = L (i/N)^2), each as wide as kBeamRad of this eye's
+            // distance to it (at least kBeamMin): about a pixel's width near and far
+            constexpr int kN = 16;
+            constexpr float kBeamRad = 0.0006f, kBeamMin = 0.0010f, kDotRad = 0.0022f, kDotMin = 0.004f;
+            float bd[3] = {le[0] - ls[0], le[1] - ls[1], le[2] - ls[2]};
+            const float L = std::sqrt(bd[0] * bd[0] + bd[1] * bd[1] + bd[2] * bd[2]);
+            auto eye_dist = [&](const float* p) {
+                const double x = p[0] - c.d[0], y = p[1] - c.d[1], z = p[2] - c.d[2];
+                return static_cast<float>(std::sqrt(x * x + y * y + z * z));
+            };
+            if (L > 0.02f) {
+                for (int i = 0; i < 3; ++i) bd[i] /= L;
+                // two axes across the beam
+                const float tv[3] = {std::fabs(bd[1]) < 0.9f ? 0.0f : 1.0f, std::fabs(bd[1]) < 0.9f ? 1.0f : 0.0f, 0.0f};
+                float uv[3] = {tv[1] * bd[2] - tv[2] * bd[1], tv[2] * bd[0] - tv[0] * bd[2], tv[0] * bd[1] - tv[1] * bd[0]};
+                normalize3(uv);
+                const float wv[3] = {bd[1] * uv[2] - bd[2] * uv[1], bd[2] * uv[0] - bd[0] * uv[2], bd[0] * uv[1] - bd[1] * uv[0]};
+                k.scale[3] = 0.01f;
+                for (int i = 0; i < kN; ++i) {
+                    const float a0 = L * static_cast<float>(i * i) / (kN * kN), a1 = L * static_cast<float>((i + 1) * (i + 1)) / (kN * kN);
+                    const float P0[3] = {ls[0] + bd[0] * a0, ls[1] + bd[1] * a0, ls[2] + bd[2] * a0};
+                    const float rad = std::fmax(kBeamMin, kBeamRad * eye_dist(P0));
+                    const float X_[3] = {uv[0] * rad, uv[1] * rad, uv[2] * rad}, Y_[3] = {bd[0] * (a1 - a0), bd[1] * (a1 - a0), bd[2] * (a1 - a0)},
+                                Z_[3] = {wv[0] * rad, wv[1] * rad, wv[2] * rad};
+                    place(X_, Y_, Z_, P0, nullptr);
+                    cl->SetGraphicsRoot32BitConstants(0, kConsts, &k, 0);
+                    cl->DrawInstanced(g_beam.count, 1, g_beam.first, 0);
+                }
+            }
+            if (lhit) {  // the dot where the shot lands, the same size near and far; let through the surface it sits on
+                const float rad = std::fmax(kDotMin, kDotRad * eye_dist(le));
+                const float X_[3] = {rad, 0, 0}, Y_[3] = {0, rad, 0}, Z_[3] = {0, 0, rad};
+                k.scale[3] = rad + 0.05f;
+                place(X_, Y_, Z_, le, nullptr);
+                cl->SetGraphicsRoot32BitConstants(0, kConsts, &k, 0);
+                cl->DrawInstanced(g_dot.count, 1, g_dot.first, 0);
+            }
+            k.scale[3] = bias;
+        }
     }
+    if (want_laser) aim::count_laser_drawn();
     cl->ResolveQueryData(g_qheap, D3D12_QUERY_TYPE_OCCLUSION, static_cast<UINT>(slot * 4), 4, g_qread, slot * 4 * sizeof(uint64_t));
     g_q_pending[slot] = true;
     if (round_ok) g_drawn.fetch_add(1, std::memory_order_relaxed);

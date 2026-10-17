@@ -25,6 +25,18 @@ bool barrel_aim();
 bool reticle_target(float pos[3], bool* on_actor, float* size_deg, int which = 0, bool advance = false);
 bool reticle_on();
 void set_reticle_on(bool on);  // also written to the user ini
+// [Hands] LaserSight (off by default): a laser from the drawn muzzle to where the shot lands (the ray the game shoots
+// along, probed each other script tick: the drawn barrel's, or the game's own when it does not aim along the barrel).
+// start / end world; hit: the probe found a surface (else the end is 300 m out). False without a gun in hand, in Dead
+// Eye's marked shots, or with no fresh probe. Any thread (the eye blit draws it: round_draw).
+bool laser_ray(float start[3], float end[3], bool* hit);
+bool laser_on();
+void set_laser_on(bool on);  // also written to the user ini
+// [Hands] ShotFromBarrel (on): each player shot leaves the drawn gun's muzzle along its drawn barrel (the game's spread
+// kept about it), and the laser and the reticle are drawn along that barrel
+bool shot_from_barrel();
+void set_shot_from_barrel(bool on);  // also written to the user ini
+void count_laser_drawn();    // round_draw: a frame with the laser drawn (aim laser's counter)
 // [Hands] ReticleStyle: ring (a ring and a centre dot, the default) or dot (a dot only)
 bool reticle_dot();
 void set_reticle_dot(bool dot);  // also written to the user ini

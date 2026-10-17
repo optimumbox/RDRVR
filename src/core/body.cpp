@@ -3290,6 +3290,18 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
         const HeldSample* hs = newest_held(f.held);
         if (hs && hs->left) hs = nullptr;  // the snap is onto the gun in the game's right hand
         static int grip_weapon = -1;  // the weapon g_grip_cur eased toward (another: it starts over)
+        // 2026-10-16 (the user: the front hand's thumb crept toward the Winchester's sights through a session; "make it
+        // reset every time I holster and unholster the gun"): each draw of a gun (or another gun in hand) learns its
+        // front-hand grips and fingers afresh, from its first still samples
+        static double held_ms = -1e9;
+        if (hs && slot == 0) {
+            const double now = log::now_ms();
+            if ((f.weapon != grip_weapon || now - held_ms > 500.0) && f.weapon >= 0 && f.weapon < kGripW) {
+                g_grip_n[f.weapon][0] = 0;
+                g_grip_n[f.weapon][1] = 0;
+            }
+            held_ms = now;
+        }
         if (hs && slot == 0 && f.weapon != grip_weapon) {
             grip_weapon = f.weapon;
             g_grip_cur.valid = false;
@@ -3392,7 +3404,31 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                         int dummy_n = 0;
                         int& n = known_w ? g_grip_n[f.weapon][slot_pose] : dummy_n;
                         const bool steady = g_steady_grip.load(std::memory_order_relaxed);
-                        if (!steady || !gr.valid || n < 30) {
+                        // 2026-10-16 (the user: John's left fingers over the Winchester's sights a whole session, gone once
+                        // the grips were learned afresh): a sample taken only once the game's hold has been still for 5
+                        // frames on end (its grip within 3 mm and each finger within 5 mm of the sample before), so a hold
+                        // caught moving is never kept for the session
+                        static float prev_rel[3] = {};
+                        static FingerRel prev_fr;
+                        static int still = 0, still_w = -1, still_slot = -1;
+                        bool moved = still_w != f.weapon || still_slot != slot_pose || fr_now.valid != prev_fr.valid;
+                        float dp = 0.0f;
+                        for (int k = 0; k < 3; ++k) dp += (rel[k] - prev_rel[k]) * (rel[k] - prev_rel[k]);
+                        moved = moved || dp > 0.003f * 0.003f;
+                        for (int i = 0; i < 15 && !moved && fr_now.valid; ++i) {
+                            if (!fr_now.has[i] || !prev_fr.has[i]) continue;
+                            float df = 0.0f;
+                            for (int k = 0; k < 3; ++k) df += (fr_now.t[i][k] - prev_fr.t[i][k]) * (fr_now.t[i][k] - prev_fr.t[i][k]);
+                            moved = df > 0.005f * 0.005f;
+                        }
+                        still = moved ? 0 : still + 1;
+                        still_w = f.weapon;
+                        still_slot = slot_pose;
+                        std::memcpy(prev_rel, rel, sizeof(rel));
+                        prev_fr = fr_now;
+                        if (still < 5) {
+                            // not yet still: nothing learned from this sample
+                        } else if (!steady || !gr.valid || n < 30) {
                             if (steady && gr.valid && n > 0) {
                                 const float w = 1.0f / static_cast<float>(n + 1);
                                 for (int k = 0; k < 3; ++k) gr.p[k] += (rel[k] - gr.p[k]) * w;
