@@ -20,7 +20,9 @@
 #include <algorithm>
 #include <vector>
 
+#include "core/body.h"
 #include "core/camera_lever.h"
+#include "core/deadeye.h"
 #include "core/config.h"
 #include "core/controllers.h"
 #include "core/controls.h"
@@ -1051,8 +1053,10 @@ bool fill_ui(XrCompositionLayerQuad& quad) {
     const bool wrist = g_hud_wrist.load(std::memory_order_relaxed) && g_wr_sc != XR_NULL_HANDLE;
     const int hole[4] = {g_wr_x0, g_wr_y0, g_wr_x0 + static_cast<int>(g_wr_cw), g_wr_y0 + static_cast<int>(g_wr_ch)};
     const int hole2[4] = {g_wh_x0, g_wh_y0, g_wh_x0 + static_cast<int>(g_wh_cw), g_wh_y0 + static_cast<int>(g_wh_ch)};  // the hand's wheel
+    int band[4];
+    const bool de_band = deadeye::band(band);  // the Dead Eye X's slots: drawn where the marks are instead
     bool ok = XR_SUCCEEDED(xrWaitSwapchainImage(g_ui_sc, &wsi)) && index < g_ui_images.size() &&
-              ui_layer::draw_quad(g_ui_images[index], g_ui_fmt, wrist ? hole : nullptr, g_wh_on ? hole2 : nullptr);
+              ui_layer::draw_quad(g_ui_images[index], g_ui_fmt, wrist ? hole : nullptr, g_wh_on ? hole2 : nullptr, de_band ? band : nullptr);
     XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     xrReleaseSwapchainImage(g_ui_sc, &ri);
     if (!ok) return false;
@@ -1075,6 +1079,115 @@ void qrot(const XrQuaternionf& q, const float v[3], float out[3]) {
     out[1] = v[1] + w * ty + (z * tx - x * tz);
     out[2] = v[2] + w * tz + (x * ty - y * tx);
 }
+// ---- the Dead Eye X (deadeye.cpp): the game's own X for each mark, from its slot in the UI target, drawn into both eyes
+// where the mark is, on one projection layer over the scene (half the eyes' size, each eye its half of one image)
+XrSwapchain g_de_sc = XR_NULL_HANDLE;
+std::vector<ID3D12Resource*> g_de_images;
+uint32_t g_de_w = 0, g_de_h = 0;  // one eye's half
+bool g_de_failed = false;
+std::atomic<uint64_t> g_de_frames{0};
+bool make_deadeye_swapchain(uint32_t iw, uint32_t ih) {
+    if (g_de_sc != XR_NULL_HANDLE) return true;
+    if (g_de_failed || !make_ui_swapchain()) return false;
+    g_de_failed = true;
+    g_de_w = iw / 2;
+    g_de_h = ih / 2;
+    if (g_de_w < 64 || g_de_h < 64) return false;
+    XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    ci.format = static_cast<int64_t>(g_ui_fmt);
+    ci.sampleCount = 1;
+    ci.width = 2 * g_de_w;
+    ci.height = g_de_h;
+    ci.faceCount = 1;
+    ci.arraySize = 1;
+    ci.mipCount = 1;
+    XrResult r = xrCreateSwapchain(g_session, &ci, &g_de_sc);
+    if (XR_FAILED(r)) {
+        log::error("[xr] Dead Eye marks: xrCreateSwapchain -> %s", result_name(g_inst, r));
+        g_de_sc = XR_NULL_HANDLE;
+        return false;
+    }
+    uint32_t ni = 0;
+    xrEnumerateSwapchainImages(g_de_sc, 0, &ni, nullptr);
+    std::vector<XrSwapchainImageD3D12KHR> imgs(ni, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+    xrEnumerateSwapchainImages(g_de_sc, ni, &ni, reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()));
+    for (auto& im : imgs) g_de_images.push_back(im.texture);
+    g_de_failed = false;
+    log::info("[xr] Dead Eye marks swapchain %ux%u (two eyes), %zu images", 2 * g_de_w, g_de_h, g_de_images.size());
+    return true;
+}
+
+bool fill_deadeye(uint32_t iw, uint32_t ih, XrCompositionLayerProjection& layer, XrCompositionLayerProjectionView pv[2]) {
+    deadeye::Mark m[deadeye::kMax];
+    float crop = 0, deg = 0;
+    const int n = deadeye::marks(m, deadeye::kMax, &crop, &deg);
+    if (n <= 0 || !ui_layer::has_ui() || !make_deadeye_swapchain(iw, ih)) return false;
+    body::BodyPoints bp;
+    if (!body::body_points(&bp) || !bp.cam_ok) return false;
+    ui_layer::Sprite sp[2 * deadeye::kMax];
+    int ns = 0;
+    for (int e = 0; e < 2; ++e) {
+        const XrView& v = g_frame_views[e];
+        const float tl = std::tan(v.fov.angleLeft), tr = std::tan(v.fov.angleRight), tu = std::tan(v.fov.angleUp), td = std::tan(v.fov.angleDown);
+        const XrQuaternionf inv = {-v.pose.orientation.x, -v.pose.orientation.y, -v.pose.orientation.z, v.pose.orientation.w};
+        const float ppt = static_cast<float>(g_de_w) / (tr - tl);  // pixels per unit of tangent (about per radian at the centre)
+        float cd = deg * 0.0174532925f * ppt;
+        if (cd < 4.0f) cd = 4.0f;
+        if (crop / cd > 8.0f) cd = crop / 8.0f;  // the box filter's reach
+        const int x0 = static_cast<int>(e * g_de_w), x1 = x0 + static_cast<int>(g_de_w);
+        for (int k = 0; k < n; ++k) {
+            float l[3];
+            if (!camera_lever::world_to_local(bp.cam, m[k].world, l)) continue;
+            const float d[3] = {l[0] - v.pose.position.x, l[1] - v.pose.position.y, l[2] - v.pose.position.z};
+            float c[3];
+            qrot(inv, d, c);
+            if (c[2] > -0.1f) continue;  // behind the eye
+            const float xn = c[0] / -c[2], yn = c[1] / -c[2];
+            const float px = static_cast<float>(x0) + (xn - tl) / (tr - tl) * static_cast<float>(g_de_w);
+            const float py = (tu - yn) / (tu - td) * static_cast<float>(g_de_h);
+            ui_layer::Sprite& t = sp[ns];
+            t.dst[0] = static_cast<int>(std::lround(px - 0.5f * cd));
+            t.dst[1] = static_cast<int>(std::lround(py - 0.5f * cd));
+            t.dst[2] = t.dst[0] + static_cast<int>(std::lround(cd));
+            t.dst[3] = t.dst[1] + static_cast<int>(std::lround(cd));
+            t.scale = crop / std::lround(cd);
+            t.src[0] = m[k].slot[0] - 0.5f * crop;
+            t.src[1] = m[k].slot[1] - 0.5f * crop;
+            if (t.dst[0] < x0) {  // kept in its eye's half
+                t.src[0] += static_cast<float>(x0 - t.dst[0]) * t.scale;
+                t.dst[0] = x0;
+            }
+            if (t.dst[2] > x1) t.dst[2] = x1;
+            if (t.dst[2] > t.dst[0] && t.dst[3] > 0 && t.dst[1] < static_cast<int>(g_de_h)) ++ns;
+        }
+    }
+    uint32_t index = 0;
+    XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    XrSwapchainImageWaitInfo wsi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wsi.timeout = 100000000;
+    if (XR_FAILED(xrAcquireSwapchainImage(g_de_sc, &ai, &index))) return false;
+    const bool ok = XR_SUCCEEDED(xrWaitSwapchainImage(g_de_sc, &wsi)) && index < g_de_images.size() &&
+                    ui_layer::draw_sprites(g_de_images[index], g_ui_fmt, sp, ns);
+    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(g_de_sc, &ri);
+    if (!ok) return false;
+    for (int e = 0; e < 2; ++e) {
+        pv[e] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+        pv[e].pose = g_frame_views[e].pose;
+        pv[e].fov = g_frame_views[e].fov;
+        pv[e].subImage.swapchain = g_de_sc;
+        pv[e].subImage.imageRect = {{static_cast<int32_t>(e * g_de_w), 0}, {static_cast<int32_t>(g_de_w), static_cast<int32_t>(g_de_h)}};
+    }
+    layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    layer.space = g_space;
+    layer.viewCount = 2;
+    layer.views = pv;
+    g_de_frames.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 // A rotation from its axes (unit, right-handed: the matrix's columns x, y, z).
 XrQuaternionf quat_from_axes(const float x[3], const float y[3], const float z[3]) {
     const float m00 = x[0], m10 = x[1], m20 = x[2], m01 = y[0], m11 = y[1], m21 = y[2], m02 = z[0], m12 = z[1], m22 = z[2];
@@ -1258,6 +1371,8 @@ void end_open_frame() {
     XrCompositionLayerQuad ring_quads[holster::kMaxMarkers];
     XrCompositionLayerQuad reticle_quad{XR_TYPE_COMPOSITION_LAYER_QUAD}, reticle2_quad{XR_TYPE_COMPOSITION_LAYER_QUAD},
         lens_quad[2] = {{XR_TYPE_COMPOSITION_LAYER_QUAD}, {XR_TYPE_COMPOSITION_LAYER_QUAD}};
+    XrCompositionLayerProjection de_layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    XrCompositionLayerProjectionView de_pv[2];
     constexpr uint32_t kLayerArray = 16;
     const XrCompositionLayerBaseHeader* layers[kLayerArray] = {reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer)};
     uint32_t nlayers = 1;
@@ -1269,10 +1384,12 @@ void end_open_frame() {
     if (full && !cinema_on) {
         const uint32_t cap = g_max_layers.load(std::memory_order_relaxed) < kLayerArray ? g_max_layers.load(std::memory_order_relaxed) : kLayerArray;
         const int room = static_cast<int>(cap) - static_cast<int>(nlayers) - (wheel::wheel_mode() ? 4 : 3);
-        const int keep = (dual::state().on ? 2 : 1) + (lens ? 2 : 0);  // run 10 item 8: a second reticle only while dual wielding; the scope's lens and mask
+        const bool de = deadeye::enabled();
+        const int keep = (dual::state().on ? 2 : 1) + (lens ? 2 : 0) + (de ? 1 : 0);  // run 10 item 8: a second reticle only while dual wielding; the scope's lens and mask; the Dead Eye X
         const int nr = zone_rings::frame(g_frame_views, g_session, g_space, ring_quads,
                                          room - keep < holster::kMaxMarkers ? room - keep : holster::kMaxMarkers);  // kept for the reticles
         for (int i = 0; i < nr; ++i) layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&ring_quads[i]);
+        if (de && room - nr >= 1 && fill_deadeye(iw, ih, de_layer, de_pv)) layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&de_layer);
         if (room - nr >= 1 && zone_rings::reticle_frame(g_frame_views, g_session, g_space, &reticle_quad))
             layers[nlayers++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&reticle_quad);
         if (room - nr >= 2 && zone_rings::reticle_frame(g_frame_views, g_session, g_space, &reticle2_quad, 1))  // run 10 item 8: dual wield

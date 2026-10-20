@@ -66,6 +66,9 @@ bool aiming();
 // Channel 0's camera is the game's own gameplay camera ([[CamManager +8] +0x18] +0x10 == [CamManager +0x28]): no
 // scripted camera (the anchor's, a shop's, a mission's) is current. False when not read.
 bool gameplay_camera_current();
+// While another hook puts the gameplay camera on channel 0 for one game call (hk_fire; deadeye.cpp's reticle update):
+// gameplay_camera_current() stays false, so the plugin's camera job does not take the swap for the game's own.
+void camera_swap_flag(bool on);
 // [Gestures] ThrowByGrip: hold the grip to hold a throwable, the trigger to start it (the light, the knife by its tip),
 // the grip let go to throw it with the swing. grip_throw_wanted(ctrl): that controller's grip is the throwable's (the
 // gun hand with a throwable in it), not the game's button

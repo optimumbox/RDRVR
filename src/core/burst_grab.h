@@ -2,7 +2,8 @@
 // R4 flicker measurement: K consecutive frames of each eye's post output, a centre crop of the Post FXAA Target,
 // recorded like the eye grab (bind tap on the recording thread, from the state the barrier watch saw in the same list,
 // into readback buffers) and written once the last frame's list has been submitted. A test command, never on in play.
-//   grabburst <prefix> <frames> [crop_w crop_h] [post|scene|vel]
+//   grabburst <prefix> <frames> [crop_w crop_h] [post|scene|vel|scenevel]
+// (scenevel: the scene colour and the motion vectors of the same frames, as "<prefix>-scene-L.rdb" and "<prefix>-vel-L.rdb")
 // The source (taken at the same binds of the post output): the post output (the default), the scene colour
 // (FullScreenCopy, PostFx+0x10: the upscaler's input, render size) or the Velocity RT (PostFx+0x3f0, RG16F: the motion
 // vectors). Writes "<prefix>-L.rdb" and "<prefix>-R.rdb" (double frames; a frame that was not double leaves its slot empty) or

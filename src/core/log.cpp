@@ -105,8 +105,14 @@ void open() {
 
     wchar_t path[MAX_PATH];
     path_in_game_dir(L"RDRVR.log", path, MAX_PATH);
+    // 2026-10-20 (the user: "Make the log start fresh each launch"; a log kept across runs grew past Discord's upload
+    // limit): each run starts a new RDRVR.log, the last run's kept as RDRVR.previous.log (a crash's log, if the game was
+    // started again before it was sent)
+    wchar_t prev[MAX_PATH];
+    path_in_game_dir(L"RDRVR.previous.log", prev, MAX_PATH);
+    MoveFileExW(path, prev, MOVEFILE_REPLACE_EXISTING);
     g_file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     SYSTEMTIME st;
     GetLocalTime(&st);
     char banner[256];

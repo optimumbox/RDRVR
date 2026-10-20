@@ -17,6 +17,7 @@
 #include "core/dual.h"
 #include "core/dual_pass.h"
 #include "core/exit_guard.h"
+#include "core/first_run.h"
 #include "core/burst_grab.h"
 #include "core/align_grab.h"
 #include "core/recorder_skip.h"
@@ -45,6 +46,7 @@
 #include "core/body.h"
 #include "core/holster.h"
 #include "core/aim.h"
+#include "core/deadeye.h"
 #include "core/reload.h"
 #include "core/gestures.h"
 #include "core/hogtie.h"
@@ -124,6 +126,7 @@ DWORD WINAPI bootstrap_thread(void*) {
     log_modules("after MTLX");
 
     config::load();
+    first_run::install();  // [Launcher] FirstRunNotice: before the game makes its window
     // the test of the no-MTLX branch on the Steam exe: from here on as for an executable without the stage (its only
     // difference after the wait is the order check below)
     const bool forced = !no_stage && config::get_bool("Debug", "ForceNoMtlx", false);
@@ -157,6 +160,7 @@ DWORD WINAPI bootstrap_thread(void*) {
     pose::init();
     holster::init();
     aim::init();
+    deadeye::init();
     reload::init();
     audio::init();
     gestures::init();
@@ -193,6 +197,7 @@ DWORD WINAPI bootstrap_thread(void*) {
         body::install();
         holster::install();
         aim::install();
+        deadeye::install();
         dual::install();
         reload::install();
         taa::install();
@@ -210,6 +215,7 @@ void on_process_attach() {
     log::info("[boot] RDRVR core loaded (dinput8 proxy), built %s %s", __DATE__, __TIME__);
     log_modules("DllMain");
     g_mtlx_at_attach = loaded(L"MTLX.dll");
+    first_run::on_process_attach();
     diag::install_crash_handler();
     build_check::log_self_and_game_async();
     if (HANDLE t = CreateThread(nullptr, 0, bootstrap_thread, nullptr, 0, nullptr)) CloseHandle(t);

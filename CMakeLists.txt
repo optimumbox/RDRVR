@@ -34,6 +34,7 @@ add_library(rdrvr_core SHARED
     src/core/anchors.cpp
     src/core/build_check.cpp
     src/core/bootstrap.cpp
+    src/core/first_run.cpp
     src/core/api.cpp
     src/core/hooks.cpp
     src/core/d3d_hooks.cpp
@@ -78,6 +79,7 @@ add_library(rdrvr_core SHARED
     src/core/round_draw.cpp
     src/core/held_prop.cpp
     src/core/aim.cpp
+    src/core/deadeye.cpp
     src/core/reload.cpp
     src/core/gestures.cpp
     src/core/hogtie.cpp

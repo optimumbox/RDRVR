@@ -272,3 +272,10 @@ MiragerDownsample        func   0x678b00 # PostFx vt+0x98 (postfx): the post cha
 # --- 2026-10-12: the audio listeners (research/run12/audio.md)
 AudioUpdateListeners     func   0xde1e60 # (camMtx: the update side's camera, [[CamManager]+8]+0x1d0): the panning listener 0x142c34bf0 (a copy), the volume one 0x142c34bb0, the environment's position; from the main frame (0x1f5954)
 AudioOutputMatrix        func   0xf6baa0 # (voice, send, out): a voice's XAudio2 output matrix from its send's 8 gains (+0x68 sends, 0x28 each: the voice +0, the gains +8, FL FR C LFE BL BR SL SR); a mono voice keeps only the first dst channels (stereo: FL FR, the rear dropped)
+# --- 2026-10-20: the Dead Eye X (deadeye.cpp)
+DeadeyeMarksUi           func   0x394300 # (targeting T, viewport: the camera's +0x150): each tick, each mark (T +0x6050 list) projected into the "DeadeyeLocks" movie's elements (shown by ViewportPointVisible, placed by ScreenToUi)
+MarkWorldPos             func   0x3dcc50 # (mark, out float4): a Dead Eye mark's world point (its actor's bone and offset)
+ViewportPointVisible     func   0x1335d0 # (viewport, point): the viewport's frustum test of a point, bit flags (0 outside)
+ScreenToUi               func   0x6c59f0 # (out, in): screen pixels (the game's frame size) to the UI movies' units
+ReticleHudUpdate         func   0x34bc00 # (player info, ?, T, ?): each tick, the reticle's and Dead Eye's UI (DeadeyeMarksUi among them), only while channel 0's camera ([[CamManager +8] +0x18] +0x10) is the gameplay camera ([CamManager +0x28])
+TargetingUpdate          func   0x39bec0 # (T = player actor +0xb8): each tick, the probe along the aim ray (T +0x3830 origin, +0x3730 direction), the target (T +0x3900), and a Dead Eye mark when painting is asked (T +0x6084)

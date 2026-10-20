@@ -51,9 +51,17 @@ bool has_ui();
 void size(uint32_t* w, uint32_t* h);
 // The whole UI into `dst`, without the UI pixels in `hole` (x0 y0 x1 y1; the wrist HUD's part) when given. Texel for
 // texel when `dst` is the UI's size; smaller (the quad's swapchain capped), box-filtered so text does not alias.
-bool draw_quad(ID3D12Resource* dst, DXGI_FORMAT fmt, const int hole[4] = nullptr, const int hole2[4] = nullptr);
+bool draw_quad(ID3D12Resource* dst, DXGI_FORMAT fmt, const int hole[4] = nullptr, const int hole2[4] = nullptr, const int hole3[4] = nullptr);
 // The wrist HUD: the UI's cw x ch pixels from (x0, y0) into all of `dst` (texel for texel at that size, else filtered).
 // which: 0 the wrist HUD's image (its own list and view), 1 the hand-placed wheel's (run 8 item 5)
 bool draw_crop(ID3D12Resource* dst, DXGI_FORMAT fmt, int x0, int y0, uint32_t cw, uint32_t ch, int which = 0);
 
+// The Dead Eye X (deadeye.cpp): each sprite's destination rect (x0 y0 x1 y1, pixels of `dst`) drawn from the UI target,
+// its corner from UI pixel `src`, `scale` UI pixels a destination pixel (box-filtered); `dst` cleared first.
+struct Sprite {
+    int dst[4];
+    float src[2];
+    float scale;
+};
+bool draw_sprites(ID3D12Resource* dst, DXGI_FORMAT fmt, const Sprite* sp, int n);
 }  // namespace rdrvr::ui_layer

@@ -982,6 +982,8 @@ using Fire_t = void (*)(uintptr_t info, uintptr_t wmgr);
 
 std::atomic<bool> g_fire_swap{false};  // in hk_fire: channel 0 may be on the gameplay camera for its call (not the game's own)
 
+void camera_swap_flag(bool on) { g_fire_swap.store(on, std::memory_order_release); }
+
 bool gameplay_camera_current() {
     if (g_fire_swap.load(std::memory_order_acquire)) return false;
     uintptr_t cm = 0, chs = 0, ch = 0, cur = 0, gp = 0;

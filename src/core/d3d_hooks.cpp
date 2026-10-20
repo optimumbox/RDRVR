@@ -20,6 +20,7 @@
 
 #include "core/anchors.h"
 #include "core/config.h"
+#include "core/first_run.h"
 #include "core/frame_probe.h"
 #include "core/hooks.h"
 #include "core/prepass_arrays.h"
@@ -1328,6 +1329,7 @@ void hook_debug_messages(ID3D12Device* dev) {
 }
 
 HRESULT WINAPI hk_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl, REFIID riid, void** out) {
+    first_run::gate("D3D12CreateDevice");  // [Launcher] FirstRunNotice, if the game's window was made before its hooks
     // [Debug] Dred is load-bearing under single-pass stereo (2026-10-15): without DRED the game's command lists ran
     // D3D12Core code the mod's draw hooks are not on (zero draws seen), so the pre-pass never started and both eyes were
     // drawn two-pass with no error. On whenever [Stereo] ViMain is.

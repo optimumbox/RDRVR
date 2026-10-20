@@ -147,7 +147,7 @@ Texture2D<float4> uiw : register(t1);  // dual: the UI drawn onto white
 // src: the UI pixel drawn at the destination's origin (the wrist HUD's crop); hole, hole2: UI pixels left out (x0 y0
 // x1 y1; the wrist HUD's corner, the hand-placed wheel's rect); scale: UI pixels a destination pixel, size: the UI
 // target's (ps_quad_box only)
-cbuffer K : register(b0) { float gamma; float2 src; float dual; float4 hole; float2 scale; float2 size; float4 hole2; };
+cbuffer K : register(b0) { float gamma; float2 src; float dual; float4 hole; float2 scale; float2 size; float4 hole2; float4 hole3; };
 // premultiplied colour and coverage: dual, black's colour and 1 - (white - black); else colour and sqrt(stored alpha)
 float4 layer(int2 p) {
     float4 u = ui.Load(int3(p, 0));
@@ -157,7 +157,10 @@ float4 layer(int2 p) {
     }
     return float4(u.rgb, sqrt(saturate(u.a)));
 }
-bool cut(int2 p) { return (p.x >= hole.x && p.x < hole.z && p.y >= hole.y && p.y < hole.w) || (p.x >= hole2.x && p.x < hole2.z && p.y >= hole2.y && p.y < hole2.w); }
+bool cut(int2 p) {
+    return (p.x >= hole.x && p.x < hole.z && p.y >= hole.y && p.y < hole.w) || (p.x >= hole2.x && p.x < hole2.z && p.y >= hole2.y && p.y < hole2.w) ||
+           (p.x >= hole3.x && p.x < hole3.z && p.y >= hole3.y && p.y < hole3.w);  // hole3: the Dead Eye X's slots (deadeye.cpp)
+}
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 t = float2((id << 1) & 2, id & 2);
     return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
@@ -222,13 +225,13 @@ ID3D12PipelineState* g_pso_quad_box = nullptr;
 ID3D12PipelineState* g_pso_mirror = nullptr;
 DXGI_FORMAT g_quad_fmt = DXGI_FORMAT_UNKNOWN, g_quad_box_fmt = DXGI_FORMAT_UNKNOWN, g_mirror_fmt = DXGI_FORMAT_UNKNOWN;
 ID3D12DescriptorHeap* g_srv_heap = nullptr;
-ID3D12DescriptorHeap* g_draw_rtv_heap = nullptr;  // [0] the back buffer, [1] the quad image, [2] the wrist image, [3] the wheel's
+ID3D12DescriptorHeap* g_draw_rtv_heap = nullptr;  // [0] the back buffer, [1] the quad image, [2] the wrist image, [3] the wheel's, [4] the marks'
 UINT g_rtv_step = 0;
 ID3DBlob* g_vs = nullptr;
 ID3DBlob* g_ps_quad = nullptr;
 ID3DBlob* g_ps_quad_box = nullptr;
 ID3DBlob* g_ps_mirror = nullptr;
-Draw g_draw_mirror, g_draw_quad, g_draw_wrist, g_draw_wheel;
+Draw g_draw_mirror, g_draw_quad, g_draw_wrist, g_draw_wheel, g_draw_marks;
 ID3D12Fence* g_draw_fence = nullptr;
 HANDLE g_draw_event = nullptr;
 uint64_t g_draw_value = 0;
@@ -302,7 +305,7 @@ bool ensure_draw(ID3D12Device* dev) {
     D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0};
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants = {0, 0, 16};  // gamma, src x y, pad, hole x0 y0 x1 y1, scale x y, size x y, hole2 x0 y0 x1 y1
+    params[0].Constants = {0, 0, 20};  // gamma, src x y, pad, hole x0 y0 x1 y1, scale x y, size x y, hole2 x0 y0 x1 y1, hole3 x0 y0 x1 y1
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable = {1, &range};
@@ -315,10 +318,10 @@ bool ensure_draw(ID3D12Device* dev) {
     if (sig) sig->Release();
     if (err) err->Release();
     D3D12_DESCRIPTOR_HEAP_DESC hs{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-    D3D12_DESCRIPTOR_HEAP_DESC hr{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC hr{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 5, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     ok = ok && SUCCEEDED(dev->CreateDescriptorHeap(&hs, IID_PPV_ARGS(&g_srv_heap))) &&
          SUCCEEDED(dev->CreateDescriptorHeap(&hr, IID_PPV_ARGS(&g_draw_rtv_heap))) && make_draw(dev, g_draw_mirror) &&
-         make_draw(dev, g_draw_quad) && make_draw(dev, g_draw_wrist) && make_draw(dev, g_draw_wheel) &&
+         make_draw(dev, g_draw_quad) && make_draw(dev, g_draw_wrist) && make_draw(dev, g_draw_wheel) && make_draw(dev, g_draw_marks) &&
          SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_draw_fence)));
     if (!ok) {
         log::error("[ui] draw objects not created");
@@ -346,14 +349,16 @@ bool ensure_draw(ID3D12Device* dev) {
 // q: the present queue for the game's back buffer (the mirror), xr::image_queue() for an XR image.
 bool draw_ui(ID3D12CommandQueue* q, Draw& d, ID3D12PipelineState* pso, ID3D12Resource* dst, DXGI_FORMAT view_fmt, D3D12_RESOURCE_STATES dst_state,
              int rtv_slot, float gamma, const float src[2] = nullptr, const int hole[4] = nullptr, const float scale[2] = nullptr,
-             const int hole2[4] = nullptr) {
+             const int hole2[4] = nullptr, const int hole3[4] = nullptr) {
     const bool dual = g_dual_frame.load() && g_b_srv_written.load();
-    const float k[16] = {gamma, src ? src[0] : 0.0f, src ? src[1] : 0.0f, dual ? 1.0f : 0.0f, hole ? static_cast<float>(hole[0]) : 0.0f,
+    const float k[20] = {gamma, src ? src[0] : 0.0f, src ? src[1] : 0.0f, dual ? 1.0f : 0.0f, hole ? static_cast<float>(hole[0]) : 0.0f,
                          hole ? static_cast<float>(hole[1]) : 0.0f, hole ? static_cast<float>(hole[2]) : 0.0f,
                          hole ? static_cast<float>(hole[3]) : 0.0f, scale ? scale[0] : 1.0f, scale ? scale[1] : 1.0f,
                          static_cast<float>(g_w), static_cast<float>(g_h), hole2 ? static_cast<float>(hole2[0]) : 0.0f,
                          hole2 ? static_cast<float>(hole2[1]) : 0.0f, hole2 ? static_cast<float>(hole2[2]) : 0.0f,
-                         hole2 ? static_cast<float>(hole2[3]) : 0.0f};
+                         hole2 ? static_cast<float>(hole2[3]) : 0.0f, hole3 ? static_cast<float>(hole3[0]) : 0.0f,
+                         hole3 ? static_cast<float>(hole3[1]) : 0.0f, hole3 ? static_cast<float>(hole3[2]) : 0.0f,
+                         hole3 ? static_cast<float>(hole3[3]) : 0.0f};
     ID3D12Device* dev = state::device.load();
     if (!q || !dev || !pso) return false;
     int s = d.slot;
@@ -392,7 +397,7 @@ bool draw_ui(ID3D12CommandQueue* q, Draw& d, ID3D12PipelineState* pso, ID3D12Res
     d.list->ResourceBarrier(nb, b);
     d.list->SetGraphicsRootSignature(g_root);
     d.list->SetDescriptorHeaps(1, &g_srv_heap);
-    d.list->SetGraphicsRoot32BitConstants(0, static_cast<UINT>(sizeof(k) / sizeof(k[0])), k, 0);  // all 16 (hole2 too)
+    d.list->SetGraphicsRoot32BitConstants(0, static_cast<UINT>(sizeof(k) / sizeof(k[0])), k, 0);  // all 20 (hole2, hole3 too)
     d.list->SetGraphicsRootDescriptorTable(1, g_srv_heap->GetGPUDescriptorHandleForHeapStart());
     d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     D3D12_RESOURCE_DESC dd = dst->GetDesc();
@@ -628,7 +633,7 @@ ID3D12PipelineState* quad_pso(ID3D12Device* dev, DXGI_FORMAT fmt, bool box) {
     return g_pso_quad;
 }
 
-bool draw_quad(ID3D12Resource* dst, DXGI_FORMAT fmt, const int hole[4], const int hole2[4]) {
+bool draw_quad(ID3D12Resource* dst, DXGI_FORMAT fmt, const int hole[4], const int hole2[4], const int hole3[4]) {
     ID3D12Device* dev = state::device.load();
     if (!has_ui() || !dev || !ensure_draw(dev)) return false;
     const D3D12_RESOURCE_DESC dd = dst->GetDesc();
@@ -636,7 +641,7 @@ bool draw_quad(ID3D12Resource* dst, DXGI_FORMAT fmt, const int hole[4], const in
     const bool box = dd.Width != g_w || dd.Height != g_h;
     const float scale[2] = {static_cast<float>(g_w) / static_cast<float>(dd.Width), static_cast<float>(g_h) / static_cast<float>(dd.Height)};
     bool ok = draw_ui(xr::image_queue(), g_draw_quad, quad_pso(dev, fmt, box), dst, fmt, D3D12_RESOURCE_STATE_RENDER_TARGET, 1, xr_blit::game_gamma(1.0f),
-                      nullptr, hole, box ? scale : nullptr, hole2);
+                      nullptr, hole, box ? scale : nullptr, hole2, hole3);
     if (ok) g_quads.fetch_add(1, std::memory_order_relaxed);
     if (ok && box) g_boxed.fetch_add(1, std::memory_order_relaxed);
     return ok;
@@ -655,6 +660,75 @@ bool draw_crop(ID3D12Resource* dst, DXGI_FORMAT fmt, int x0, int y0, uint32_t cw
     return draw_ui(xr::image_queue(), which ? g_draw_wheel : g_draw_wrist, quad_pso(dev, fmt, box), dst, fmt, D3D12_RESOURCE_STATE_RENDER_TARGET,
                    which ? 3 : 2, xr_blit::game_gamma(1.0f), src,
                    nullptr, box ? scale : nullptr);
+}
+
+// The Dead Eye X (deadeye.cpp): `dst` cleared to transparent, then each sprite's rect drawn from the UI about its slot
+// (the box filter at its scale), in the quad's form (linear premultiplied).
+bool draw_sprites(ID3D12Resource* dst, DXGI_FORMAT fmt, const Sprite* sp, int n) {
+    ID3D12Device* dev = state::device.load();
+    ID3D12CommandQueue* q = xr::image_queue();
+    if (!has_ui() || !dev || !q || !ensure_draw(dev)) return false;
+    ID3D12PipelineState* pso = quad_pso(dev, fmt, true);
+    if (!pso) return false;
+    Draw& d = g_draw_marks;
+    const bool dual = g_dual_frame.load() && g_b_srv_written.load();
+    int s = d.slot;
+    if (g_draw_fence->GetCompletedValue() < d.slot_value[s]) {
+        g_draw_fence->SetEventOnCompletion(d.slot_value[s], g_draw_event);
+        if (WaitForSingleObject(g_draw_event, 50) != WAIT_OBJECT_0) {
+            g_draw_skips.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    if (FAILED(d.alloc[s]->Reset()) || FAILED(d.list->Reset(d.alloc[s], pso))) return false;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_draw_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += 4 * static_cast<SIZE_T>(g_rtv_step);
+    D3D12_RENDER_TARGET_VIEW_DESC rv{};
+    rv.Format = fmt;
+    rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    dev->CreateRenderTargetView(dst, &rv, rtv);
+    D3D12_RESOURCE_BARRIER b[2]{};
+    for (auto& x : b) {
+        x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        x.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        x.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        x.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    }
+    b[0].Transition.pResource = g_ui;
+    b[1].Transition.pResource = g_ui_b;
+    const UINT nb = g_b_ready.load() ? 2 : 1;
+    d.list->ResourceBarrier(nb, b);
+    const float clear[4] = {0, 0, 0, 0};
+    d.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    d.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    d.list->SetGraphicsRootSignature(g_root);
+    d.list->SetDescriptorHeaps(1, &g_srv_heap);
+    d.list->SetGraphicsRootDescriptorTable(1, g_srv_heap->GetGPUDescriptorHandleForHeapStart());
+    d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_RESOURCE_DESC dd = dst->GetDesc();
+    D3D12_VIEWPORT vp{0, 0, static_cast<float>(dd.Width), static_cast<float>(dd.Height), 0, 1};
+    d.list->RSSetViewports(1, &vp);
+    const float gamma = xr_blit::game_gamma(1.0f);
+    for (int i = 0; i < n; ++i) {
+        const Sprite& t = sp[i];
+        const LONG w = static_cast<LONG>(dd.Width), h = static_cast<LONG>(dd.Height);
+        D3D12_RECT sc{t.dst[0] < 0 ? 0 : t.dst[0], t.dst[1] < 0 ? 0 : t.dst[1], t.dst[2] > w ? w : t.dst[2], t.dst[3] > h ? h : t.dst[3]};
+        if (sc.right <= sc.left || sc.bottom <= sc.top) continue;
+        // the box filter's UI point for a destination pixel is src + pixel * scale: the rect's corner on the crop's
+        const float k[20] = {gamma, t.src[0] - static_cast<float>(t.dst[0]) * t.scale, t.src[1] - static_cast<float>(t.dst[1]) * t.scale,
+                             dual ? 1.0f : 0.0f, 0, 0, 0, 0, t.scale, t.scale, static_cast<float>(g_w), static_cast<float>(g_h), 0, 0, 0, 0, 0, 0, 0, 0};
+        d.list->SetGraphicsRoot32BitConstants(0, 20, k, 0);
+        d.list->RSSetScissorRects(1, &sc);
+        d.list->DrawInstanced(3, 1, 0, 0);
+    }
+    for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+    d.list->ResourceBarrier(nb, b);
+    if (FAILED(d.list->Close())) return false;
+    d3d::submit_internal(q, d.list);
+    d.slot_value[s] = ++g_draw_value;
+    q->Signal(g_draw_fence, g_draw_value);
+    d.slot = (s + 1) % kSlots;
+    return true;
 }
 
 bool on_ui_target(ID3D12GraphicsCommandList* cl) { return t_ui_cl == cl && cl && g_redirect.load(std::memory_order_relaxed); }

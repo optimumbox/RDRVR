@@ -31,6 +31,7 @@
 #include "core/game_hooks.h"
 #include "core/holster.h"
 #include "core/aim.h"
+#include "core/deadeye.h"
 #include "core/reload.h"
 #include "core/actions.h"
 #include "core/dlss.h"
@@ -368,8 +369,8 @@ std::string execute(const std::vector<std::string>& t) {
         return st;
     }
     if (c == "lumcheck") return lum_check::run(t.size() >= 2 ? std::atoi(t[1].c_str()) : 8);
-    if (c == "grabburst" && t.size() >= 3) {  // grabburst <prefix> <frames> [crop_w crop_h] [post|scene|vel]
-        const int src = t.size() >= 6 ? (t[5] == "scene" ? 1 : t[5] == "vel" ? 2 : 0) : 0;
+    if (c == "grabburst" && t.size() >= 3) {  // grabburst <prefix> <frames> [crop_w crop_h] [post|scene|vel|scenevel]
+        const int src = t.size() >= 6 ? (t[5] == "scene" ? 1 : t[5] == "vel" ? 2 : t[5] == "scenevel" ? 3 : 0) : 0;
         return burst_grab::grab(t[1], std::atoi(t[2].c_str()), t.size() >= 5 ? std::atoi(t[3].c_str()) : 640,
                                 t.size() >= 5 ? std::atoi(t[4].c_str()) : 360, 10000, src);
     }
@@ -473,6 +474,11 @@ std::string execute(const std::vector<std::string>& t) {
         std::string line;
         for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
         return body::command(line);
+    }
+    if (c == "deadeye") {
+        std::string line;
+        for (size_t i = 0; i < t.size(); ++i) line += (i ? " " : "") + t[i];
+        return deadeye::command(line);
     }
     if (c == "aim") {
         std::string line;
