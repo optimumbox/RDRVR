@@ -440,6 +440,29 @@ bool in_module(const void* p, HMODULE m) {
     return p && m && VirtualQuery(p, &mbi, sizeof(mbi)) && mbi.AllocationBase == m;
 }
 
+// A slot's value the mod can chain to: sl.interposer.dll's own export, or another module's hook already in the slot (a
+// DLSS add-on that patched the game's imports first, e.g. Cheeky Foveated DLSS; its hook calls on to sl.interposer, and
+// swap_slot keeps it as the original). Refused: nothing committed behind it, not a module image, not executable, the
+// mod's own (the slots swapped twice) or RDR.exe's (an import not yet resolved). owner: the module's file name, for the
+// log (empty for sl.interposer itself)
+bool chainable(const void* p, HMODULE sl, char* owner, size_t n) {
+    owner[0] = '\0';
+    if (in_module(p, sl)) return true;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!p || !VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT || mbi.Type != MEM_IMAGE) return false;
+    constexpr DWORD kExec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (!(mbi.Protect & kExec)) return false;
+    HMODULE self = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCSTR>(&chainable), &self);
+    if (mbi.AllocationBase == self || mbi.AllocationBase == GetModuleHandleW(nullptr)) return false;
+    char path[MAX_PATH] = "";
+    GetModuleFileNameA(static_cast<HMODULE>(mbi.AllocationBase), path, MAX_PATH);
+    const char* base = std::strrchr(path, '\\');
+    std::snprintf(owner, n, "%s", base ? base + 1 : (path[0] ? path : "an unnamed module"));
+    return true;
+}
+
 template <typename Fn>
 bool swap_slot(uintptr_t slot, Fn mine, Fn* orig) {
     DWORD old = 0;
@@ -467,12 +490,16 @@ bool ensure() {
                     s_consts = anchors::addr(Id::SlSetConstantsSlot), s_free = anchors::addr(Id::SlFreeResourcesSlot);
     if (!sl || !d || !opts) return false;  // not yet: the next frame tries again
     for (uintptr_t s : {s_tag, s_eval, s_consts, s_free}) {
-        if (!in_module(*reinterpret_cast<void**>(s), sl)) {
+        char owner[MAX_PATH];
+        if (!chainable(*reinterpret_cast<void**>(s), sl, owner, sizeof(owner))) {
             given_up = true;
-            log::error("[dlss] per-eye DLSS refused: the import slot %p does not point into sl.interposer.dll (%p)", reinterpret_cast<void*>(s),
-                       *reinterpret_cast<void**>(s));
+            log::error("[dlss] per-eye DLSS refused: the import slot %p holds %p, neither sl.interposer.dll nor another module's code",
+                       reinterpret_cast<void*>(s), *reinterpret_cast<void**>(s));
             return false;
         }
+        if (owner[0])
+            log::info("[dlss] the import slot %p already hooked by %s (%p): the mod's hook chains to it", reinterpret_cast<void*>(s), owner,
+                      *reinterpret_cast<void**>(s));
     }
     std::memcpy(g_vp1, d + kViewport, kViewportSize);
     const uint32_t v0 = *reinterpret_cast<uint32_t*>(g_vp1 + kViewportValue);

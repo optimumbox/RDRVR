@@ -24,6 +24,7 @@
 #include "core/menu.h"
 #include "core/pose.h"
 #include "core/reload.h"
+#include "core/round_draw.h"
 #include "core/whistle.h"
 
 namespace rdrvr::actions {
@@ -52,12 +53,43 @@ std::atomic<bool> g_breech_flick{true};
 bool g_breech_by_flick = false;  // the breech's state last set by a flick: drawn eased toward it
 // [Reload] SemiAutoParts (off; run 6 item 9h): the Semi-Auto Shotgun's bolt racked by the off hand after a load from empty
 std::atomic<bool> g_semi_parts{false};
+// [Reload] PistolMagazines (on; 2026-10-20, the user: "Instead of bullets, the game needs to be able to grab the gun's
+// magazine, insert it into the bottom of the grip, then pull back the slide to cock the gun. Also when a pistol is
+// equipped, right stick down lets you drop the mag ... I don't want this to waste bullets from the dropped mag"): the
+// Semi-Auto, the High Power and the Mauser take no single rounds. A flick of the stick down drops the magazine (the
+// gun will not fire without one); the other hand takes a full one at the chest and pushes it up into the grip's bottom
+// (holster.cpp, the gun's loading ring there); then the slide is racked by the other hand as the Semi-Auto Shotgun's
+// bolt is. The dropped magazine's rounds are not lost: the game's count keeps them and the new magazine only adds what
+// the gun lacks from the spare rounds.
+std::atomic<bool> g_mags{true};
+std::atomic<bool> g_mag_in{true};  // the gun in hand's magazine in it (a pistol's; set at each draw)
+// 2026-10-20: a round left in the chamber as the magazine drops (the gun not empty, its slide not waiting): one shot
+// with the magazine out, and a magazine put in after it needs no rack while that round is still there
+bool g_mag_chamber = false;
+std::atomic<uint64_t> g_mag_drops{0}, g_mag_inserts{0};
+// 2026-10-20: the Mauser (kClip) has no magazine to drop: its own is fixed in front of the trigger guard and is loaded
+// from the top through the open action, as the real C96. A flick of the right stick down pulls its bolt back and holds
+// it there (the last round's shot holds it back too); a 10-round stripper clip from the chest is pushed down into the
+// top of the gun while it is back (one clip an opening: its rounds what the gun lacks, the rest kept in the spare
+// count); another flick down shuts the bolt, a round chambered, and the empty clip falls away. One hand: no slide to
+// rack, and the stick's up is the camera's as on every gun.
+bool g_clip_open = false, g_clip_strip = false;  // the bolt held back; a clip stripped in during this opening
+std::atomic<bool> g_clip_room{false};            // a clip goes in now (the bolt back, room, spare rounds, none in yet)
+float g_clip_drawn = 0.0f;
+int g_clip_left = 0;  // the seated clip's rounds that did not go in (there was no room for them)
+bool g_clip_grip_open = false;  // the bolt was held back when the hand took it (let go then, it goes forward)
+// the Mauser's clip guide (2026-10-20): from the muzzle (the weapon's MuzzleOffset) back to the breech and a little up,
+// in the gun's frame (m: y up, z back); the C96's barrel is 140 mm
+constexpr float kMauserGuideBack = 0.150f, kMauserGuideUp = 0.010f;
+// the pistols' own slide (the High Power's) and bolt (the Mauser's) drawn by the mod (body.cpp's kGunModels)
+std::atomic<float> g_slide_amt{0.0f};
+std::atomic<int> g_slide_weapon{-1};
 float g_break_deg = kBreakOpenDeg;  // the barrels' opening (the game's reload: 31 held, 33.5 at the swing's end; round 13: 45)
 float g_barrel_r = 0.15f;          // [Reload] BarrelGripRadius: the off hand within this of the open barrels takes them
 const float kHingeAlong = 0.10f;   // the hinge from the gun hand's wrist: along the barrel, up (m; the loading point's)
 const float kHingeUp = 0.03f;
 
-enum Kind { kNone, kRevolver, kTopBreak, kBolt, kLever, kPump, kBreak, kBreech, kSemi };
+enum Kind { kNone, kRevolver, kTopBreak, kBolt, kLever, kPump, kBreak, kBreech, kSemi, kMag, kClip };
 Kind kind_of(int w) {
     switch (w) {
         case 4: case 6: case 7: return kRevolver;  // the Cattleman, the Double-Action, the LeMat (a loading gate)
@@ -68,16 +100,18 @@ Kind kind_of(int w) {
         case 15: case 16: return kBreak;           // the Sawed-off, the Double-barrel
         case 12: case 14: case 19: return kBreech;  // the Springfield, the Buffalo, the Rolling Block (single shots)
         case 18: return kSemi;                     // the Semi-Auto Shotgun
+        case 1: case 2: return kMag;               // the Semi-Auto, the High Power (a magazine in the grip)
+        case 3: return kClip;                      // the Mauser (a stripper clip from the top)
         default: return kNone;
     }
 }
 const char* kind_name(Kind k) {
-    static const char* const n[] = {"none", "revolver", "top-break", "bolt", "lever", "pump", "break", "breech", "semi-auto"};
+    static const char* const n[] = {"none", "revolver", "top-break", "bolt", "lever", "pump", "break", "breech", "semi-auto", "pistol", "Mauser"};
     return n[k];
 }
 bool kind_on(Kind k) {
     return (k == kRevolver || k == kTopBreak) ? g_revolver.load() : k == kBolt ? g_bolt.load() : k == kLever ? g_lever.load() : k == kPump ? g_pump.load()
-         : k == kBreak ? g_break.load() : k == kBreech ? g_breech_parts.load() : k == kSemi ? g_semi_parts.load() : false;
+         : k == kBreak ? g_break.load() : k == kBreech ? g_breech_parts.load() : k == kSemi ? g_semi_parts.load() : (k == kMag || k == kClip) ? g_mags.load() : false;
 }
 bool opens(Kind k) { return k == kRevolver || k == kTopBreak || k == kBreak; }  // opened by the stick, loaded only open
 
@@ -201,6 +235,39 @@ float g_breech_s0 = 0.0f, g_breech_d = 1e9f, g_breech_zone[3] = {};
 // prop's bolt never moves in any of the game's clips, so its travel is the mod's: 65 mm, the Auto-5's it copies
 constexpr float kSemiTravel = 0.065f;
 const float kSemiHandle[3] = {0.030f, 0.074f, -0.035f};  // the handle in the gun's frame: right of the bolt's bind origin
+// PistolMagazines: the slide's rear (its grip serrations) in the gun's frame, above the web of the gun hand, and its travel
+constexpr float kSlideTravel = 0.035f;
+constexpr float kSlideTravelHP = 0.0328f;  // the High Power's: its fire clip's full travel ("skel parts", bone 1)
+constexpr float kPistolGripR = 0.10f;      // the pistols' slide (toggle) zone's radius (m)
+// the Semi-Auto pistol's toggle (its fire clip, "skel parts" 2026-10-20): the rear link (bone 1) turned up about its
+// hinge on the frame; the knee (where the knobs are) shared with the front link (bone 2, within 0.3 mm in every frame),
+// which the game turns by its own curve of the rear link's angle. The knee's pull: its chord (up, back), its length
+const float kToggleHinge[3] = {0.0f, 0.0669f, 0.1126f}, kToggleKnee[3] = {0.0f, 0.0710f, 0.0835f};
+const float kTogglePull[3] = {0.0f, 0.7510f, 0.6603f};
+constexpr float kToggleTravel = 0.0323f;
+// the knee as drawn at the toggle's amount a (0 shut, 1 at the fire clip's top), the front link's turn (degrees)
+void toggle_pose(float a, float knee[3], float* front_deg) {
+    const float th = a * kToggleDeg * 0.0174532925f, c = std::cos(th), s = std::sin(th);
+    const float ry = kToggleKnee[1] - kToggleHinge[1], rz = kToggleKnee[2] - kToggleHinge[2];
+    knee[0] = 0.0f;
+    knee[1] = kToggleHinge[1] + c * ry - s * rz;
+    knee[2] = kToggleHinge[2] + s * ry + c * rz;
+    // the front link's turn against the rear link's, the game's clip at 0, 24.6, 59.3 and 66.6 degrees
+    static const float kAt[4][2] = {{0.0f, 0.0f}, {24.6f, -15.36f}, {59.3f, -32.24f}, {66.6f, -30.47f}};
+    const float d = a * kToggleDeg;
+    *front_deg = kAt[3][1];
+    for (int i = 0; i < 3; ++i)
+        if (d <= kAt[i + 1][0]) {
+            const float t = (d - kAt[i][0]) / (kAt[i + 1][0] - kAt[i][0]);
+            *front_deg = kAt[i][1] + t * (kAt[i + 1][1] - kAt[i][1]);
+            break;
+        }
+}
+const float kSlideHandle[3] = {0.0f, 0.045f, 0.030f};
+// the Mauser's bolt ears (its rear, above the hammer; the pistols' wide zone around them) and the bolt's travel back
+// (its fire clip: 20.5 mm)
+const float kMauserEars[3] = {0.0f, 0.050f, 0.040f};
+constexpr float kMauserTravel = 0.0205f;
 std::atomic<float> g_semi_amt{0.0f};
 std::atomic<int> g_semi_weapon{-1};
 std::atomic<bool> g_semi_want[2] = {false, false};
@@ -213,7 +280,7 @@ float g_semi_s0 = 0.0f, g_semi_d = 1e9f, g_semi_zone[3] = {};
 // player's (the design for every gun: the parts drawn from the gesture, the game's own cycling gone, its sounds on
 // the player's steps).
 constexpr uint32_t kSoundAt = 0x05BC72D7;
-enum SoundGate { kGateLeverParts, kGateOpenCylinder, kGateManualBreak, kGatePumpParts, kGateBoltParts, kGateBreechParts, kGateSemiParts };
+enum SoundGate { kGateLeverParts, kGateOpenCylinder, kGateManualBreak, kGatePumpParts, kGateBoltParts, kGateBreechParts, kGateSemiParts, kGateMags };
 struct GunSounds {
     int weapon;
     SoundGate gate;
@@ -261,6 +328,10 @@ const GunSounds kGunSounds[] = {
     {14, kGateBreechParts, "ARMOR_HORSE_HVY_MASTER", "RIFLE_COCK_FIRE_MASTER", "RIFLE_INSERT_BULLET_LOUD_MASTER", nullptr},
     // run 6 item 9h: the Semi-Auto Shotgun (rifle_sem): racked back, forward (with the bolt's close), a shell into its tube
     {18, kGateSemiParts, "SHOTGUN_PUMP1_REM_MASTER", "SHOTGUN_PUMP2_REM_MASTER", "SHOTGUN_SHELL_DBLE_INSERT_MASTER", "RIFLE_BOLT_CLOSE2_MASTER"},
+    // PistolMagazines: the slide back and forward (the High Power's action strokes), the magazine in (insert) and out (open2)
+    {1, kGateMags, "PISTOL_ACTION1_HIPWR_MASTER", "PISTOL_ACTION2_HIPWR_MASTER", "REVOLVER_CHAMBER_IN_MASTER", nullptr, "REVOLVER_CHAMBER_OUT_MASTER"},
+    {2, kGateMags, "PISTOL_ACTION1_HIPWR_MASTER", "PISTOL_ACTION2_HIPWR_MASTER", "REVOLVER_CHAMBER_IN_MASTER", nullptr, "REVOLVER_CHAMBER_OUT_MASTER"},
+    {3, kGateMags, "PISTOL_ACTION1_HIPWR_MASTER", "PISTOL_ACTION2_HIPWR_MASTER", "REVOLVER_CHAMBER_IN_MASTER", nullptr, "REVOLVER_CHAMBER_OUT_MASTER"},
 };
 std::mutex g_sound_mutex;       // the frame end's actions and the holsters' loads (one thread today; cheap)
 uint64_t g_sound_req[16] = {};  // their results, collected (the result map clears everyone's at 4096)
@@ -301,6 +372,7 @@ const GunSounds* gun_sounds(int weapon) {  // the gun's sounds while its switch 
                         : g.gate == kGateBoltParts    ? g_bolt_parts.load(std::memory_order_relaxed)
                         : g.gate == kGateBreechParts  ? g_breech_parts.load(std::memory_order_relaxed)
                         : g.gate == kGateSemiParts    ? g_semi_parts.load(std::memory_order_relaxed)
+                        : g.gate == kGateMags         ? g_mags.load(std::memory_order_relaxed)
                                                       : g_open_cyl.load(std::memory_order_relaxed);
         return on ? &g : nullptr;
     }
@@ -380,6 +452,13 @@ void reset_gun(int w, float clip) {
     g_breech_hammer.store(1.0f, std::memory_order_relaxed);
     g_semi_grip = g_semi_back = false;
     g_semi_amt.store(0.0f, std::memory_order_relaxed);
+    g_mag_in.store(true, std::memory_order_relaxed);
+    g_mag_chamber = false;
+    g_clip_open = kind_of(w) == kClip && clip >= 0.0f && clip < 0.5f;  // drawn empty: its bolt held back
+    g_clip_strip = false;
+    g_clip_left = 0;
+    g_clip_drawn = g_clip_open ? 1.0f : 0.0f;
+    if (g_clip_open) g_semi_amt.store(1.0f, std::memory_order_relaxed);
     g_pump_have = g_pump_back = false;
     g_lever_down_ms = 0;
     g_lever_open = g_hammer_down = false;
@@ -421,6 +500,9 @@ void frame() {
         g_rifle_pend.store(false, std::memory_order_relaxed);
         g_semi_weapon.store(-1, std::memory_order_relaxed);
         g_semi_want[0] = g_semi_want[1] = false;
+        g_slide_weapon.store(-1, std::memory_order_relaxed);
+        g_slide_amt.store(0.0f, std::memory_order_relaxed);
+        g_clip_room = false;
         g_barrel_want[0] = g_barrel_want[1] = false;
         g_break_open = false;
         g_open_amt.store(0.0f, std::memory_order_relaxed);
@@ -467,6 +549,15 @@ void frame() {
             log::info("[actions] %s (%d): shot, the %s needs working (clip %.0f/%.0f)", kind_name(k), w,
                       k == kBolt ? "bolt" : k == kLever ? "lever" : "pump", st.clip, st.clip_max);
         }
+        if (k == kMag && !g_mag_in.load(std::memory_order_relaxed) && g_mag_chamber) {  // the chambered round, the magazine out
+            g_mag_chamber = false;
+            log::info("[actions] pistol (%d): the chambered round fired with the magazine out: put one in and rack the slide", w);
+        }
+        if (k == kClip && st.clip < 0.5f && !deadeye) {  // the Mauser's last round: its bolt held back
+            g_clip_open = true;
+            g_clip_strip = false;
+            log::info("[actions] Mauser (%d): the last round fired, the bolt held back (spare %.0f)", w, st.spare);
+        }
         if (k == kBreech && !deadeye) {  // a single shot: the spent case in the chamber, whatever the game's count
             g_needs = true;
             g_breech_round.store(false, std::memory_order_relaxed);
@@ -500,6 +591,61 @@ void frame() {
         g_open = false;
         g_lever_open = g_hammer_down = false;
     }
+    // PistolMagazines: the stick's flick drops the magazine (its rounds stay in the game's count)
+    bool mag_dropped = false;
+    if (k == kMag && !deadeye) {
+        if (g_open_req.exchange(false) && g_mag_in.load(std::memory_order_relaxed) && !menu::visible()) {
+            g_mag_in.store(false, std::memory_order_relaxed);
+            g_mag_chamber = st.clip >= 0.5f && !g_needs;
+            g_mag_drops.fetch_add(1, std::memory_order_relaxed);
+            mag_dropped = true;
+            controllers::pulse(gun_h, 0.5f, 15);
+            if (const GunSounds* gs = gun_sounds(w); gs && gh.valid) {
+                float at[3];
+                if (body_hand(gun_h, at)) play_at(gs->open2, at);
+            }
+            log::info("[actions] pistol (%d): the magazine dropped by the stick (its %.0f rounds kept)%s, spare %.0f", w, st.clip,
+                      g_mag_chamber ? ", a round left in the chamber" : "", st.spare);
+        }
+    }
+    // the Mauser, as the C96: the other hand pulls the bolt back by its ears (the sparts below; an empty magazine's
+    // follower holds it back), a clip from the chest goes into the guide on top and stays there; a flick down pulls the
+    // clip out and the bolt goes forward, chambering a round
+    bool clip_shut = false;
+    int clip_left = 0;  // the falling clip's rounds
+    if (k == kClip && !deadeye) {
+        const bool flick = g_open_req.exchange(false) && !menu::visible();
+        if (flick && !g_clip_strip && g_clip_open && st.clip >= 0.5f) {  // no clip in: the bolt let forward on the rounds there
+            g_clip_open = false;
+            g_needs = false;
+            controllers::pulse(gun_h, 0.7f, 20);
+            float at[3];
+            if (const GunSounds* gs = gun_sounds(w); gs && gh.valid && body_hand(gun_h, at)) {
+                play_at(gs->close, at);
+                play_at(gs->close2, at);
+            }
+            log::info("[actions] Mauser (%d): the bolt let forward by the stick, a round chambered (clip %.0f/%.0f)", w, st.clip, st.clip_max);
+        } else if (flick && g_clip_strip) {
+            clip_shut = true;
+            clip_left = g_clip_left;
+            g_clip_strip = false;
+            g_clip_left = 0;
+            controllers::pulse(gun_h, 0.7f, 20);
+            float at[3];
+            if (g_clip_open) {
+                g_clip_open = false;
+                g_needs = false;
+                if (const GunSounds* gs = gun_sounds(w); gs && gh.valid && body_hand(gun_h, at)) {
+                    play_at(gs->close, at);
+                    play_at(gs->close2, at);
+                }
+            }
+            log::info("[actions] Mauser (%d): the clip pulled out by the stick (%d rounds left on it), the bolt forward: %s (clip %.0f/%.0f)", w,
+                      clip_left, st.clip >= 0.5f ? "a round chambered" : "empty", st.clip, st.clip_max);
+        }
+    }
+    g_clip_room.store(k == kClip && !deadeye && g_clip_open && !g_clip_strip && st.clip + 0.5f <= st.clip_max && st.spare >= 1.0f,
+                      std::memory_order_relaxed);
     // revolvers (and the break action): open by the stick flick (filter_stick), close by a flick of the gun hand
     if (opens(k) && !deadeye) {
         // run 7 item 5: a flick while the menu is open is the menu's (its stick scrolls the page): taken, nothing opened
@@ -533,7 +679,7 @@ void frame() {
                           g_w[2], g_w[1], g_w[0], (now - g_open_ms) * 0.001, st.clip, st.clip_max);
             }
         }
-    } else {
+    } else if (k != kMag && k != kClip && !(k == kLever && w == 0)) {  // (the Volcanic's: its lever, below)
         g_open_req = false;
         g_open = false;
     }
@@ -839,13 +985,24 @@ void frame() {
     }
     g_breech_amt.store(brz ? bdrawn : 0.0f, std::memory_order_relaxed);
     g_breech_weapon.store(brz ? w : -1, std::memory_order_relaxed);
-    // [Reload] SemiAutoParts: the bolt racked by the off hand
-    const bool sparts = k == kSemi;
+    // [Reload] SemiAutoParts: the bolt racked by the off hand; PistolMagazines: a pistol's slide, the same way
+    const bool sparts = k == kSemi || k == kMag || k == kClip;
+    // 2026-10-20: the Semi-Auto pistol is a toggle lock: its knobs at the knee pinched and pulled up and back, the
+    // toggle drawn as the game's own fire clip folds it (toggle_pose)
+    const bool toggle = k == kMag && w == 1;
+    const float* const s_handle = k == kMag ? kSlideHandle : k == kClip ? kMauserEars : kSemiHandle;
+    const float s_travel = toggle ? kToggleTravel : k == kMag ? (w == 2 ? kSlideTravelHP : kSlideTravel) : k == kClip ? kMauserTravel : kSemiTravel;
+    // a pistol's grip zone: wider than a long gun's (the user: easy to take; no two-handed hold on a pistol to take it)
+    const float s_r = k == kMag || k == kClip ? kPistolGripR : g_bolt_r;
     float sdrawn = sparts ? g_semi_amt.load(std::memory_order_relaxed) : 0.0f;
     g_semi_want[0] = g_semi_want[1] = false;
     bool chamber = false;
     if (sparts && !deadeye && pts && bp.hand_ok[gj] && bp.hand_ok[oj]) {
-        const float hz[3] = {kSemiHandle[0], kSemiHandle[1], kSemiHandle[2] + sdrawn * kSemiTravel};  // the handle as drawn
+        float hz[3] = {s_handle[0], s_handle[1], s_handle[2] + sdrawn * s_travel};  // the handle as drawn
+        if (toggle) {
+            float th2;
+            toggle_pose(sdrawn, hz, &th2);
+        }
         std::memcpy(g_semi_hz, hz, sizeof(g_semi_hz));
         for (int i = 0; i < 3; ++i)
             g_semi_zone[i] = bp.gun_frame_ok ? bp.gun_frame_o[i] + bp.gun_frame_R[i * 3] * hz[0] + bp.gun_frame_R[i * 3 + 1] * hz[1] + bp.gun_frame_R[i * 3 + 2] * hz[2]
@@ -853,24 +1010,31 @@ void frame() {
         const float* oh = ogb;
         const float dx = oh[0] - g_semi_zone[0], dy = oh[1] - g_semi_zone[1], dz = oh[2] - g_semi_zone[2];
         g_semi_d = std::sqrt(dx * dx + dy * dy + dz * dz);
-        const bool in = g_semi_d < g_bolt_r;
+        const bool in = g_semi_d < s_r;
         const bool grip = hands::get(off_h).grip > 0.6f;
-        const float s = -((oh[0] - bp.hand[gj][0]) * u[0] + (oh[1] - bp.hand[gj][1]) * u[1] + (oh[2] - bp.hand[gj][2]) * u[2]);  // back
+        float pw[3];  // the pull: back along the barrel; the toggle's knee up and back (its chord, the gun's frame)
+        for (int i = 0; i < 3; ++i)
+            pw[i] = !toggle ? -u[i]
+                  : bp.gun_frame_ok ? bp.gun_frame_R[i * 3 + 1] * kTogglePull[1] + bp.gun_frame_R[i * 3 + 2] * kTogglePull[2]
+                                    : up[i] * kTogglePull[1] - u[i] * kTogglePull[2];
+        const float s = (oh[0] - bp.hand[gj][0]) * pw[0] + (oh[1] - bp.hand[gj][1]) * pw[1] + (oh[2] - bp.hand[gj][2]) * pw[2];
         g_semi_want[off_h] = in || g_semi_grip;
         if (grip && !g_semi_grip_was && in) {
             g_semi_grip = true;
-            g_semi_s0 = s - sdrawn * kSemiTravel;
+            g_clip_grip_open = k == kClip && g_clip_open;
+            g_semi_s0 = s - sdrawn * s_travel;
             controllers::pulse(off_h, 0.35f, 25);
-            log::info("[actions] semi-auto (%d): the bolt gripped (%.3f m from its handle)%s", w, g_semi_d, g_needs ? "" : ", a shell already in");
+            log::info("[actions] %s (%d): the %s gripped (%.3f m from its handle)%s", kind_name(k), w, toggle ? "toggle" : k == kMag ? "slide" : "bolt", g_semi_d,
+                      g_needs ? "" : ", a round already in");
         }
         if (g_semi_grip && grip) {
-            const float b = (s - g_semi_s0) / kSemiTravel;
+            const float b = (s - g_semi_s0) / s_travel;
             sdrawn = b < 0.0f ? 0.0f : b > 1.0f ? 1.0f : b;
             if (!g_semi_back && sdrawn >= 0.9f) {
                 g_semi_back = true;
                 if (const GunSounds* gs = gun_sounds(w)) play_at(gs->open, oh);
                 controllers::pulse(off_h, 0.5f, 15);
-                log::info("[actions] semi-auto (%d): the bolt back", w);
+                log::info("[actions] %s (%d): the %s back", kind_name(k), w, toggle ? "toggle" : k == kMag ? "slide" : "bolt");
             } else if (g_semi_back && sdrawn <= 0.2f) {
                 chamber = true;  // pushed forward
             }
@@ -885,6 +1049,26 @@ void frame() {
         g_semi_grip_was = hands::get(off_h).grip > 0.6f;
         if (sparts && g_semi_back) chamber = true;
     }
+    if (chamber && k == kClip) {  // the Mauser's bolt let go back
+        // an empty magazine's follower holds the bolt back; pulled back from shut with room for rounds (and spare ones),
+        // it stays back too for a clip to go in (the real gun's held there by the thumb); taken while back, it goes forward
+        const bool room = st.clip + 0.5f <= st.clip_max && st.spare >= 1.0f;
+        if (!g_clip_strip && (st.clip < 0.5f || (room && !g_clip_grip_open))) {
+            g_semi_back = false;
+            chamber = false;
+            if (!g_clip_open)
+                log::info("[actions] Mauser (%d): the bolt held back (clip %.0f/%.0f, spare %.0f): a clip in from the chest", w, st.clip, st.clip_max, st.spare);
+            g_clip_open = true;
+        } else {
+            g_clip_open = false;
+            if (g_clip_strip) {  // the bolt going forward pushes the clip out of its guide
+                clip_shut = true;
+                clip_left = g_clip_left;
+                g_clip_strip = false;
+                g_clip_left = 0;
+            }
+        }
+    }
     if (chamber) {
         g_semi_back = false;
         float at[3];
@@ -895,16 +1079,45 @@ void frame() {
         controllers::pulse(gun_h, 0.6f, 20);
         if (g_needs) g_cycles.fetch_add(1, std::memory_order_relaxed);
         g_needs = false;
-        log::info("[actions] semi-auto (%d): the bolt forward, a shell chambered", w);
+        log::info("[actions] %s (%d): the %s forward, a round chambered", kind_name(k), w, toggle ? "toggle" : k == kMag ? "slide" : "bolt");
     }
-    if (sparts && !g_semi_grip) {  // not held: it springs shut (40 ms)
+    if (sparts && !g_semi_grip) {  // not held: it springs shut (40 ms); the Mauser's held back stays back
         static double last = 0;
         const float step = last > 0 ? static_cast<float>((now - last) / 40.0) : 1.0f;
         last = now;
-        sdrawn = sdrawn - step < 0.0f ? 0.0f : sdrawn - step;
+        sdrawn = k == kClip && g_clip_open ? std::fmin(sdrawn + step, 1.0f) : sdrawn - step < 0.0f ? 0.0f : sdrawn - step;
     }
     g_semi_amt.store(sparts ? sdrawn : 0.0f, std::memory_order_relaxed);
-    g_semi_weapon.store(sparts ? w : -1, std::memory_order_relaxed);
+    g_semi_weapon.store(k == kSemi ? w : -1, std::memory_order_relaxed);  // (the drawn bolt: the shotgun's model only)
+    g_clip_drawn = k == kClip ? sdrawn : 0.0f;
+    g_slide_amt.store(k == kMag || k == kClip ? sdrawn : 0.0f, std::memory_order_relaxed);
+    g_slide_weapon.store(k == kMag || k == kClip ? w : -1, std::memory_order_relaxed);
+    if (mag_dropped && pts && bp.hand_ok[gj]) {  // the magazine seen falling from the grip's bottom, upright
+        float pz[12];
+        for (int i = 0; i < 3; ++i) {  // upright in the gun (its axes when drawn)
+            pz[i] = bp.gun_frame_ok ? bp.gun_frame_R[i * 3] : rgt[i];
+            pz[3 + i] = bp.gun_frame_ok ? bp.gun_frame_R[i * 3 + 1] : up[i];
+            pz[6 + i] = bp.gun_frame_ok ? bp.gun_frame_R[i * 3 + 2] : rgt[(i + 1) % 3] * up[(i + 2) % 3] - rgt[(i + 2) % 3] * up[(i + 1) % 3];
+        }
+        float well[3];
+        mag_well(bp, w, well);
+        const MagSpec ms = mag_spec(w);
+        for (int i = 0; i < 3; ++i) pz[9 + i] = well[i] - pz[3 + i] * ms.length;
+        round_draw::drop_mag(pz, ms.family);
+    }
+    if ((clip_shut || (k == kClip && g_clip_strip)) && pts && bp.hand_ok[gj]) {  // the Mauser's clip in its guide on top, or falling from it
+        float pz[12];
+        for (int i = 0; i < 3; ++i) {  // upright in the gun (its axes when drawn), the rounds pointing forward
+            pz[i] = bp.gun_frame_ok ? bp.gun_frame_R[i * 3] : rgt[i];
+            pz[3 + i] = bp.gun_frame_ok ? bp.gun_frame_R[i * 3 + 1] : up[i];
+            pz[6 + i] = bp.gun_frame_ok ? bp.gun_frame_R[i * 3 + 2] : rgt[(i + 1) % 3] * up[(i + 2) % 3] - rgt[(i + 2) % 3] * up[(i + 1) % 3];
+        }
+        mag_well(bp, w, pz + 9);
+        if (clip_shut)
+            round_draw::drop_mag(pz, 6, clip_left);  // (the clip, with the rounds that did not go in)
+        else
+            round_draw::seat_clip(pz, g_clip_left);
+    }
     // the break action open: the off hand grips the barrels (near them, tipped down at the hinge as drawn) and swings
     // them up; their opening follows the hand's angle about the hinge in the gun's frame (the gun's own motion does not
     // count) from where it took them, and at the top they shut. Let go before that: they fall open again
@@ -982,7 +1195,7 @@ void frame() {
             } else if (k == kBreech && g_breech_grip && g_breech_ctrl == off_h) {  // (the gun hand's grip: not drawn on it)
                 std::memcpy(pg, g_breech_hz, sizeof(pg));
                 held = true;
-            } else if (k == kSemi && g_semi_grip) {
+            } else if ((k == kSemi || k == kMag || k == kClip) && g_semi_grip) {  // (a pistol's slide, the toggle's knee, the Mauser's bolt)
                 std::memcpy(pg, g_semi_hz, sizeof(pg));
                 held = true;
             }
@@ -1012,7 +1225,36 @@ void frame() {
     // draws each one's parts; with LeverParts off they keep the down-then-up flick)
     const bool parts = k == kLever && g_lever_parts.load(std::memory_order_relaxed);
     collect_sounds();
-    if (parts && !deadeye) {
+    // the Volcanic (2026-10-20): a flick of the right stick down works its lever for you, the hammer cocked and the next
+    // round chambered (drawn open, then shut 0.15 s later); the gun's flicks still work it
+    static bool s_stick_lever = false;
+    if (k == kLever && w == 0) {
+        if (g_open_req.exchange(false) && !menu::visible() && !deadeye && g_needs && !g_lever_open) {
+            if (parts) {
+                g_lever_open = true;
+                g_hammer_down = false;
+                g_lever_down_ms = now;
+                s_stick_lever = true;
+                if (pts && bp.hand_ok[gj]) play_at(gun_sounds(w) ? gun_sounds(w)->open : nullptr, bp.hand[gj]);
+            } else {
+                g_needs = false;
+                g_cycles.fetch_add(1, std::memory_order_relaxed);
+            }
+            controllers::pulse(gun_h, 0.5f, 15);
+            log::info("[actions] lever (%d): worked by the stick, the hammer cocked (clip %.0f/%.0f)", w, st.clip, st.clip_max);
+        }
+        if (s_stick_lever && g_lever_open && now - g_lever_down_ms >= 150.0) {
+            s_stick_lever = false;
+            g_lever_open = false;
+            g_needs = false;
+            if (pts && bp.hand_ok[gj]) play_at(gun_sounds(w) ? gun_sounds(w)->close : nullptr, bp.hand[gj]);
+            g_cycles.fetch_add(1, std::memory_order_relaxed);
+            controllers::pulse(gun_h, 0.6f, 20);
+        }
+    } else {
+        s_stick_lever = false;
+    }
+    if (parts && !deadeye && !s_stick_lever) {
         if (!g_lever_open && g_needs && g_w[0] <= -g_lever_speed) {
             g_lever_open = true;
             g_hammer_down = false;
@@ -1136,10 +1378,14 @@ void frame() {
     g_pump_weapon.store(pparts ? w : -1, std::memory_order_relaxed);
     // the hold: open or not cycled; a pull while held is counted (a faint buzz), and after it a fresh pull is needed
     const bool block = !deadeye && (g_open || g_needs || (bparts && (blift > 0.05f || bslide > 0.0f)) || (brz && (g_breech_open || bdrawn > 0.05f)) ||
-                                    (sparts && sdrawn > 0.05f));
+                                    (sparts && sdrawn > 0.05f) || (k == kMag && !g_mag_in.load(std::memory_order_relaxed) && !g_mag_chamber) ||
+                                    (k == kClip && g_clip_open));
     // the menu's clicks are not pulls (round 10: three refusals counted while the menu was open)
     const bool trig = gh.trigger > 0.6f && !menu::visible() && !whistle::suppressed(gun_h);  // run 8: not the whistle's
-    if (block && trig && !g_trig_was) {
+    // the pull that fired the last shot reaching this threshold after the game fired on it (the log, 2026-10-20: refusals
+    // 0 ms after a shot, a buzz and a click on a gun that had fired): it is that shot's pull, not a refused one
+    const bool shot_pull = now - g_last_shot_ms.load(std::memory_order_relaxed) < 250.0;
+    if (block && trig && !g_trig_was && !shot_pull) {
         g_held.fetch_add(1, std::memory_order_relaxed);
         controllers::pulse(gun_h, 0.45f, 35);  // felt, and unlike the empty click (round 10: an open full revolver felt dead)
         // round 13 item 13: "guns should click when attempting to fire without having performed the necessary reload
@@ -1149,8 +1395,20 @@ void frame() {
         log::info("[actions] fire held back: the %s %s (pulls %llu)", kind_name(k), g_open || (bparts && g_bolt_up) ? "is open" : "is not worked",
                   static_cast<unsigned long long>(g_held.load()));
     }
-    if (block && trig) g_rt_rearm = true;
-    if (g_rt_rearm && gh.trigger < 0.15f) g_rt_rearm = false;
+    // after a held pull, a fresh one: the trigger let out below 0.4 first. 2026-10-20 (the user: the repeater "ignored my
+    // trigger press multiple times" once cocked): it was below 0.15, and the shot's own pull (still held as the lever
+    // came due) set this each shot, so a pull from a finger resting on the trigger never fired, without a sound
+    static float rearm_low = 1.0f;
+    if (block && trig) {
+        if (!g_rt_rearm) rearm_low = gh.trigger;
+        g_rt_rearm = true;
+    }
+    if (g_rt_rearm) {
+        rearm_low = std::fmin(rearm_low, gh.trigger);
+        if (gh.trigger < 0.4f) g_rt_rearm = false;
+        else if (!block && trig && !g_trig_was)
+            log::info("[actions] a pull waits for the trigger to be let out (below 0.4; lowest since %.2f, now %.2f)", rearm_low, gh.trigger);
+    }
     g_trig_was = trig;
     g_blocked = block || g_rt_rearm.load();
 }
@@ -1179,6 +1437,7 @@ void init() {
     g_breech_parts = config::get_bool("Reload", "BreechParts", false);
     g_breech_flick = config::get_bool("Reload", "BreechFlick", true);
     g_semi_parts = config::get_bool("Reload", "SemiAutoParts", false);
+    g_mags = config::get_bool("Reload", "PistolMagazines", true);
     g_break = config::get_bool("Reload", "ManualBreak", false);
     g_barrel_r = config::get_float("Reload", "BarrelGripRadius", 0.15f);
     g_barrel_snap_cfg = config::get_bool("Reload", "BarrelHandSnap", true);
@@ -1209,7 +1468,7 @@ void set_enabled(bool on) {
 void filter_stick(float* rx, float* ry) {
     if (!g_on.load(std::memory_order_relaxed) || !rx || !ry) return;
     const Kind k = kind_of(g_weapon);  // the frame end's weapon (the same thread)
-    if (!(opens(k) && kind_on(k))) {
+    if (!((opens(k) || k == kMag || k == kClip || (k == kLever && g_weapon == 0)) && kind_on(k))) {  // (a pistol's flick drops its magazine; the Mauser's pulls its clip; the Volcanic's works its lever)
         g_stick_armed = true;
         return;
     }
@@ -1275,6 +1534,16 @@ int hint(float pos[3]) {
             return 2;  // the part's zone
         }
         return 3;  // a flick
+    }
+    if (kind_of(g_weapon) == kMag && g_mags.load(std::memory_order_relaxed)) {  // PistolMagazines: the grip for a magazine, the slide
+        if (!g_mag_in.load(std::memory_order_relaxed)) return 1;
+        if (!g_needs) return 0;
+        if (pos) std::memcpy(pos, g_semi_zone, sizeof(g_semi_zone));
+        return 2;
+    }
+    if (kind_of(g_weapon) == kClip && g_mags.load(std::memory_order_relaxed)) {  // the Mauser: the top for a clip, then a flick down
+        if (g_clip_room.load(std::memory_order_relaxed)) return 1;
+        return g_clip_strip ? 3 : 0;  // (an empty gun's bolt is held back: never shut on an empty magazine)
     }
     if (kind_of(g_weapon) == kSemi && g_semi_parts.load(std::memory_order_relaxed)) {  // SemiAutoParts: its handle to rack
         if (!g_needs) return 0;
@@ -1371,12 +1640,125 @@ unsigned gun_drivers(int* weapon, float* d) {
         mask |= 1u << kDrvBoltSlide;
         *weapon = sw;
     }
+    const int pw2 = g_slide_weapon.load(std::memory_order_relaxed);
+    if (g_mags.load(std::memory_order_relaxed) && pw2 >= 0) {  // PistolMagazines: the High Power's slide, the Mauser's bolt
+        const float a = g_slide_amt.load(std::memory_order_relaxed);
+        if (pw2 == 1) {  // the Semi-Auto's toggle: the rear link's turn, the knee's rise and its move back, the front link's turn
+            float knee[3], fd;
+            toggle_pose(a, knee, &fd);
+            d[kDrvBoltLift] = a;
+            d[kDrvPump] = (knee[1] - kToggleKnee[1]) / kToggleDy;
+            d[kDrvBoltSlide] = (knee[2] - kToggleKnee[2]) / kToggleDz;
+            d[kDrvBreech] = fd / kToggleFrontDeg;
+            mask |= 1u << kDrvBoltLift | 1u << kDrvPump | 1u << kDrvBreech;
+        } else {
+            d[kDrvBoltSlide] = a;
+        }
+        mask |= 1u << kDrvBoltSlide;
+        *weapon = pw2;
+    }
     return mask;
 }
 bool semi_auto_parts() { return g_semi_parts.load(std::memory_order_relaxed); }
 void set_semi_auto_parts(bool on) {
     if (g_semi_parts.exchange(on) != on) log::info("[actions] the semi-auto shotgun racked by hand, drawn: %s", on ? "on" : "off");
     config::set("Reload", "SemiAutoParts", on ? "1" : "0");
+}
+bool pistol_mags() { return g_mags.load(std::memory_order_relaxed); }
+void set_pistol_mags(bool on) {
+    if (g_mags.exchange(on) != on) log::info("[actions] the pistols loaded by magazine: %s", on ? "on" : "off");
+    config::set("Reload", "PistolMagazines", on ? "1" : "0");
+}
+bool mag_gun(int weapon) {
+    const Kind k = kind_of(weapon);
+    return g_on.load(std::memory_order_relaxed) && (k == kMag || k == kClip) && kind_on(k);
+}
+bool mag_in() { return g_mag_in.load(std::memory_order_relaxed); }
+bool mag_wanted() {
+    const Kind k = kind_of(g_weapon);
+    return k == kMag ? !g_mag_in.load(std::memory_order_relaxed) : k == kClip ? g_clip_room.load(std::memory_order_relaxed) : false;
+}
+MagSpec mag_spec(int weapon) {
+    // the Mauser's clip goes down into the top of the gun ahead of the bolt (the clip guide over the fixed magazine);
+    // the others' magazines up into the grip's bottom
+    if (kind_of(weapon) == kClip) return MagSpec{kClipLength, 0.055f, 0.070f, 5};
+    return MagSpec{kMagLength, kMagWellAlong, kMagWellUp, weapon == 1 ? 7 : 4};  // the Semi-Auto's its own (7)
+}
+void mag_well(const body::BodyPoints& bp, int weapon, float out[3]) {
+    const MagSpec ms = mag_spec(weapon);
+    if (kind_of(weapon) == kClip && bp.gun_frame_ok) {  // the Mauser: its clip guide, back from the muzzle along the drawn gun
+        float m[16], mo[3];
+        bool left = false;
+        uintptr_t W = 0;
+        if (aim::held_item_matrix(m, &left, &W) && aim::weapon_muzzle_offset(W, mo)) {
+            const float g[3] = {mo[0], mo[1] + kMauserGuideUp, mo[2] + kMauserGuideBack};
+            const float* R = bp.gun_frame_R;
+            for (int i = 0; i < 3; ++i) out[i] = bp.gun_frame_o[i] + R[i * 3] * g[0] + R[i * 3 + 1] * g[1] + R[i * 3 + 2] * g[2];
+            static int s_logged = 0;
+            if (s_logged++ == 0) log::info("[actions] Mauser: the clip guide at (%.3f %.3f %.3f) in the gun's frame (its muzzle %.3f %.3f %.3f)", g[0], g[1], g[2], mo[0], mo[1], mo[2]);
+            return;
+        }
+    }
+    const int gj = bp.gun;
+    float bt[3] = {0.0f, 0.174f, -0.985f}, u[3], rgt[3], up[3];
+    aim::barrel_in_target(bt);
+    const float* R = bp.target_rot[gj];
+    for (int i = 0; i < 3; ++i) {
+        u[i] = R[i * 3] * bt[0] + R[i * 3 + 1] * bt[1] + R[i * 3 + 2] * bt[2];
+        rgt[i] = R[i * 3];
+    }
+    up[0] = rgt[1] * u[2] - rgt[2] * u[1];
+    up[1] = rgt[2] * u[0] - rgt[0] * u[2];
+    up[2] = rgt[0] * u[1] - rgt[1] * u[0];
+    const float ul = std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
+    for (int i = 0; i < 3; ++i) out[i] = bp.hand[gj][i] + u[i] * ms.along + (ul > 1e-4f ? up[i] / ul : 0.0f) * ms.up;
+    // 2026-10-20 (the High Power's dropped to the right of the gun): onto the drawn gun's middle plane, the muzzle's
+    // across (the wrist is off to the side of the grip)
+    if (bp.gun_frame_ok) {
+        float m[16], mo[3];
+        bool left = false;
+        uintptr_t W = 0;
+        if (aim::held_item_matrix(m, &left, &W) && aim::weapon_muzzle_offset(W, mo)) {
+            const float* G = bp.gun_frame_R;
+            float x = 0.0f;
+            for (int i = 0; i < 3; ++i) x += G[i * 3] * (out[i] - bp.gun_frame_o[i]);
+            for (int i = 0; i < 3; ++i) out[i] += G[i * 3] * (mo[0] - x);
+        }
+    }
+}
+bool insert_mag(const RdrvrActorState& st, const float at[3]) {
+    if (!mag_gun(st.weapon) || !reload::hand_reload()) return false;
+    if (st.weapon_flags & (RDRVR_WEAPON_DEADEYE | RDRVR_WEAPON_RELOADING)) return false;
+    std::lock_guard lock(g_mutex);
+    if (kind_of(st.weapon) == kClip) {  // the Mauser: a stripper clip into the open top
+        if (st.weapon != g_weapon || !g_clip_room.load(std::memory_order_relaxed)) return false;
+        // the clip's ten (or the spare rounds left) pushed down as far as there is room; the rest stay on it (and in the
+        // spare count)
+        const int on_clip = static_cast<int>(std::fmin(10.0f, std::floor(st.spare + 0.01f)));
+        const int room = static_cast<int>(std::floor(st.clip_max - st.clip + 0.01f));
+        const int in = on_clip < room ? on_clip : room;
+        g_clip_strip = true;
+        g_clip_left = on_clip - in;
+        g_clip_room.store(false, std::memory_order_relaxed);
+        reload::fill_clip(st, static_cast<float>(in));
+        g_mag_inserts.fetch_add(1, std::memory_order_relaxed);
+        g_hand_round_ms.store(log::now_ms(), std::memory_order_relaxed);
+        if (const GunSounds* gs = gun_sounds(st.weapon)) play_at(gs->insert, at);
+        log::info("[actions] Mauser (%d): a stripper clip in, %d rounds pushed down (clip %.0f -> %.0f of %.0f, spare %.0f), %d left on it: pull it "
+                  "out by a flick down, or work the bolt", st.weapon, in, st.clip, st.clip + in, st.clip_max, st.spare, g_clip_left);
+        return true;
+    }
+    if (st.weapon != g_weapon || g_mag_in.load(std::memory_order_relaxed)) return false;
+    g_mag_in.store(true, std::memory_order_relaxed);
+    reload::fill_clip(st);  // what the gun lacks, from the spare rounds (none when the dropped magazine was full)
+    g_needs = !g_mag_chamber;  // the slide to rack, unless a round stayed in the chamber
+    g_mag_inserts.fetch_add(1, std::memory_order_relaxed);
+    g_hand_round_ms.store(log::now_ms(), std::memory_order_relaxed);
+    if (const GunSounds* gs = gun_sounds(st.weapon)) play_at(gs->insert, at);
+    log::info("[actions] pistol (%d): a magazine in (clip %.0f -> %.0f of %.0f, spare %.0f): %s", st.weapon, st.clip,
+              std::fmin(st.clip_max, st.clip + st.spare), st.clip_max, st.spare, g_mag_chamber ? "a round in the chamber, ready" : "rack the slide");
+    g_mag_chamber = false;
+    return true;
 }
 bool breech_parts() { return g_breech_parts.load(std::memory_order_relaxed); }
 bool breech_flick() { return g_breech_flick.load(std::memory_order_relaxed); }
@@ -1461,8 +1843,10 @@ void set_open_cylinder(bool on) {
 }
 
 bool can_load(int weapon) {
-    if (!g_on.load(std::memory_order_relaxed) || !g_load_open.load(std::memory_order_relaxed)) return true;
+    if (!g_on.load(std::memory_order_relaxed)) return true;
     const Kind k = kind_of(weapon);
+    if ((k == kMag || k == kClip) && kind_on(k)) return false;  // PistolMagazines: a magazine (the Mauser a clip), never a round (insert_mag)
+    if (!g_load_open.load(std::memory_order_relaxed)) return true;
     if (k == kBreech && kind_on(k)) {  // BreechParts: open, and one round at most; the Springfield as a repeater (any time)
         if (g_breech_cap.load(std::memory_order_relaxed) > 1.5f) return true;
         std::lock_guard lock(g_mutex);
@@ -1609,6 +1993,13 @@ std::string command(const std::string& line) {
         std::snprintf(b, sizeof(b), " | breech %d open %d round %d drawn %.2f hammer %.2f gripped %d breech zone (%.3f %.3f %.3f) %.3f m", g_breech_parts.load() ? 1 : 0,
                       g_breech_open ? 1 : 0, g_breech_round.load() ? 1 : 0, g_breech_amt.load(), g_breech_hammer.load(), g_breech_grip ? 1 : 0, g_breech_zone[0],
                       g_breech_zone[1], g_breech_zone[2], g_breech_d);
+        o += b;
+    }
+    if (all || gk == kMag || gk == kClip) {
+        std::snprintf(b, sizeof(b), " | pistol mags %d in %d chamber %d drops %llu inserts %llu slide %.2f (weapon %d) | Mauser bolt back %d clip in %d room %d drawn %.2f left %d",
+                      g_mags.load() ? 1 : 0, g_mag_in.load() ? 1 : 0, g_mag_chamber ? 1 : 0, static_cast<unsigned long long>(g_mag_drops.load()),
+                      static_cast<unsigned long long>(g_mag_inserts.load()), g_slide_amt.load(), g_slide_weapon.load(), g_clip_open ? 1 : 0,
+                      g_clip_strip ? 1 : 0, g_clip_room.load() ? 1 : 0, g_clip_drawn, g_clip_left);
         o += b;
     }
     if (all || gk == kSemi) {

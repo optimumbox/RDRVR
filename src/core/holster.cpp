@@ -1082,6 +1082,8 @@ void holster_frame() {
     }
     g_gun_in_hand.store(st.weapon >= 0 && st.weapon < kAdjGuns ? st.weapon : -1, std::memory_order_relaxed);
     gun_adjust(st.weapon, kAdjLoadRing, lo, &lr);  // round 13 item 8: the gun's own loading ring, else every gun's
+    const bool mag_now = actions::mag_gun(st.weapon);  // [Reload] PistolMagazines: a magazine (the Mauser a clip), not a round
+    const actions::MagSpec mspec = actions::mag_spec(st.weapon);
     {  // [Reload] LoadPointOffset in the gun's axes: right (the target's x), up (square to the barrel), forward (the barrel)
         const float* Rg = bp.target_rot[bp.gun];
         float rgt[3] = {Rg[0], Rg[3], Rg[6]}, upv[3] = {rgt[1] * u[2] - rgt[2] * u[1], rgt[2] * u[0] - rgt[0] * u[2], rgt[0] * u[1] - rgt[1] * u[0]};
@@ -1090,7 +1092,10 @@ void holster_frame() {
             for (float& x : upv) x /= ul;
         else
             upv[0] = upv[2] = 0.0f, upv[1] = 1.0f;
-        for (int k = 0; k < 3; ++k) load_pt[k] = bp.hand[gj][k] + u[k] * (0.10f + lo[2]) + rgt[k] * lo[0] + upv[k] * lo[1];
+        // [Reload] PistolMagazines: a pistol's is its mag well, the grip's bottom (actions::mag_well; the Mauser's the top
+        // of the gun), not the gate's
+        const float base_along = mag_now ? mspec.along : 0.10f, base_up = mag_now ? mspec.up : 0.0f;
+        for (int k = 0; k < 3; ++k) load_pt[k] = bp.hand[gj][k] + u[k] * (base_along + lo[2]) + rgt[k] * lo[0] + upv[k] * (base_up + lo[1]);
         std::lock_guard lock(g_zone_mutex);
         std::memcpy(g_load_diag.pt, load_pt, sizeof(g_load_diag.pt));
     }
@@ -1107,6 +1112,8 @@ void holster_frame() {
         *d_round = -1.0f;
         float pz[12];
         if (round_draw::pose(bp, rj, pz)) {
+            if (mag_now)  // PistolMagazines: the magazine's top (the clip's far end), near the end that goes in
+                for (int k = 0; k < 3; ++k) pz[9 + k] += pz[3 + k] * mspec.length * 0.85f;
             const float ex = pz[9] - load_pt[0], ey = pz[10] - load_pt[1], ez = pz[11] - load_pt[2];
             *d_round = std::sqrt(ex * ex + ey * ey + ez * ez);
             std::lock_guard lock(g_zone_mutex);
@@ -1536,8 +1543,10 @@ void holster_frame() {
             g_consumed[h] = true;
             press_zone[h] = in_z[h];
             pending[h] = false;
-            const bool loadable = reload::hand_reload() && gun && st.clip + 0.5f <= st.clip_max && st.spare >= 1.0f && actions::can_load(st.weapon) &&
-                                  !(st.weapon_flags & (RDRVR_WEAPON_DEADEYE | RDRVR_WEAPON_RELOADING));
+            // PistolMagazines: a magazine whenever the gun has none in (the dropped one's rounds kept: none needed spare)
+            const bool loadable = mag_now ? reload::hand_reload() && gun && actions::mag_wanted() && !(st.weapon_flags & (RDRVR_WEAPON_DEADEYE | RDRVR_WEAPON_RELOADING))
+                                          : reload::hand_reload() && gun && st.clip + 0.5f <= st.clip_max && st.spare >= 1.0f && actions::can_load(st.weapon) &&
+                                                !(st.weapon_flags & (RDRVR_WEAPON_DEADEYE | RDRVR_WEAPON_RELOADING));
             const int sq = reload::chest_squeeze();
             const bool sec_hand = ds.on && h == ds.ctrl;
             if (sec_hand && sq && ds.copy) {  // [Hands] DualWieldCopy: the copy pressed to the chest, a round of its own count
@@ -1560,7 +1569,7 @@ void holster_frame() {
             } else if (h == gun_h && sq) {  // the gun itself pressed to the chest: one round or a full clip
                 round_held[h] = false;
                 const bool full = sq == 2;
-                const bool done = loadable && (full ? reload::fill_clip(st) : reload::insert_round(st));
+                const bool done = loadable && !mag_now && (full ? reload::fill_clip(st) : reload::insert_round(st));  // (a pistol: its magazine)
                 if (done) {
                     if (bp.hand_ok[gj]) actions::round_in(st.weapon, bp.hand[gj]);
                     float nr = full ? st.clip_max - st.clip : 1.0f;
@@ -1580,8 +1589,8 @@ void holster_frame() {
             if (!squeezed) controllers::pulse(h, can ? 0.4f : 0.15f, can ? 25 : 10);
             if (can) {
                 g_rounds_taken.fetch_add(1, std::memory_order_relaxed);
-                log::info("[holster] %s hand took a round (clip %.0f/%.0f, spare %.0f)", h ? "right" : "left", st.clip, st.clip_max,
-                          st.spare);
+                log::info("[holster] %s hand took a %s (clip %.0f/%.0f, spare %.0f)", h ? "right" : "left", mag_now ? "magazine" : "round", st.clip,
+                          st.clip_max, st.spare);
             }
         } else if (pressed && in_z[h] < 0 && h == off_h && fore_ok) {
             two_hold[h] = true;
@@ -1756,7 +1765,15 @@ void holster_frame() {
                     ++(by_touch ? g_load_diag.inserts_touch : g_load_diag.inserts_wrist);
                 }
                 if (by_touch) log::info("[holster] the round touched the loading point (the round %.3f m, the wrist %.3f m from it)", d_round, d_wrist);
-                if (actions::can_load(st.weapon) && reload::insert_round(st)) {
+                if (mag_now) {  // PistolMagazines: pushed into the grip
+                    if (actions::insert_mag(st, load_pt)) {
+                        g_rounds_in.fetch_add(1, std::memory_order_relaxed);
+                        controllers::pulse(h, 0.7f, 25);
+                        controllers::pulse(gun_h, 0.7f, 25);
+                    } else {
+                        log::info("[holster] the magazine did not go in (flags %#x)", st.weapon_flags);
+                    }
+                } else if (actions::can_load(st.weapon) && reload::insert_round(st)) {
                     g_rounds_in.fetch_add(1, std::memory_order_relaxed);
                     actions::round_in(st.weapon, load_pt);
                     controllers::pulse(h, 0.5f, 20);
@@ -1786,7 +1803,15 @@ void holster_frame() {
             float d_round = -1.0f, d = 1e9f;
             round_at(rj, &d_round, &d);
             if (touch && d_round >= 0.0f) d = d_round;  // InsertOnTouch: the round's own distance
-            if (d < lr + 0.04f && actions::can_load(st.weapon) && reload::insert_round(st)) {
+            if (mag_now && d < lr + 0.04f && actions::insert_mag(st, load_pt)) {  // PistolMagazines: let go at the grip
+                g_rounds_in.fetch_add(1, std::memory_order_relaxed);
+                controllers::pulse(h, 0.7f, 25);
+                controllers::pulse(gun_h, 0.7f, 25);
+                log::info("[holster] a magazine into the gun, let go at the grip (%.2f m)", d);
+            } else if (mag_now) {
+                log::info("[holster] the magazine dropped: let go %.2f m from the grip (it goes in within %.2f m holding, %.2f m letting go)", d,
+                          lr, lr + 0.04f);
+            } else if (d < lr + 0.04f && actions::can_load(st.weapon) && reload::insert_round(st)) {
                 {
                     std::lock_guard lock(g_zone_mutex);
                     ++g_load_diag.inserts_let_go;
@@ -1899,7 +1924,7 @@ void holster_frame() {
         int rh = -1;
         for (int h = 0; h < 2; ++h)
             if (round_held[h] && !(rifle_free && h == gun_h)) rh = bp.ctrl[0] == h ? 0 : 1;
-        round_draw::set_held(rh, audio::click_family(st.weapon));
+        round_draw::set_held(rh, mag_now ? mspec.family : audio::click_family(st.weapon));
         // [Reload] ShowAmmo (run 6 item 6b): while a round could go in now (the gun open for it, or a gate gun with room),
         // a row of the gun's rounds at the chest: as many as could go in, up to six
         if (round_draw::show_ammo()) {
@@ -1909,9 +1934,12 @@ void holster_frame() {
                 if (zone_rounds(z)) rz = z;
             const bool room = gun && reload::hand_reload() && st.clip + 0.5f <= st.clip_max && st.spare >= 1.0f && actions::can_load(st.weapon) &&
                               !(st.weapon_flags & (RDRVR_WEAPON_DEADEYE | RDRVR_WEAPON_RELOADING)) && rz >= 0 && zok[rz];
-            const float can = std::fmin(std::fmin(st.spare, st.clip_max - st.clip), 6.0f);
-            round_draw::set_row(room ? audio::click_family(st.weapon) : 0, room ? static_cast<int>(can + 0.01f) : 0, zp[rz >= 0 ? rz : kAmmoZone], hr, up,
-                                hf);
+            float can = std::fmin(std::fmin(st.spare, st.clip_max - st.clip), st.weapon == 0 ? 8.0f : 6.0f);  // (the Volcanic's tube: eight)
+            const bool mag_room = mag_now && gun && reload::hand_reload() && actions::mag_wanted() && rz >= 0 && zok[rz];  // PistolMagazines: one
+            if (mag_now) can = 1.0f;
+            const bool show = mag_now ? mag_room : room;
+            round_draw::set_row(show ? (mag_now ? mspec.family : audio::click_family(st.weapon)) : 0, show ? static_cast<int>(can + 0.01f) : 0,
+                                zp[rz >= 0 ? rz : kAmmoZone], hr, up, hf);
         }
         // [Reload] RoundInHand = 2: the game's own shotgun shell in the hand (held_prop; its draw moved onto the pose)
         float pz[12];

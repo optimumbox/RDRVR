@@ -35,8 +35,9 @@ void after_fire_trigger(uintptr_t info, uint8_t before);
 // One round from the spare ammo into the gun in hand (ACTOR_ADD_WEAPON_AMMO with 1.0, the game's own count); false
 // when the gun is full, has no spare rounds or Dead Eye is on. Any thread (a queued native).
 bool insert_round(const RdrvrActorState& st);
-// As many rounds as the gun takes (up to the spare ones), at once: the chest squeeze's full reload.
-bool fill_clip(const RdrvrActorState& st);
+// As many rounds as the gun takes (up to the spare ones, and `most`: a stripper clip's), at once: the chest squeeze's
+// full reload.
+bool fill_clip(const RdrvrActorState& st, float most = 1e9f);
 // [Reload] ChestSqueeze: the gun hand gripped at the chest (Ammo) holster reloads: 0 off, 1 one round, 2 a full clip
 int chest_squeeze();
 void set_chest_squeeze(int mode, bool save = true);

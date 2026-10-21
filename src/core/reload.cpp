@@ -173,10 +173,11 @@ void after_fire_trigger(uintptr_t info, uint8_t before) {
     }
 }
 
-bool fill_clip(const RdrvrActorState& st) {
+bool fill_clip(const RdrvrActorState& st, float most) {
     if (!g_hand.load(std::memory_order_relaxed) || !st.valid || !st.actor || !is_gun(st.weapon)) return false;
     if (st.weapon_flags & (RDRVR_WEAPON_DEADEYE | RDRVR_WEAPON_RELOADING)) return false;
     float n = st.clip_max - st.clip;
+    if (n > most) n = most;
     if (n > st.spare) n = st.spare;
     n = std::floor(n + 0.01f);
     if (!(n >= 1.0f) || n > 200.0f) return false;

@@ -794,6 +794,19 @@ const GunModel kGunModels[] = {
     // run 6 item 9h: [Reload] SemiAutoParts: the Semi-Auto Shotgun's bolt (2, "sliding") racked 65 mm back (the mod's:
     // no clip of the game's moves it); its fire clip and its cycling between shots are the game's (no flags)
     {18, 5, 0, 0, 1, {{2, 0, kDrvBoltSlide, kRef, 0.0f, {}, {0.0f, 0.0f, 0.065f}, {}}}},
+    // 2026-10-20: [Reload] PistolMagazines: the High Power's slide (bone 1) racked 32.8 mm back, the Mauser's bolt (1)
+    // held 20.5 mm back (their fire clips' full travel, "skel parts": straight back, no turn). On their own bones, so the
+    // game's own recoil of them at each shot stays (no flags)
+    {2, 3, 0, 0, 1, {{1, 0, kDrvBoltSlide, kOwn, 0.0f, {}, {0.0f, 0.0f, 0.0328f}, {}}}},
+    // the Semi-Auto's toggle (its fire clip): the rear link (1) up to 66.6 degrees about its hinge on the frame; the
+    // front link (2) carried by the knee they share (its rise and its move back, two drivers: the knee goes round the
+    // hinge) and turned about it by the game's own curve (actions::toggle_pose sets the four amounts)
+    {1, 4, 0, 0, 4,
+     {{1, 0, kDrvBoltLift, kOwn, actions::kToggleDeg, {0.0f, 0.0669f, 0.1126f}, {}, {}},
+      {2, 0, kDrvPump, kOwn, 0.0f, {}, {0.0f, actions::kToggleDy, 0.0f}, {}},
+      {2, 0, kDrvBoltSlide, kOwn, 0.0f, {}, {0.0f, 0.0f, actions::kToggleDz}, {}},
+      {2, 0, kDrvBreech, kOwn, actions::kToggleFrontDeg, {0.0f, 0.0710f, 0.0835f}, {}, {}}}},
+    {3, 4, 0, 0, 1, {{1, 0, kDrvBoltSlide, kOwn, 0.0f, {}, {0.0f, 0.0f, 0.0205f}, {}}}},
 };
 const GunModel* gun_model(int weapon, int count = -1) {
     for (const GunModel& g : kGunModels)
@@ -1403,6 +1416,99 @@ struct GunMvStats {
     float max = 0.0f;
 };
 GunMvStats g_gun_mv_log, g_gun_mv_cmd;  // the [lag] line's (since the last line) and "skel gunmv"'s (since its reset)
+// [Hands] Recoil (2026-10-20, the user: "is there a way to add recoil back to guns like the in game animations
+// have?"): the drawn gun is held still through John's fire clip (Steady), so a shot had no kick. Now each player shot
+// tips the gun in hand muzzle up about its own root (the grip, in the palm) and slides it back a little along its
+// barrel; the hand stays on the controller ("is there a way to fix or hide that hand issue?": the gun turns in the
+// grip, the hand is not moved). A critically damped spring: a shot's turn peaks 40 ms after it and is gone by 250 ms,
+// shots in quick succession stack. The turn per weapon (kick_peak) times Recoil (0 off). Made once a frame at the
+// publish (g_item_corr takes it: aim.cpp's barrel, so a shot during a kick leaves the raised barrel) and put on the
+// gun in hand's drawn matrices after every other correction (kick_rigid, kick_skinned). Under g_draw_mutex.
+std::atomic<float> g_recoil{1.0f};
+struct Kick {
+    float s = 0.0f, v = 0.0f;  // the spring (1: a shot's peak)
+    double last_shot = -1e12, ms = 0.0;
+    float deg = 0.0f, back = 0.0f;  // the last shot's weapon: its peak turn (degrees) and slide back (m)
+    bool on = false;                // R, t this frame's (world: x' = R x + t), for the game's hand `hand`
+    int hand = -1;
+    float R[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}, t[3] = {};
+};
+Kick g_kick;
+constexpr float kKickW0 = 25.0f;  // the spring's rate (1/s): its peak at 1/w0 = 40 ms
+void kick_peak(int w, float* deg, float* back) {
+    *deg = 0.0f, *back = 0.0f;
+    if (w >= 0 && w <= 3) *deg = 5.0f, *back = 0.012f;                    // the pistols
+    else if (w >= 4 && w <= 7) *deg = w == 7 ? 8.0f : 7.0f, *back = 0.015f;  // the revolvers (the LeMat heavier)
+    else if (w >= 8 && w <= 11) *deg = 4.0f, *back = 0.012f;              // the repeaters
+    else if (w == 14) *deg = 9.0f, *back = 0.022f;                        // the Buffalo rifle
+    else if (w >= 15 && w <= 18) *deg = 10.0f, *back = 0.025f;            // the shotguns
+    else if (w >= 12 && w <= 20) *deg = 6.0f, *back = 0.016f;             // the other rifles
+}
+// The frame's kick for the game's hand g: its gun's root at `p` (world), its barrel `b` and top `up` (unit), from the
+// item's correction on the game's matrix. Steps the spring to `now`.
+void kick_make(int g, const float p[3], const float b[3], const float up[3], double now) {
+    Kick& k = g_kick;
+    const double shot = now - actions::since_shot_ms();
+    if (shot > k.last_shot + 30.0 && now - shot < 150.0) {  // a new shot
+        RdrvrActorState ast{};
+        kick_peak(api::actor_state(&ast) ? ast.weapon : -1, &k.deg, &k.back);
+        k.v += kKickW0 * 2.7182818f;  // a peak of 1
+    }
+    if (shot > k.last_shot) k.last_shot = shot;
+    double dt = k.ms > 0.0 ? std::fmin(now - k.ms, 100.0) / 1000.0 : 0.0;
+    k.ms = now;
+    for (; dt > 0.0; dt -= 0.002) {  // semi-implicit, 2 ms steps
+        const float h = static_cast<float>(std::fmin(dt, 0.002));
+        k.v += (-kKickW0 * kKickW0 * k.s - 2.0f * kKickW0 * k.v) * h;
+        k.s += k.v * h;
+    }
+    if (std::fabs(k.s) < 1e-4f && std::fabs(k.v) < 1e-3f) k.s = k.v = 0.0f;
+    const float sc = g_recoil.load(std::memory_order_relaxed) * k.s;
+    k.on = false;
+    if (sc == 0.0f || k.deg <= 0.0f) return;
+    // the turn takes the barrel toward the gun's top: about u = b x up
+    float u[3] = {b[1] * up[2] - b[2] * up[1], b[2] * up[0] - b[0] * up[2], b[0] * up[1] - b[1] * up[0]};
+    const float ul = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+    if (ul < 0.5f) return;
+    for (float& x : u) x /= ul;
+    const float th = sc * k.deg * 0.017453293f, c = std::cos(th), sn = std::sin(th), C = 1.0f - c;
+    float* R = k.R;
+    R[0] = c + u[0] * u[0] * C, R[1] = u[0] * u[1] * C - u[2] * sn, R[2] = u[0] * u[2] * C + u[1] * sn;
+    R[3] = u[1] * u[0] * C + u[2] * sn, R[4] = c + u[1] * u[1] * C, R[5] = u[1] * u[2] * C - u[0] * sn;
+    R[6] = u[2] * u[0] * C - u[1] * sn, R[7] = u[2] * u[1] * C + u[0] * sn, R[8] = c + u[2] * u[2] * C;
+    for (int i = 0; i < 3; ++i)
+        k.t[i] = p[i] - sc * k.back * b[i] - (R[i * 3] * p[0] + R[i * 3 + 1] * p[1] + R[i * 3 + 2] * p[2]);
+    k.on = true;
+    k.hand = g;
+}
+// a rigid draw's record (the axes in rows 0-2, the position at 12-14; world): its current half kicked
+void kick_rigid(int hand, float* rc) {
+    if (!g_kick.on || hand != g_kick.hand) return;
+    const float* R = g_kick.R;
+    for (int ax = 0; ax < 4; ++ax) {
+        float* r = rc + ax * 4;
+        const float v[3] = {r[0], r[1], r[2]};
+        for (int k = 0; k < 3; ++k) r[k] = R[k * 3] * v[0] + R[k * 3 + 1] * v[1] + R[k * 3 + 2] * v[2] + (ax == 3 ? g_kick.t[k] : 0.0f);
+    }
+}
+// a skinned set's current half (`count` 12-float matrices, the world less `po`): kicked
+void kick_skinned(int hand, float* sm, int count, const float* po) {
+    if (!g_kick.on || hand != g_kick.hand) return;
+    const float* R = g_kick.R;
+    for (int j = 0; j < count; ++j) {
+        float* m = sm + j * 12;
+        const float mb[9] = {m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]};
+        const float w[3] = {m[3] + po[0], m[7] + po[1], m[11] + po[2]};
+        float nm[9];
+        mul3(R, mb, nm);
+        for (int k = 0; k < 3; ++k) {
+            m[k * 4 + 0] = nm[k * 3 + 0];
+            m[k * 4 + 1] = nm[k * 3 + 1];
+            m[k * 4 + 2] = nm[k * 3 + 2];
+            m[k * 4 + 3] = R[k * 3] * w[0] + R[k * 3 + 1] * w[1] + R[k * 3 + 2] * w[2] + g_kick.t[k] - po[k];
+        }
+    }
+}
 // the draw's previous half (`prev`: `count` matrices of 12 floats, the world less `off_prev`; count 0: one 4x4 record,
 // the world) set to last frame's drawn gun of that hand and drawable; this frame's drawn (`cur`, with `off_cur`) kept
 void gun_prev_fix(int hand, uintptr_t key, const float* cur, float* prev, int count, const float* off_cur, const float* off_prev) {
@@ -1628,6 +1734,12 @@ struct HandCorr {
     double ad[3];
     double ms;
     bool ik;
+    // the item's game matrix (W +0x80) of the build this correction was drawn with (g_item_corr only): the game moves
+    // it between builds (an animation's clip, up to 19 degrees a frame on the Scofield), so a live read against this
+    // correction is off by that much
+    bool gun_ok;
+    float gun[16];
+    uintptr_t W;
 };
 std::atomic<uint32_t> g_hand_seq{0};
 std::atomic<uint64_t> g_seq_waits{0}, g_seq_misses{0};
@@ -4412,6 +4524,7 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
         std::memcpy(g_points.fore, pub_fore_p, sizeof(g_points.fore));
         g_points.gun = f.gun_j;
         std::memcpy(g_points.ctrl, f.ctrl, sizeof(g_points.ctrl));
+        g_kick.on = false;
         for (int g = 0; g < 2; ++g) {
             std::memcpy(g_item_corr[g].A, g_item_world[g].A, sizeof(g_item_corr[g].A));
             std::memcpy(g_item_corr[g].a, g_item_world[g].a, sizeof(g_item_corr[g].a));
@@ -4421,6 +4534,36 @@ void transform_set(float* s, int count, int slot, const Frame& f, const float* o
                                         static_cast<double>(item[g].A[k * 3 + 2]) * off[2]);
             g_item_corr[g].ms = now;
             g_item_corr[g].ik = f.ik[xfer_ok && g == f.item_side ? f.gun_j : g];
+            const HeldSample* hg = newest_held(f.held);
+            g_item_corr[g].gun_ok = hg && !hg->sec && hg->left == (g == 0);
+            if (g_item_corr[g].gun_ok) {
+                std::memcpy(g_item_corr[g].gun, hg->game, sizeof(g_item_corr[g].gun));
+                g_item_corr[g].W = hg->W;
+                // [Hands] Recoil: the frame's kick about the drawn gun's root, put on its correction
+                HandCorr& ic = g_item_corr[g];
+                float p[3], b[3], up[3];
+                for (int k = 0; k < 3; ++k) {
+                    p[k] = ic.A[k * 3] * hg->game[12] + ic.A[k * 3 + 1] * hg->game[13] + ic.A[k * 3 + 2] * hg->game[14] + ic.a[k];
+                    b[k] = -(ic.A[k * 3] * hg->game[8] + ic.A[k * 3 + 1] * hg->game[9] + ic.A[k * 3 + 2] * hg->game[10]);
+                    up[k] = ic.A[k * 3] * hg->game[4] + ic.A[k * 3 + 1] * hg->game[5] + ic.A[k * 3 + 2] * hg->game[6];
+                }
+                norm(b);
+                norm(up);
+                kick_make(g, p, b, up, now);
+                if (g_kick.on) {
+                    const float* R = g_kick.R;
+                    float nA[9], na[3];
+                    double nd[3];
+                    mul3(R, ic.A, nA);
+                    for (int k = 0; k < 3; ++k) {
+                        na[k] = R[k * 3] * ic.a[0] + R[k * 3 + 1] * ic.a[1] + R[k * 3 + 2] * ic.a[2] + g_kick.t[k];
+                        nd[k] = R[k * 3] * ic.ad[0] + R[k * 3 + 1] * ic.ad[1] + R[k * 3 + 2] * ic.ad[2] + g_kick.t[k];
+                    }
+                    std::memcpy(ic.A, nA, sizeof(nA));
+                    std::memcpy(ic.a, na, sizeof(na));
+                    std::memcpy(ic.ad, nd, sizeof(nd));
+                }
+            }
         }
         g_points.steady = f.steady;
         g_points.free_ok = f.ik[f.gun_j];
@@ -6278,7 +6421,8 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                                 g_steady_misses.fetch_add(1, std::memory_order_relaxed);
                             }
                         }
-                        if (hi >= 0 && !rec_matrix) {  // [Hands] StaleGunFix (an early draw), then GunMotionVectors
+                        if (hi >= 0 && !rec_matrix) {  // [Hands] Recoil, StaleGunFix (an early draw), then GunMotionVectors
+                            kick_skinned(held, sm, count, reinterpret_cast<const float*>(mset + 0x10));
                             stale_place(xf ? 1 - held : held, held, reinterpret_cast<uintptr_t>(rec[0x10]), sm, sm + static_cast<size_t>(count) * 12,
                                         count, reinterpret_cast<const float*>(mset + 0x10), reinterpret_cast<const float*>(mset + 0x20));
                             gun_prev_fix(held, reinterpret_cast<uintptr_t>(rec[0x10]), sm, sm + static_cast<size_t>(count) * 12, count,
@@ -6438,7 +6582,8 @@ void hk_DrawVisEntity(void* ctx, void** rec, uint64_t pass, uint64_t bucket, uin
                     float t[3] = {rm[12], rm[13], rm[14]};
                     for (int k = 0; k < 3; ++k) rm[12 + k] = c.A[k * 3] * t[0] + c.A[k * 3 + 1] * t[1] + c.A[k * 3 + 2] * t[2] + c.a[k];
                 }
-                if (hi >= 0) {  // [Hands] StaleGunFix (an early draw), then GunMotionVectors
+                if (hi >= 0) {  // [Hands] Recoil, StaleGunFix (an early draw), then GunMotionVectors
+                    kick_rigid(held, rc);
                     stale_place(g_item_xfer ? 1 - held : held, held, reinterpret_cast<uintptr_t>(rec[0x10]), rc, rc + 16, 0, nullptr, nullptr);
                     gun_prev_fix(held, reinterpret_cast<uintptr_t>(rec[0x10]), rc, rc + 16, 0, nullptr, nullptr);
                 }
@@ -6993,6 +7138,27 @@ bool item_correction(int h, float A[9], float a[3], bool* ik, double* ad) {
     return true;
 }
 
+bool item_gun(int h, float A[9], float a[3], bool* ik, float gun[16], uintptr_t* W) {
+    if (h < 0 || h > 1) return false;
+    HandCorr c;
+    if (!seq_copy(g_hand_seq, &c, &g_item_corr[h], sizeof(c))) return false;
+    if (!c.ms || log::now_ms() - c.ms > 250 || !c.gun_ok) return false;
+    std::memcpy(A, c.A, sizeof(c.A));
+    std::memcpy(a, c.a, sizeof(c.a));
+    std::memcpy(gun, c.gun, sizeof(c.gun));
+    if (ik) *ik = c.ik;
+    if (W) *W = c.W;
+    return true;
+}
+
+float recoil() { return g_recoil.load(std::memory_order_relaxed); }
+void set_recoil(float v) {
+    v = std::fmin(2.0f, std::fmax(0.0f, v));
+    if (g_recoil.exchange(v) != v) log::info("[body] the guns' kick (Recoil): %.2f", v);
+    char t[16];
+    std::snprintf(t, sizeof(t), "%.2f", v);
+    config::set("Hands", "Recoil", t);
+}
 bool gun_in_gun_hand() { return g_gun_hand_cfg.load(); }
 void set_gun_in_gun_hand(bool on) {
     if (g_gun_hand_cfg.exchange(on) != on) log::info("[body] left-handed: the gun in John's left hand, each arm on its own controller %d", on ? 1 : 0);
@@ -7218,6 +7384,7 @@ bool install() {
         g_mirror_cfg = config::get_bool("Hands", "TransplantMirror", true);
         g_own_follow = config::get_bool("Hands", "OwnModelFollow", true);
         g_gun_mv = config::get_bool("Hands", "GunMotionVectors", true);
+        g_recoil = std::fmin(2.0f, std::fmax(0.0f, config::get_float("Hands", "Recoil", 1.0f)));
         g_stale_fix = config::get_bool("Hands", "StaleGunFix", true);
         g_arm_mv = config::get_bool("Body", "ArmMotionVectors", false);  // run 12 item 9
         g_body_with_cam = config::get_bool("Horse", "BodyWithCamera", true);  // run 12 item 8 (on: cycles GL2/GF1 and their captures)

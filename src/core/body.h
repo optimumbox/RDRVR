@@ -46,8 +46,14 @@ bool hand_correction(int h, float A[9], float a[3], bool* ik);
 // correction, or, left-handed with [Hands] GunInGunHand, the transplant onto John's left hand (a rigid move: the gun
 // sits on the left controller as it sits on the right one right-handed). The aim, the held prop. Any thread.
 bool item_correction(int g, float A[9], float a[3], bool* ik, double* ad = nullptr);  // ad: a in double (the world's coordinates are large)
+// The same with the item's game matrix (W +0x80) of the build it was drawn with, and the weapon object: false without
+// one in that hand. A x + a on it is the item as drawn (a live read of W +0x80 is a build or more newer)
+bool item_gun(int g, float A[9], float a[3], bool* ik, float gun[16], uintptr_t* W);
 // [Hands] GunInGunHand (left-handed: each arm on its own controller, the gun in John's left hand), TransplantFingers
 // (0 unchanged, 1 the gun hand takes the gripping hand's curl and the other the game's empty hand's, 2 the other open)
+// [Hands] Recoil: the guns' kick on each shot (0 off, 1 the default, up to 2)
+float recoil();
+void set_recoil(float v);  // also written to the user ini
 bool gun_in_gun_hand();
 void set_gun_in_gun_hand(bool on);  // also written to the user ini
 // [Hands] FixedGunGrip (off; run 7 item 1c): each long gun held in the drawn hand by its aiming hold in every pose

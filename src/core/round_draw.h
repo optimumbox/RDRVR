@@ -41,7 +41,14 @@ void set_place(const Place& p, bool save);  // save: also written to the user in
 void note_pass(int eye, const float* cam, float l, float r, float u, float d);
 // The holsters (each update): John's hand holding a round taken at the chest (0 left, 1 right; -1 none) and the gun in
 // hand's family (audio::click_family: 1 revolvers and pistols, 2 rifles, 3 shotguns).
-void set_held(int john_hand, int family);
+void set_held(int john_hand, int family);  // family 4: a pistol's magazine (7 the Semi-Auto's), 5 the Mauser's clip ([Reload] PistolMagazines)
+// [Reload] PistolMagazines: a magazine dropped from the gun at `pose` (12 floats: X, Y its base to top, Z, its base's
+// position; world), drawn falling for a second; family 4 a magazine, 6 the Mauser's clip (with `rounds` of its ten
+// still on it, the top ones)
+void drop_mag(const float pose[12], int family, int rounds = 0);
+// The Mauser's clip in the guide on top of the gun (each update while it is there: drawn for 0.1 s after), as drop_mag's
+// pose, with `rounds` still on it
+void seat_clip(const float pose[12], int rounds);
 
 // The presenting thread, in xr_blit::blit's list after both eye images are drawn (the list's allocator slot `slot`,
 // whose previous use the GPU has passed): the round into each eye's swapchain image dst[e] (RENDER_TARGET, its RTV
@@ -50,6 +57,12 @@ void set_held(int john_hand, int family);
 // the scene depth's content behind it (0: the whole depth target).
 void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* const dst[2], const D3D12_CPU_DESCRIPTOR_HANDLE rtv[2],
             uint32_t w, uint32_t h, DXGI_FORMAT fmt, int slot, uint32_t vw = 0, uint32_t vh = 0, uint32_t dw = 0, uint32_t dh = 0);
+// 2026-10-21: the same for the monitor (a recording of the game's window shows them): the left eye's draws into the
+// back buffer `rtv` (w x h, RENDER_TARGET; an sRGB view of the eyes' format) in its image rect at (ox, oy), vw x vh,
+// where xr_blit::repaint drew the left eye. Its own depth and descriptor slots (`slot`: the repaint's list); no
+// occlusion counts. The presenting thread, after record that frame; changes the list's state as record does.
+void record_monitor(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv, uint32_t w, uint32_t h,
+                    DXGI_FORMAT fmt, int slot, uint32_t ox, uint32_t oy, uint32_t vw, uint32_t vh);
 
 // [Reload] ShowAmmo (off; run 6 item 6b): while a round could go in now (the holsters say), a row of `n` rounds of the
 // gun's family (as set_held's) standing at the chest's ammo zone `at`, side by side along the body's right (world:

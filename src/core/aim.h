@@ -29,7 +29,7 @@ void set_reticle_on(bool on);  // also written to the user ini
 // along, probed each other script tick: the drawn barrel's, or the game's own when it does not aim along the barrel).
 // start / end world; hit: the probe found a surface (else the end is 300 m out). False without a gun in hand, in Dead
 // Eye's marked shots, or with no fresh probe. Any thread (the eye blit draws it: round_draw).
-bool laser_ray(float start[3], float end[3], bool* hit);
+bool laser_ray(float start[3], float end[3], bool* hit, bool frame = false);  // frame: the per-frame draw (its research stats)
 bool laser_on();
 void set_laser_on(bool on);  // also written to the user ini
 // [Hands] ShotFromBarrel (on): each player shot leaves the drawn gun's muzzle along its drawn barrel (the game's spread

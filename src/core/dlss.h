@@ -9,8 +9,9 @@
 //  - H3: slSetTag and slEvaluateFeature (their import slots) take viewport 1 while the mod's evaluate runs (playback);
 //  - H4: slDLSSSetOptions (the game's cached pointer) also sends the options to viewport 1;
 //  - H5: slFreeResources frees viewport 1 before the game's viewport.
-// The slots are swapped lazily on the render thread, once each points into sl.interposer.dll (the game's packed
-// imports are resolved at run time). Kill switch: the first failed mod call turns it off (back to the shared viewport).
+// The slots are swapped lazily on the render thread (the game's packed imports are resolved at run time), each holding
+// sl.interposer.dll's export or another module's hook already in it (chained: a DLSS add-on such as Cheeky Foveated DLSS
+// patches them first). Kill switch: the first failed mod call turns it off (back to the shared viewport).
 
 #include <cstddef>
 #include <string>

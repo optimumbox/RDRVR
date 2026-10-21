@@ -10,6 +10,11 @@
 // sliding the fore-end back, then forward (two-handed). Until the action is worked the trigger's pull is held back
 // from the game (RT 0), so the game's own ammo count is never touched. Input level only: no game memory, no natives.
 // The bow is not in the game's data (BLOCKED, research 4).
+namespace rdrvr::body {
+struct BodyPoints;
+}
+struct RdrvrActorState;
+
 namespace rdrvr::actions {
 
 void init();  // a frame-end listener (after the holsters')
@@ -78,6 +83,34 @@ void set_breech_flick(bool on);  // also written to the user ini
 // from empty (drawn back with the hand, it springs forward let go: a shell chambered); its cycling between shots stays.
 bool semi_auto_parts();
 void set_semi_auto_parts(bool on);  // also written to the user ini
+// [Reload] PistolMagazines (on; 2026-10-20): the Semi-Auto, the High Power and the Mauser loaded by magazine: a flick
+// of the right stick down drops it, the other hand takes one at the chest and pushes it into the grip's bottom (the
+// mag well, the gun's loading ring), then racks the slide; no single rounds. The dropped magazine's rounds are kept.
+bool pistol_mags();
+void set_pistol_mags(bool on);  // also written to the user ini
+// The Mauser (2026-10-20) by a stripper clip instead, as the C96: the other hand pulls the bolt back by its ears (an
+// empty magazine holds it back), a clip from the chest goes down into the guide on top and stays there, a flick down
+// pulls the clip out and the bolt goes forward (working the bolt pushes it out too).
+bool mag_gun(int weapon);       // that gun is loaded by magazine (the Mauser by clip) now
+bool mag_in();                  // the gun in hand's magazine is in it
+bool mag_wanted();              // the gun in hand takes one now: its magazine out; the Mauser's bolt back with room
+// the magazine's length (its floorplate to its top, m) and the mag well from the gun hand's wrist: along the barrel, up;
+// the Mauser's clip (its ten rounds' stack)
+constexpr float kMagLength = 0.105f, kMagWellAlong = 0.04f, kMagWellUp = -0.045f, kClipLength = 0.100f;
+// the Semi-Auto pistol's toggle (2026-10-20, its fire clip): the rear link's turn at the top (degrees), the knee's rise
+// and move back there (m), the front link's turn by which its driver is scaled (degrees; body.cpp's kGunModels)
+constexpr float kToggleDeg = 66.6f, kToggleDy = 0.02424f, kToggleDz = 0.02131f, kToggleFrontDeg = -32.24f;
+// a gun's magazine (or clip): its length, where it goes in (from the wrist: along the barrel, up), its drawn family
+// (round_draw: 4 a pistol's magazine, 5 the Mauser's stripper clip)
+struct MagSpec {
+    float length, along, up;
+    int family;
+};
+MagSpec mag_spec(int weapon);
+void mag_well(const body::BodyPoints& bp, int weapon, float out[3]);  // where it goes in (world): the gun hand's wrist target, the barrel
+// holster.cpp: a magazine pushed into the gun in hand (its sound at `at`): the clip topped up from the spare rounds, the
+// slide to rack. False when the gun takes none now (one in it, Dead Eye, not a magazine gun).
+bool insert_mag(const RdrvrActorState& st, const float at[3]);
 // The gun in hand whose action the player works by hand and whose parts are drawn so (a lever gun with LeverParts, the
 // Pump-action with PumpParts, the bolt actions with BoltParts, the single shots with BreechParts, the Semi-Auto Shotgun
 // with SemiAutoParts): its

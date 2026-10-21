@@ -78,7 +78,8 @@ thread_local int t_pellets = 0;
 thread_local double t_first_err = -1.0, t_max_err = -1.0;
 thread_local float t_first_start[3] = {}, t_first_dir[3] = {}, t_first_speed = 0.0f;
 thread_local bool t_first_fresh = false;
-std::atomic<uint64_t> g_assist_off{0}, g_shots{0}, g_tracers{0};
+std::atomic<uint64_t> g_assist_off{0}, g_shots{0}, g_tracers{0}, g_untrue_shots{0};
+std::atomic<uint64_t> g_dist_raw_jumps{0}, g_dist_held_jumps{0};  // probes far off the held distance; changes of it
 std::atomic<double> g_last_override_ms{0.0};
 // the player's last shot as launched: start, velocity direction, and the angle to the barrel ray then (degrees)
 float g_shot_start[3] = {}, g_shot_dir[3] = {}, g_shot_err = -1;
@@ -254,9 +255,17 @@ float* aim_ray_apply(uintptr_t self, float* out, const float* yp) {
     }
     const uintptr_t actor = player_actor(), W = actor ? player_gun(actor) : 0;
     float gm[16];
-    if (!W || !raw(W + 0x80, gm, sizeof(gm))) {
-        g_no_gun.fetch_add(1, std::memory_order_relaxed);
-        return r;
+    {  // the game's matrix of the build the correction was drawn with, when it is this gun's (barrel_ray's)
+        float A2[9], a2[3];
+        bool ik2 = false;
+        uintptr_t Wd = 0;
+        if (W && body::item_gun(1, A2, a2, &ik2, gm, &Wd) && Wd == W && ik2) {
+            std::memcpy(A, A2, sizeof(A));
+            std::memcpy(a, a2, sizeof(a));
+        } else if (!W || !raw(W + 0x80, gm, sizeof(gm))) {
+            g_no_gun.fetch_add(1, std::memory_order_relaxed);
+            return r;
+        }
     }
     // the gun as drawn: each axis row turned by A, the origin through T(x) = A x + a
     float rows[4][3];
@@ -325,13 +334,24 @@ float* hk_aim_ray(uintptr_t self, float* out, const float* yp) {
 }
 
 // The drawn gun's barrel now (as hk_aim_ray places the shot): the muzzle and the direction. The game thread.
+// Why the last call failed (0 none): 1 no item correction, 2 the hand's IK not on, 3 no gun, 4 the direction, 5 the muzzle
+thread_local int t_br_fail = 0;
 bool barrel_ray(float muzzle[3], float dir[3]) {
     float A[9], a[3];
     bool ik = false;
-    if (!body::item_correction(1, A, a, &ik) || !ik) return false;
+    t_br_fail = 0;
     const uintptr_t actor = player_actor(), W = actor ? player_gun(actor) : 0;
     float gm[16];
-    if (!W || !raw(W + 0x80, gm, sizeof(gm))) return false;
+    uintptr_t Wd = 0;
+    // the gun as drawn: the correction and the game's matrix of the same build (2026-10-20: the live matrix against the
+    // drawn build's correction turned the barrel up to 19 degrees for a frame while the hand held still)
+    if (body::item_gun(1, A, a, &ik, gm, &Wd) && W && Wd == W) {
+        if (!ik) return t_br_fail = 2, false;
+    } else {
+        if (!body::item_correction(1, A, a, &ik)) return t_br_fail = 1, false;
+        if (!ik) return t_br_fail = 2, false;
+        if (!W || !raw(W + 0x80, gm, sizeof(gm))) return t_br_fail = 3, false;
+    }
     float rows[4][3];
     for (int i = 0; i < 3; ++i)
         for (int k = 0; k < 3; ++k) rows[i][k] = A[k * 3] * gm[i * 4] + A[k * 3 + 1] * gm[i * 4 + 1] + A[k * 3 + 2] * gm[i * 4 + 2];
@@ -348,9 +368,9 @@ bool barrel_ray(float muzzle[3], float dir[3]) {
         dir[k] = -rows[2][k];
         dl += dir[k] * dir[k];
     }
-    if (!(dl > 0.98f && dl < 1.02f)) return false;  // also catches NaN
+    if (!(dl > 0.98f && dl < 1.02f)) return t_br_fail = 4, false;  // also catches NaN
     for (int k = 0; k < 3; ++k)
-        if (!std::isfinite(muzzle[k])) return false;
+        if (!std::isfinite(muzzle[k])) return t_br_fail = 5, false;
     return true;
 }
 uint64_t f32bits(float f) {
@@ -380,18 +400,57 @@ void reticle_tick() {
             float dd = 0.0f;
             for (int k = 0; k < 3; ++k) dd += (r.vec[k] - req_m[k]) * (r.vec[k] - req_m[k]);
             const float dist = hit && std::isfinite(dd) ? std::sqrt(dd) : kProbeRange;
+            // The distance held steady (2026-10-20, the user: the dot "bounces"): the camera probe flips between two
+            // distances for an aim held almost still (65, 149, 69, 156 m on consecutive probes: a thin thing, branches,
+            // in and out of the ray). A distance far off the held one (over 30%, and 1 m) replaces it only once three
+            // probes in a row agree on it (about 0.1 s); near it, it is taken at once.
+            float held = dist;
+            bool held_hit = hit;
+            {
+                static float d_held = -1.0f, d_cand = -1.0f;
+                static bool hit_held = false, hit_cand = false;
+                static int n_cand = 0;
+                static uint64_t raw_jumps = 0, held_jumps = 0;
+                auto close_to = [](float x, float y) { return std::fabs(x - y) <= std::fmax(1.0f, 0.3f * std::fmin(x, y)); };
+                if (d_held < 0.0f || close_to(dist, d_held)) {
+                    d_held = dist;
+                    hit_held = hit;
+                    n_cand = 0;
+                } else {
+                    ++raw_jumps;
+                    if (n_cand > 0 && close_to(dist, d_cand)) {
+                        ++n_cand;
+                        d_cand = dist;
+                        hit_cand = hit;
+                    } else {
+                        n_cand = 1;
+                        d_cand = dist;
+                        hit_cand = hit;
+                    }
+                    if (n_cand >= 3) {
+                        ++held_jumps;
+                        d_held = d_cand;
+                        hit_held = hit_cand;
+                        n_cand = 0;
+                    }
+                }
+                held = d_held;
+                held_hit = hit_held;
+                g_dist_raw_jumps.store(raw_jumps, std::memory_order_relaxed);
+                g_dist_held_jumps.store(held_jumps, std::memory_order_relaxed);
+            }
             std::lock_guard lock(g_rp_mutex);
             std::memcpy(g_rp.muzzle, req_m, sizeof(req_m));
             std::memcpy(g_rp.dir, req_d, sizeof(req_d));
             std::memcpy(g_rp.hand, req_h, sizeof(req_h));
             g_rp.hand_ok = req_h_ok;
-            g_rp.dist = dist > kProbeRange ? kProbeRange : dist;
-            g_rp.hit = hit;
+            g_rp.dist = held > kProbeRange ? kProbeRange : held;
+            g_rp.hit = held_hit;
             g_rp.ms = now;
             g_rp.kind = req_kind;
             std::memcpy(g_rp.bm, req_bm, sizeof(req_bm));
             std::memcpy(g_rp.rot, req_rot, sizeof(req_rot));
-            if (hit) g_rp_hits.fetch_add(1, std::memory_order_relaxed);
+            if (held_hit) g_rp_hits.fetch_add(1, std::memory_order_relaxed);
         } else if (now - pending_ms > 500.0) {  // the plugin never ran it (a stall): given up
             api::cancel_op(pending);
             pending = 0;
@@ -636,6 +695,13 @@ void hk_launch(uintptr_t p, const float* mtx, int wtype, const float* vel, uint3
                 }
                 g_shot_err = 0.0f;
                 const uint64_t n = g_true_shots.fetch_add(1, std::memory_order_relaxed);
+                if (t_in_spawn && t_pellets == 0) {  // the spawn's summary line: this shot as moved
+                    t_first_err = 0.0;
+                    t_first_fresh = true;
+                    t_first_speed = vl;
+                    std::memcpy(t_first_start, bm, sizeof(bm));
+                    for (int k = 0; k < 3; ++k) t_first_dir[k] = nv[k] / vl;
+                }
                 if (!t_in_spawn || t_pellets++ == 0) {
                     const float dd = std::clamp(a[0] * d[0] + a[1] * d[1] + a[2] * d[2], -1.0f, 1.0f);
                     if (n < 40 || n % 50 == 0)
@@ -649,6 +715,14 @@ void hk_launch(uintptr_t p, const float* mtx, int wtype, const float* vel, uint3
                 return;
             }
         }
+    }
+    if (g_true_barrel.load(std::memory_order_relaxed) && (!t_in_spawn || t_pellets == 0)) {
+        // a shot left on the game's aim: why (the game's aim is its camera's, not the gun's)
+        static const char* const why[] = {"turned too far (over 154 deg)", "no item correction", "the hand's IK off", "no gun", "a bad barrel direction", "a bad muzzle"};
+        const char* reason = !mtx ? "no matrix" : vl <= 1e-3f ? "no speed" : dead_eye_firing_marks() ? "Dead Eye firing its marks" : why[t_br_fail >= 0 && t_br_fail <= 5 ? t_br_fail : 0];
+        g_untrue_shots.fetch_add(1, std::memory_order_relaxed);
+        log::info("[aim] shot NOT from the drawn barrel: %s (the game's aim dir (%.3f %.3f %.3f); %llu such)", reason, d[0], d[1], d[2],
+                  static_cast<unsigned long long>(g_untrue_shots.load()));
     }
     float start[3] = {0, 0, 0};
     if (mtx) raw(reinterpret_cast<uintptr_t>(mtx) + 48, start, sizeof(start));
@@ -1836,7 +1910,7 @@ bool reticle_target(float pos[3], bool* on_actor, float* size_deg, int which, bo
 // ray rides on the gun hand: its muzzle and direction in the hand's IK target's axes at the probe, carried by the axes
 // now; the game's own ray stays where it was probed (the shot goes there, not along the barrel). None in Dead Eye's
 // marked shots (the game turns each onto a mark) or without a gun in hand.
-bool laser_ray(float start[3], float end[3], bool* hit) {
+bool laser_ray(float start[3], float end[3], bool* hit, bool frame) {
     if (!g_laser.load(std::memory_order_relaxed)) return false;
     RdrvrActorState st{};
     if (!api::actor_state(&st) || !st.valid || !reload::is_gun(st.weapon) || dead_eye_firing_marks()) return false;
@@ -2041,15 +2115,16 @@ std::string command(const std::string& line) {
         float p[3] = {0, 0, 0}, sz = 0;
         bool act = false;
         const bool ok = reticle_target(p, &act, &sz);
-        char e[600];
-        std::snprintf(e, sizeof(e), "reticle %d (%s), now %s (%.2f %.2f %.2f)%s, size %.1f deg | shown %llu, (the old barrel-line rejects %llu) | muzzle (%.2f %.2f %.2f) dir (%.3f %.3f %.3f) | probes %llu hits %llu lost %llu, no gun %llu, no barrel %llu, red %llu, not red (the game's point elsewhere) %llu",
+        char e[700];
+        std::snprintf(e, sizeof(e), "reticle %d (%s), now %s (%.2f %.2f %.2f)%s, size %.1f deg | shown %llu, (the old barrel-line rejects %llu) | muzzle (%.2f %.2f %.2f) dir (%.3f %.3f %.3f) | probes %llu hits %llu lost %llu, no gun %llu, no barrel %llu, red %llu, not red (the game's point elsewhere) %llu | distance: %llu probes far off the held one, %llu changes of it",
                       g_reticle.load() ? 1 : 0, g_reticle_dot.load() ? "dot" : "ring", ok ? "at" : "none", p[0], p[1], p[2], act ? " on an actor" : "", sz,
                       static_cast<unsigned long long>(g_reticle_shown.load()), static_cast<unsigned long long>(g_reticle_offline.load()),
                       g_last_muzzle[0], g_last_muzzle[1], g_last_muzzle[2], g_last_dir[0], g_last_dir[1], g_last_dir[2],
                       static_cast<unsigned long long>(g_rp_probes.load()), static_cast<unsigned long long>(g_rp_hits.load()),
                       static_cast<unsigned long long>(g_rp_lost.load()), static_cast<unsigned long long>(g_rp_nogun.load()),
                       static_cast<unsigned long long>(g_rp_nobarrel.load()), static_cast<unsigned long long>(g_rp_red.load()),
-                      static_cast<unsigned long long>(g_rp_unred.load()));
+                      static_cast<unsigned long long>(g_rp_unred.load()), static_cast<unsigned long long>(g_dist_raw_jumps.load()),
+                      static_cast<unsigned long long>(g_dist_held_jumps.load()));
         return e;
     }
     if (line.find(" ledge") != std::string::npos) {  // aim ledge [trace on|off|reset]: the climb state (run 7 item 1f)

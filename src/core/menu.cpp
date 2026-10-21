@@ -1368,6 +1368,13 @@ void page_guns() {
                   "and the reticle sit on that line. Off: the game's own aim, as before."))
             aim::set_shot_from_barrel(sb);
     }
+    {  // 2026-10-20: [Hands] Recoil
+        float rc = body::recoil() * 100.0f;
+        if (nudge1("Recoil", &rc, 25.0f, 0.0f, 200.0f, "%.0f%%",
+                   "Each shot kicks the gun in your hand muzzle up and back a little, as the game's own animations do; the gun turns in "
+                   "John's grip, his hand stays on your controller. 0% = off, 100% = the default (a press 25%)."))
+            body::set_recoil(rc / 100.0f);
+    }
     bool kd = holster::keeps_drawn();
     if (check("Keep the gun drawn", &kd, "A drawn gun stays in your hand until you put it away (the game holsters it 3 s after your last shot).")) {
         holster::set_keeps_drawn(kd);
@@ -1664,6 +1671,14 @@ void page_reloading() {
     if (check("Semi-Auto Shotgun: the bolt racked by hand", &sa,
               "After loading it from empty, pull back the bolt's handle (right of the receiver) with your other hand and let go."))
         actions::set_semi_auto_parts(sa);
+    bool pm = actions::pistol_mags();  // 2026-10-20: [Reload] PistolMagazines
+    if (check("Pistols loaded by magazine", &pm,
+              "Semi-Auto and High Power: flick the right stick down to drop the magazine (its rounds are kept), take a new one "
+              "at your chest with your other hand, push it up into the bottom of the grip, then pull the slide back with your other "
+              "hand and let go. The Mauser loads as the real one does: pull its bolt back by the ears at the rear with your other "
+              "hand (it stays back when the gun is empty), push a stripper clip from your chest down into the top of the gun, "
+              "then flick the right stick down to pull the clip out: the bolt goes forward and chambers a round."))
+        actions::set_pistol_mags(pm);
     bool mb = actions::manual_break();
     if (check("Break actions opened by the stick", &mb,
               "Double-barrel and Sawed-off: open with a flick of the right stick down; shut with a flick of the gun up, or swing the "

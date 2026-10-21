@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <utility>
@@ -502,7 +503,7 @@ bool repaint(ID3D12CommandQueue* queue, ID3D12Resource* bb, uint32_t cw, uint32_
     if (!made) {  // its own lists, fence and view, once (one attempt)
         if (failed) return false;
         failed = true;
-        D3D12_DESCRIPTOR_HEAP_DESC rh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        D3D12_DESCRIPTOR_HEAP_DESC rh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};  // (the mirror's, the rounds' sRGB view)
         for (auto& a : g_m_alloc)
             if (FAILED(g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a)))) return false;
         if (FAILED(g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_m_alloc[0], nullptr, IID_PPV_ARGS(&g_m_list))) ||
@@ -549,6 +550,25 @@ bool repaint(ID3D12CommandQueue* queue, ID3D12Resource* bb, uint32_t cw, uint32_
     g_m_list->RSSetScissorRects(1, &sc);
     g_m_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     g_m_list->DrawInstanced(3, 1, 0, 0);
+    {  // 2026-10-21: the mod's rounds, magazines and laser over the left eye's image there too (a recording of the window)
+        const DXGI_FORMAT sf = f == DXGI_FORMAT_R8G8B8A8_UNORM ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                             : f == DXGI_FORMAT_B8G8R8A8_UNORM ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+                                                               : DXGI_FORMAT_UNKNOWN;
+        if (sf != DXGI_FORMAT_UNKNOWN) {  // the eyes' images are sRGB: the same light, encoded by the view
+            D3D12_CPU_DESCRIPTOR_HANDLE rtv2 = rtv;
+            rtv2.ptr += g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            D3D12_RENDER_TARGET_VIEW_DESC rv2{};
+            rv2.Format = sf;
+            rv2.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            g_dev->CreateRenderTargetView(bb, &rv2, rtv2);
+            // the image rect as ps_mirror fits it: scaled to fit, centred
+            const uint32_t bw = static_cast<uint32_t>(bd.Width), bh = bd.Height;
+            const double fit = std::fmin(static_cast<double>(bw) / cw, static_cast<double>(bh) / ch);
+            const uint32_t vw = static_cast<uint32_t>(cw * fit + 0.5), vh = static_cast<uint32_t>(ch * fit + 0.5);
+            round_draw::record_monitor(g_dev, g_m_list, rtv2, bw, bh, sf, s, vw < bw ? (bw - vw) / 2 : 0, vh < bh ? (bh - vh) / 2 : 0,
+                                       vw < bw ? vw : bw, vh < bh ? vh : bh);
+        }
+    }
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
     g_m_list->ResourceBarrier(1, &b);
     if (FAILED(g_m_list->Close())) return false;

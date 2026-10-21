@@ -23,7 +23,7 @@ namespace rdrvr::round_draw {
 namespace {
 
 // ---- the models: lathe profiles (radius, height along the axis, mm; the material), base at 0, tip up
-enum Mat { kBrass = 0, kLead = 1, kHull = 2, kLaser = 3 };
+enum Mat { kBrass = 0, kLead = 1, kHull = 2, kLaser = 3, kSteel = 4, kCopper = 5, kWood = 6 };
 struct Pt {
     float r, y;
     int mat;  // the band from this point to the next
@@ -48,6 +48,18 @@ const Pt kBeam[] = {{0, 0, kLaser}, {1000, 0, kLaser}, {1000, 1000, kLaser}, {0,
 const Pt kDot[] = {{0, -1000, kLaser},     {383, -924, kLaser}, {707, -707, kLaser}, {924, -383, kLaser}, {1000, 0, kLaser},
                    {924, 383, kLaser},     {707, 707, kLaser},  {383, 924, kLaser},  {0, 1000, kLaser}};
 constexpr int kSeg = 24;  // around the axis
+// 2026-10-20: the pistols' rounds, lying in their magazines (bullets forward): 9 mm Browning Long (the High Power's: a
+// 20 mm case, 28 in all) and 7.63 Mauser (a bottlenecked 25 mm case, 34.5 in all), copper-jacketed
+const Pt k9mm[] = {{0, 0, kBrass},      {4.8f, 0, kBrass},     {4.8f, 1.3f, kBrass},  {4.45f, 1.3f, kBrass}, {4.45f, 2.0f, kBrass},
+                   {4.75f, 2.4f, kBrass}, {4.75f, 20, kBrass},  {4.5f, 20, kCopper},   {4.5f, 22.5f, kCopper}, {3.9f, 25.5f, kCopper},
+                   {2.4f, 27.4f, kCopper}, {0, 28, kCopper}};
+// 9 mm Parabellum (the Semi-Auto's: a 19 mm case, 29.7 in all)
+const Pt k9para[] = {{0, 0, kBrass},       {4.95f, 0, kBrass},     {4.95f, 1.3f, kBrass}, {4.45f, 1.3f, kBrass}, {4.45f, 2.0f, kBrass},
+                     {4.9f, 2.4f, kBrass},  {4.82f, 19.1f, kBrass}, {4.5f, 19.1f, kCopper}, {4.5f, 21, kCopper}, {4.1f, 24.5f, kCopper},
+                     {3.0f, 27.8f, kCopper}, {1.5f, 29.3f, kCopper}, {0, 29.7f, kCopper}};
+const Pt k763[] = {{0, 0, kBrass},       {4.95f, 0, kBrass},    {4.95f, 1.2f, kBrass}, {4.5f, 1.2f, kBrass}, {4.5f, 2.0f, kBrass},
+                   {4.85f, 2.4f, kBrass}, {4.75f, 17.5f, kBrass}, {4.25f, 19.5f, kBrass}, {4.2f, 25, kBrass}, {3.93f, 25, kCopper},
+                   {3.93f, 28, kCopper}, {3.2f, 32, kCopper},   {1.8f, 34, kCopper},   {0, 34.5f, kCopper}};
 
 struct Vtx {
     float p[4];  // x y z (m), w the material
@@ -56,7 +68,7 @@ struct Vtx {
 struct Model {
     uint32_t first = 0, count = 0;
 };
-Model g_model[3];  // handgun, rifle, shotgun
+Model g_model[8];  // handgun, rifle, shotgun; [Reload] PistolMagazines: a pistol's magazine, the Mauser's clip (loaded, empty), the Semi-Auto's magazine
 Model g_beam, g_dot;  // the laser's
 std::vector<Vtx> g_mesh;
 
@@ -85,6 +97,60 @@ void lathe(const Pt* pts, int n, Model* out) {
     out->count = static_cast<uint32_t>(g_mesh.size()) - out->first;
 }
 
+// [Reload] PistolMagazines: a box (mm: x across, y from its base up, z front (-) to back (+)), each face flat-shaded,
+// added to the model being made
+void box(float x0, float x1, float y0, float y1, float z0, float z1, int mat) {
+    const float xa = x0 * 0.001f, xb = x1 * 0.001f, a = y0 * 0.001f, b = y1 * 0.001f, za = z0 * 0.001f, zb = z1 * 0.001f;
+    const float c[8][3] = {{xa, a, za}, {xb, a, za}, {xb, b, za}, {xa, b, za}, {xa, a, zb}, {xb, a, zb}, {xb, b, zb}, {xa, b, zb}};
+    const int f[6][4] = {{0, 3, 2, 1}, {4, 5, 6, 7}, {0, 4, 7, 3}, {1, 2, 6, 5}, {3, 7, 6, 2}, {0, 1, 5, 4}};
+    const float n[6][3] = {{0, 0, -1}, {0, 0, 1}, {-1, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, -1, 0}};
+    for (int i = 0; i < 6; ++i) {
+        const int q[6] = {f[i][0], f[i][1], f[i][2], f[i][0], f[i][2], f[i][3]};
+        for (int v : q) g_mesh.push_back(Vtx{{c[v][0], c[v][1], c[v][2], static_cast<float>(mat)}, {n[i][0], n[i][1], n[i][2]}});
+    }
+}
+// a round lying forward (its base at z = zb mm, its axis at height y mm, the bullet toward -z), 12 sides (a magazine's)
+void round_z(const Pt* pts, int n, float y, float zb) {
+    constexpr int kS = 12;
+    for (int i = 0; i + 1 < n; ++i) {
+        const Pt &a = pts[i], &b = pts[i + 1];
+        const float dr = b.r - a.r, dy = b.y - a.y, l = std::sqrt(dr * dr + dy * dy);
+        if (l < 1e-6f) continue;
+        const float nr = dy / l, na = -dr / l;  // outward: radial, along the axis (forward, -z)
+        for (int s = 0; s < kS; ++s) {
+            const float t0 = 6.2831853f * s / kS, t1 = 6.2831853f * (s + 1) / kS;
+            auto v = [&](float r, float ax, float t) {
+                const float c = std::cos(t), sn = std::sin(t);
+                g_mesh.push_back(Vtx{{r * c * 0.001f, (y + r * sn) * 0.001f, (zb - ax) * 0.001f, static_cast<float>(a.mat)}, {nr * c, nr * sn, -na}});
+            };
+            v(a.r, a.y, t0);
+            v(b.r, b.y, t0);
+            v(b.r, b.y, t1);
+            v(a.r, a.y, t0);
+            v(b.r, b.y, t1);
+            v(a.r, a.y, t1);
+        }
+    }
+}
+// a cylinder across (along x, from x0 to x1 mm, radius r, its axis at y, z), 12 sides with their ends
+void cyl_x(float r, float x0, float x1, float y, float z, int mat) {
+    constexpr int kS = 12;
+    for (int s = 0; s < kS; ++s) {
+        const float t0 = 6.2831853f * s / kS, t1 = 6.2831853f * (s + 1) / kS;
+        const float c0 = std::cos(t0), s0 = std::sin(t0), c1 = std::cos(t1), s1 = std::sin(t1);
+        auto v = [&](float x, float c, float sn, float nx, float ny, float nz) {
+            g_mesh.push_back(Vtx{{x * 0.001f, (y + r * c) * 0.001f, (z + r * sn) * 0.001f, static_cast<float>(mat)}, {nx, ny, nz}});
+        };
+        v(x0, c0, s0, 0, c0, s0), v(x1, c1, s1, 0, c1, s1), v(x1, c0, s0, 0, c0, s0);
+        v(x0, c0, s0, 0, c0, s0), v(x0, c1, s1, 0, c1, s1), v(x1, c1, s1, 0, c1, s1);
+        g_mesh.push_back(Vtx{{x1 * 0.001f, y * 0.001f, z * 0.001f, static_cast<float>(mat)}, {1, 0, 0}});
+        v(x1, c0, s0, 1, 0, 0), v(x1, c1, s1, 1, 0, 0);
+        g_mesh.push_back(Vtx{{x0 * 0.001f, y * 0.001f, z * 0.001f, static_cast<float>(mat)}, {-1, 0, 0}});
+        v(x0, c1, s1, -1, 0, 0), v(x0, c0, s0, -1, 0, 0);
+    }
+}
+int model_of(int family) { return family == 7 ? 6 : family == 6 ? 5 : family == 5 ? 4 : family == 4 ? 3 : family == 2 ? 1 : family == 3 ? 2 : 0; }
+
 // The vertex shader carries the model into the eye's view (L: rows of the model-to-view rotation, w the view-space
 // translation) and projects it as the game's Perspective does (row-vector, right-handed, standard Z): x' = (2x + (r+l)z)
 // / (r-l), y' likewise, z' = P22 z + P32, w = -z. The pixel shader drops what lies behind the game's own depth there.
@@ -95,7 +161,7 @@ cbuffer K : register(b0) {
     float4 zc;              // P22, P32, near, far
     float4 scale;           // depth texels per image pixel (x, y), brightness, the depth bias (m)
     uint4 dinfo;            // the eye's byte offset, the row pitch (bytes), width, height
-    uint4 dfmt;             // 0 D24 in the low bits, 1 float32; the game's depth used (1) or not (0)
+    uint4 dfmt;             // 0 D24 in the low bits, 1 float32; the game's depth used (1) or not (0); the test; the origin (x | y << 16)
 };
 ByteAddressBuffer depth : register(t0);
 struct V { float4 pos : SV_Position; float3 vp : TEXCOORD0; float3 n : TEXCOORD1; nointerpolation float mat : TEXCOORD2; };
@@ -111,7 +177,8 @@ V vs(float4 p : POSITION, float3 n : NORMAL) {
 }
 float4 ps(V i) : SV_Target {
     if (dfmt.y) {
-        uint2 q = min(uint2(i.pos.xy * scale.xy), uint2(dinfo.z - 1, dinfo.w - 1));
+        float2 org = float2(dfmt.w & 0xFFFF, dfmt.w >> 16);  // the image's origin in the target (the monitor's pillarbox)
+        uint2 q = min(uint2(max(i.pos.xy - org, 0) * scale.xy), uint2(dinfo.z - 1, dinfo.w - 1));
         uint raw = depth.Load(dinfo.x + q.y * dinfo.y + q.x * 4);
         float d = dfmt.x ? asfloat(raw) : (raw & 0xFFFFFF) / 16777215.0;
         float game = zc.z * zc.w / (zc.w - d * (zc.w - zc.z));  // the game's distance along the view axis there
@@ -123,7 +190,10 @@ float4 ps(V i) : SV_Target {
     if (i.mat < 0.5) { alb = float3(0.50, 0.33, 0.10); spc = float3(0.85, 0.68, 0.38); sh = 48; }
     else if (i.mat < 1.5) { alb = float3(0.20, 0.20, 0.22); spc = float3(0.25, 0.25, 0.27); sh = 18; }
     else if (i.mat < 2.5) { alb = float3(0.33, 0.03, 0.02); spc = float3(0.06, 0.05, 0.05); sh = 8; }
-    else return float4(1.0, 0.06, 0.03, 1);  // the laser: its own light
+    else if (i.mat < 3.5) return float4(1.0, 0.06, 0.03, 1);  // the laser: its own light
+    else if (i.mat < 4.5) { alb = float3(0.09, 0.09, 0.10); spc = float3(0.45, 0.45, 0.48); sh = 32; }  // blued steel (a magazine)
+    else if (i.mat < 5.5) { alb = float3(0.45, 0.20, 0.10); spc = float3(0.80, 0.50, 0.35); sh = 40; }  // a copper jacket
+    else { alb = float3(0.30, 0.16, 0.07); spc = float3(0.10, 0.08, 0.06); sh = 10; }  // walnut (a magazine's base)
     float dif = saturate(dot(N, Ld)), rim = saturate(1 - abs(dot(N, V)));
     float3 c = alb * (0.22 + 0.78 * dif) + spc * pow(saturate(dot(N, H)), sh) * (dif > 0) + alb * rim * rim * 0.25;
     return float4(c * scale.z, 1);
@@ -163,6 +233,17 @@ std::atomic<double> g_held_ms{0};
 bool held_now() {
     return g_hand.load(std::memory_order_relaxed) >= 0 && log::now_ms() - g_held_ms.load(std::memory_order_relaxed) < 250.0;
 }
+
+// [Reload] PistolMagazines: a dropped magazine, falling from where it left the grip for kDropS (then under the ground,
+// hidden by the scene's depth long before)
+constexpr double kDropS = 1.2;
+std::mutex g_drop_mutex;
+float g_drop_pose[12] = {};
+double g_drop_ms = -1e12;
+int g_drop_family = 4, g_drop_rounds = 0;
+float g_seat_pose[12] = {};  // the Mauser's clip in its guide (under g_drop_mutex)
+double g_seat_ms = -1e12;
+int g_seat_rounds = 0;
 
 // [Hands] LaserSight: a laser wanted within the last 250 ms (record sets it before it needs the depth)
 std::atomic<double> g_laser_ms{-1e9};
@@ -238,6 +319,11 @@ uint32_t g_w = 0, g_h = 0;
 DXGI_FORMAT g_fmt = DXGI_FORMAT_UNKNOWN;
 bool g_ready = false, g_failed = false;
 bool g_q_pending[kSlots] = {};
+// the monitor's copy (record_monitor): its own depth, the size of the back buffer, and the eye pass's depth content
+ID3D12DescriptorHeap* g_mdsv_heap = nullptr;
+ID3D12Resource* g_mzbuf = nullptr;
+uint32_t g_mz_w = 0, g_mz_h = 0, g_eye_dw = 0, g_eye_dh = 0;
+std::atomic<uint64_t> g_mon_drawn{0};
 std::atomic<uint64_t> g_drawn{0}, g_no_cam{0}, g_no_depth{0}, g_records{0};
 std::atomic<uint64_t> g_px[2] = {0, 0};  // the last counted pixels per eye
 std::atomic<uint64_t> g_px_frames{0}, g_px_seen[2] = {0, 0};
@@ -315,7 +401,7 @@ bool make(ID3D12Device* dev, uint32_t w, uint32_t h, DXGI_FORMAT fmt) {
     if (vs) vs->Release();
     if (ps) ps->Release();
     if (!ok) return false;
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSlots, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSlots * 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};  // (the eyes', the monitor's)
     D3D12_DESCRIPTOR_HEAP_DESC dd{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_srv_heap))) || FAILED(dev->CreateDescriptorHeap(&dd, IID_PPV_ARGS(&g_dsv_heap))))
         return false;
@@ -542,11 +628,21 @@ bool pose(const body::BodyPoints& bp, int hand, float* out) {
         to_world(ax, Y);
         normalize3(Y);
     }
-    {  // any axis across it
-        const float t[3] = {std::fabs(Y[1]) < 0.9f ? 0.0f : 1.0f, std::fabs(Y[1]) < 0.9f ? 1.0f : 0.0f, 0.0f};
-        X[0] = t[1] * Y[2] - t[2] * Y[1];
-        X[1] = t[2] * Y[0] - t[0] * Y[2];
-        X[2] = t[0] * Y[1] - t[1] * Y[0];
+    {  // across it: the thumb to the index (a magazine's flat sides pinched; 2026-10-20), else any axis
+        float tq[3] = {}, tl = 0.0f;
+        if (bp.tips_ok[hand]) {
+            float dt = 0.0f;
+            for (int k = 0; k < 3; ++k) tq[k] = bp.index_tip[hand][k] - bp.thumb_tip[hand][k], dt += tq[k] * Y[k];
+            for (int k = 0; k < 3; ++k) tq[k] -= dt * Y[k], tl += tq[k] * tq[k];
+        }
+        if (tl > 1e-6f) {
+            for (int k = 0; k < 3; ++k) X[k] = tq[k];
+        } else {
+            const float t[3] = {std::fabs(Y[1]) < 0.9f ? 0.0f : 1.0f, std::fabs(Y[1]) < 0.9f ? 1.0f : 0.0f, 0.0f};
+            X[0] = t[1] * Y[2] - t[2] * Y[1];
+            X[1] = t[2] * Y[0] - t[0] * Y[2];
+            X[2] = t[0] * Y[1] - t[1] * Y[0];
+        }
         normalize3(X);
         Z[0] = X[1] * Y[2] - X[2] * Y[1];
         Z[1] = X[2] * Y[0] - X[0] * Y[2];
@@ -667,6 +763,45 @@ void init() {
     lathe(kHandgun, static_cast<int>(sizeof(kHandgun) / sizeof(kHandgun[0])), &g_model[0]);
     lathe(kRifle, static_cast<int>(sizeof(kRifle) / sizeof(kRifle[0])), &g_model[1]);
     lathe(kShell, static_cast<int>(sizeof(kShell) / sizeof(kShell[0])), &g_model[2]);
+    {  // [Reload] PistolMagazines: the High Power's magazine (single stack, 11 x 31 mm, 105 tall with its top round): its
+       // floorplate, wider and longer, the body, the feed lips at the top and the top round (9 mm Browning Long) held
+       // between them, bullet forward
+        g_model[3].first = static_cast<uint32_t>(g_mesh.size());
+        box(-6.5f, 6.5f, 0.0f, 4.0f, -17.5f, 17.0f, kSteel);
+        box(-5.5f, 5.5f, 4.0f, 98.0f, -15.5f, 15.5f, kSteel);
+        box(-5.5f, -3.6f, 98.0f, 103.0f, -9.0f, 15.5f, kSteel);
+        box(3.6f, 5.5f, 98.0f, 103.0f, -9.0f, 15.5f, kSteel);
+        round_z(k9mm, static_cast<int>(sizeof(k9mm) / sizeof(k9mm[0])), 101.5f, 14.0f);
+        g_model[3].count = static_cast<uint32_t>(g_mesh.size()) - g_model[3].first;
+    }
+    // the Mauser's stripper clip (2026-10-20): ten 7.63 Mauser rounds stacked base to base on its rims, 100 mm, in a
+    // steel channel at their rear (its back and two flanges over the rims); empty, the channel alone (it falls away)
+    for (int full = 1; full >= 0; --full) {
+        Model& m = g_model[full ? 4 : 5];
+        m.first = static_cast<uint32_t>(g_mesh.size());
+        box(-5.6f, 5.6f, 0.0f, 100.0f, 16.0f, 17.0f, kSteel);
+        box(-5.6f, -4.5f, 0.0f, 100.0f, 13.0f, 16.0f, kSteel);
+        box(4.5f, 5.6f, 0.0f, 100.0f, 13.0f, 16.0f, kSteel);
+        if (full)
+            for (int r = 0; r < 10; ++r) round_z(k763, static_cast<int>(sizeof(k763) / sizeof(k763[0])), 5.0f + 9.9f * r, 16.0f);
+        m.count = static_cast<uint32_t>(g_mesh.size()) - m.first;
+    }
+    // one of the clip's rounds (its lowest place): the rounds left on a clip drawn by it, 9.9 mm apart
+    g_model[7].first = static_cast<uint32_t>(g_mesh.size());
+    round_z(k763, static_cast<int>(sizeof(k763) / sizeof(k763[0])), 5.0f, 16.0f);
+    g_model[7].count = static_cast<uint32_t>(g_mesh.size()) - g_model[7].first;
+    {  // the Semi-Auto pistol's (2026-10-20; a toggle lock, as the Luger): single stack, 11 x 30 mm, its base a walnut
+       // knob across it (gripped at both ends to pull it), the follower's button on its left side, the top round
+       // (9 mm Parabellum) between the feed lips, bullet forward
+        g_model[6].first = static_cast<uint32_t>(g_mesh.size());
+        cyl_x(7.0f, -9.0f, 9.0f, 7.0f, 0.0f, kWood);
+        box(-5.5f, 5.5f, 6.0f, 98.0f, -15.0f, 15.0f, kSteel);
+        box(-5.5f, -3.6f, 98.0f, 103.0f, -9.0f, 15.0f, kSteel);
+        box(3.6f, 5.5f, 98.0f, 103.0f, -9.0f, 15.0f, kSteel);
+        cyl_x(3.0f, -9.0f, -5.5f, 62.0f, 4.0f, kSteel);
+        round_z(k9para, static_cast<int>(sizeof(k9para) / sizeof(k9para[0])), 102.0f, 14.5f);
+        g_model[6].count = static_cast<uint32_t>(g_mesh.size()) - g_model[6].first;
+    }
     lathe(kBeam, static_cast<int>(sizeof(kBeam) / sizeof(kBeam[0])), &g_beam);
     lathe(kDot, static_cast<int>(sizeof(kDot) / sizeof(kDot[0])), &g_dot);
     g_grab_done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -781,18 +916,95 @@ void note_pass(int eye, const float* cam, float l, float r, float u, float d) {
     }
 }
 
+void drop_mag(const float pose[12], int family, int rounds) {
+    std::lock_guard lock(g_drop_mutex);
+    std::memcpy(g_drop_pose, pose, sizeof(g_drop_pose));
+    g_drop_family = family;
+    g_drop_rounds = rounds < 0 ? 0 : rounds > 10 ? 10 : rounds;
+    g_drop_ms = log::now_ms();
+    g_seat_ms = -1e12;  // (out of its guide)
+}
+
+void seat_clip(const float pose[12], int rounds) {
+    std::lock_guard lock(g_drop_mutex);
+    std::memcpy(g_seat_pose, pose, sizeof(g_seat_pose));
+    g_seat_rounds = rounds < 0 ? 0 : rounds > 10 ? 10 : rounds;
+    g_seat_ms = log::now_ms();
+}
+
 void set_held(int john_hand, int family) {
     g_hand.store(john_hand, std::memory_order_relaxed);
     g_family.store(family, std::memory_order_relaxed);
     g_held_ms.store(log::now_ms(), std::memory_order_relaxed);
 }
 
+namespace {
+// the monitor's pass (record_monitor): the left eye's draws into the back buffer's pillarboxed image rect
+struct Mon {
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv;
+    uint32_t ox, oy, vw, vh;
+};
+
+// the monitor's depth (the back buffer's size), made again when that changes
+bool monitor_depth(ID3D12Device* dev, uint32_t w, uint32_t h, uint64_t frame) {
+    if (!g_mdsv_heap) {
+        D3D12_DESCRIPTOR_HEAP_DESC dd{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        if (FAILED(dev->CreateDescriptorHeap(&dd, IID_PPV_ARGS(&g_mdsv_heap)))) return false;
+    }
+    if (g_mzbuf && g_mz_w == w && g_mz_h == h) return true;
+    if (g_mzbuf) g_grave.push_back({g_mzbuf, frame});
+    g_mzbuf = nullptr;
+    D3D12_HEAP_PROPERTIES dh{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC zd{};
+    zd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    zd.Width = w;
+    zd.Height = h;
+    zd.DepthOrArraySize = zd.MipLevels = 1;
+    zd.Format = DXGI_FORMAT_D32_FLOAT;
+    zd.SampleDesc.Count = 1;
+    zd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE cv{};
+    cv.Format = DXGI_FORMAT_D32_FLOAT;
+    cv.DepthStencil.Depth = 1.0f;
+    if (FAILED(dev->CreateCommittedResource(&dh, D3D12_HEAP_FLAG_NONE, &zd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(&g_mzbuf)))) return false;
+    g_mzbuf->SetName(L"RDRVR round depth (monitor)");
+    D3D12_DEPTH_STENCIL_VIEW_DESC dv{};
+    dv.Format = DXGI_FORMAT_D32_FLOAT;
+    dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    dev->CreateDepthStencilView(g_mzbuf, &dv, g_mdsv_heap->GetCPUDescriptorHandleForHeapStart());
+    g_mz_w = w;
+    g_mz_h = h;
+    log::info("[round] the monitor's copy: its depth made (%ux%u)", w, h);
+    return true;
+}
+
+void draw(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* const dst[2], const D3D12_CPU_DESCRIPTOR_HANDLE rtv[2],
+          uint32_t w, uint32_t h, DXGI_FORMAT fmt, int slot, uint32_t vw, uint32_t vh, uint32_t dw, uint32_t dh, const Mon* mon);
+}  // namespace
+
 void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* const dst[2], const D3D12_CPU_DESCRIPTOR_HANDLE rtv[2],
             uint32_t w, uint32_t h, DXGI_FORMAT fmt, int slot, uint32_t vw, uint32_t vh, uint32_t dw, uint32_t dh) {
+    draw(dev, cl, dst, rtv, w, h, fmt, slot, vw, vh, dw, dh, nullptr);
+}
+
+void record_monitor(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE rtv, uint32_t w, uint32_t h,
+                    DXGI_FORMAT fmt, int slot, uint32_t ox, uint32_t oy, uint32_t vw, uint32_t vh) {
+    if (!vw || !vh || ox + vw > w || oy + vh > h || ox > 0xFFFF || oy > 0xFFFF) return;
+    const Mon mon{rtv, ox, oy, vw, vh};
+    ID3D12Resource* const none[2] = {nullptr, nullptr};
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = {rtv, rtv};
+    draw(dev, cl, none, rtvs, w, h, fmt, slot % kSlots, vw, vh, 0, 0, &mon);
+}
+
+namespace {
+void draw(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* const dst[2], const D3D12_CPU_DESCRIPTOR_HANDLE rtv[2],
+          uint32_t w, uint32_t h, DXGI_FORMAT fmt, int slot, uint32_t vw, uint32_t vh, uint32_t dw, uint32_t dh, const Mon* mon) {
     if (slot < 0 || slot >= kSlots) return;
-    g_records.fetch_add(1, std::memory_order_relaxed);
-    g_rec_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
-    if (g_ready && g_q_pending[slot]) {  // this slot's counts from its last use (the GPU has passed it)
+    if (!mon) {
+        g_records.fetch_add(1, std::memory_order_relaxed);
+        g_rec_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    }
+    if (!mon && g_ready && g_q_pending[slot]) {  // this slot's counts from its last use (the GPU has passed it)
         uint64_t* q = nullptr;
         D3D12_RANGE r{slot * 4 * sizeof(uint64_t), (slot * 4 + 4) * sizeof(uint64_t)};
         if (SUCCEEDED(g_qread->Map(0, &r, reinterpret_cast<void**>(&q))) && q) {
@@ -808,17 +1020,25 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
         }
         g_q_pending[slot] = false;
     }
-    if (g_grab_phase.load(std::memory_order_acquire) == 2 && g_grab_slot == slot) write_grab();
+    if (!mon && g_grab_phase.load(std::memory_order_acquire) == 2 && g_grab_slot == slot) write_grab();
     if (!g_on.load(std::memory_order_relaxed) && !g_row_on.load(std::memory_order_relaxed) && !aim::laser_on()) return;
     const uint64_t frame = state::presents.load(std::memory_order_relaxed);
-    if (!g_ready && !g_failed) {
+    if (!mon && !g_ready && !g_failed) {
         g_ready = make(dev, w, h, fmt);
         g_failed = !g_ready;
         log::info("[round] the round's pipeline %s (%ux%u, format %d)", g_ready ? "made" : "NOT made", w, h, static_cast<int>(fmt));
     }
-    if (!g_ready || w != g_w || h != g_h || fmt != g_fmt) return;
-    // [XR] EyeShape: the eye image's rect at the image's origin (else the whole image)
-    const uint32_t iw = vw && vw <= w ? vw : w, ih = vh && vh <= h ? vh : h;
+    if (!g_ready || fmt != g_fmt || (!mon && (w != g_w || h != g_h))) return;
+    if (mon && !monitor_depth(dev, w, h, frame)) return;
+    if (mon) {  // the eye pass's depth content behind its image
+        dw = g_eye_dw;
+        dh = g_eye_dh;
+    } else {
+        g_eye_dw = dw;
+        g_eye_dh = dh;
+    }
+    // [XR] EyeShape: the eye image's rect at the image's origin (else the whole image); the monitor's, its rect
+    const uint32_t iw = mon ? vw : vw && vw <= w ? vw : w, ih = mon ? vh : vh && vh <= h ? vh : h;
     int cx = static_cast<int>(iw / 2), cy = static_cast<int>(ih / 2);  // the capture's crop centre (the round's, when drawn)
     struct AtEnd {
         ID3D12Device* dev;
@@ -826,8 +1046,11 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
         ID3D12Resource* const* dst;
         int slot;
         int *cx, *cy;
-        ~AtEnd() { grab_copy(dev, cl, dst, slot, *cx, *cy); }
-    } at_end{dev, cl, dst, slot, &cx, &cy};
+        bool on;
+        ~AtEnd() {
+            if (on) grab_copy(dev, cl, dst, slot, *cx, *cy);
+        }
+    } at_end{dev, cl, dst, slot, &cx, &cy, !mon};
     ensure_buffer(dev, frame);
     const int hand = g_hand.load(std::memory_order_relaxed);
     body::BodyPoints bp;
@@ -842,9 +1065,28 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
     if (!want_row) g_row_px[0] = g_row_px[1] = 0;  // no row drawn: none of it seen (its last count would stay)
     float ls[3], le[3];
     bool lhit = false;
-    const bool want_laser = aim::laser_ray(ls, le, &lhit);
+    const bool want_laser = aim::laser_ray(ls, le, &lhit, !mon);  // (the stats: the eyes' draw)
     if (want_laser) g_laser_ms.store(log::now_ms(), std::memory_order_relaxed);
-    if (!want_round && !want_row && !want_laser) return;
+    float dpz[12], spz[12];
+    bool want_drop = false, want_seat = false;
+    int drop_model = 3, drop_rounds = 0, seat_rounds = 0;
+    {  // PistolMagazines: the dropped magazine, its fall (y up)
+        std::lock_guard lock(g_drop_mutex);
+        const double t = (log::now_ms() - g_drop_ms) / 1000.0;
+        if (g_on.load(std::memory_order_relaxed) && t >= 0.0 && t < kDropS) {
+            std::memcpy(dpz, g_drop_pose, sizeof(dpz));
+            drop_model = model_of(g_drop_family);
+            drop_rounds = g_drop_family == 6 ? g_drop_rounds : 0;
+            dpz[10] -= static_cast<float>(0.5 * 9.8 * t * t);
+            want_drop = true;
+        }
+        if (g_on.load(std::memory_order_relaxed) && log::now_ms() - g_seat_ms < 100.0) {
+            std::memcpy(spz, g_seat_pose, sizeof(spz));
+            seat_rounds = g_seat_rounds;
+            want_seat = true;
+        }
+    }
+    if (!want_round && !want_row && !want_laser && !want_drop && !want_seat) return;
     // the newest frame with both eyes' cameras (and depths, if they are used)
     PassCam cam[2];
     uint64_t use = ~0ull;
@@ -898,12 +1140,12 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
     }
     const int fam = g_family.load(std::memory_order_relaxed);
     if (fam == 3 && g_mode.load(std::memory_order_relaxed) == 2) round_ok = false;  // the game's own shell is held (held_prop)
-    if (!round_ok && !want_row && !want_laser) return;
-    const Model& m = g_model[fam == 2 ? 1 : fam == 3 ? 2 : 0];
-    const Model& rm = g_model[row.family == 2 ? 1 : row.family == 3 ? 2 : 0];
+    if (!round_ok && !want_row && !want_laser && !want_drop && !want_seat) return;
+    const Model& m = g_model[model_of(fam)];
+    const Model& rm = g_model[model_of(row.family)];
     // the row: standing (base to tip up), side by side along the body's right, centred on the zone; a shell's width
     // apart, a rifle round's, a handgun round's
-    const float gap = row.family == 3 ? 0.026f : row.family == 2 ? 0.017f : 0.016f;
+    const float gap = row.family == 5 ? 0.030f : row.family == 4 || row.family == 7 ? 0.024f : row.family == 3 ? 0.026f : row.family == 2 ? 0.017f : 0.016f;
     float rz[3];  // X x Y: the right-handed third axis (the body's back)
     rz[0] = row.rgt[1] * row.up[2] - row.rgt[2] * row.up[1];
     rz[1] = row.rgt[2] * row.up[0] - row.rgt[0] * row.up[2];
@@ -919,7 +1161,7 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
         sv.Buffer.NumElements = static_cast<UINT>(g_dbuf_size.load(std::memory_order_relaxed) / 4);
         sv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
         D3D12_CPU_DESCRIPTOR_HANDLE hc = g_srv_heap->GetCPUDescriptorHandleForHeapStart();
-        hc.ptr += static_cast<SIZE_T>(slot) * g_srv_step;
+        hc.ptr += static_cast<SIZE_T>(mon ? kSlots + slot : slot) * g_srv_step;
         dev->CreateShaderResourceView(buf, &sv, hc);
     }
     cl->SetGraphicsRootSignature(g_root);
@@ -928,16 +1170,17 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
     cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     D3D12_VERTEX_BUFFER_VIEW vbv{g_vb->GetGPUVirtualAddress(), static_cast<UINT>(g_mesh.size() * sizeof(Vtx)), sizeof(Vtx)};
     cl->IASetVertexBuffers(0, 1, &vbv);
-    D3D12_VIEWPORT vp{0, 0, static_cast<float>(iw), static_cast<float>(ih), 0, 1};
-    D3D12_RECT sc{0, 0, static_cast<LONG>(iw), static_cast<LONG>(ih)};
+    const uint32_t ox = mon ? mon->ox : 0, oy = mon ? mon->oy : 0;
+    D3D12_VIEWPORT vp{static_cast<float>(ox), static_cast<float>(oy), static_cast<float>(iw), static_cast<float>(ih), 0, 1};
+    D3D12_RECT sc{static_cast<LONG>(ox), static_cast<LONG>(oy), static_cast<LONG>(ox + iw), static_cast<LONG>(oy + ih)};
     cl->RSSetViewports(1, &vp);
     cl->RSSetScissorRects(1, &sc);
     D3D12_GPU_DESCRIPTOR_HANDLE hg = g_srv_heap->GetGPUDescriptorHandleForHeapStart();
-    hg.ptr += static_cast<UINT64>(slot) * g_srv_step;
+    hg.ptr += static_cast<UINT64>(mon ? kSlots + slot : slot) * g_srv_step;
     if (buf) cl->SetGraphicsRootDescriptorTable(1, hg);
-    const D3D12_CPU_DESCRIPTOR_HANDLE dsv = g_dsv_heap->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE dsv = (mon ? g_mdsv_heap : g_dsv_heap)->GetCPUDescriptorHandleForHeapStart();
     const int gpar = static_cast<int>(use % kKeep);
-    for (int e = 0; e < 2; ++e) {
+    for (int e = 0; e < (mon ? 1 : 2); ++e) {  // (the monitor: the left eye's)
         const PassCam& c = cam[e];
         Consts k{};
         const double* rows[3] = {c.a, c.b, c.c};
@@ -978,11 +1221,12 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
                         : 0u;  // else D24 in the low bits (measured: the scene depth is D24S8, standard Z)
         k.dfmt[1] = occlude && buf ? 1u : 0u;
         k.dfmt[2] = g_ndc.load(std::memory_order_relaxed) ? 1u : 0u;
-        {
+        k.dfmt[3] = ox | oy << 16;
+        if (!mon) {
             std::lock_guard lock(g_last_mutex);
             std::memcpy(g_last_k[e], &k, sizeof(k));
         }
-        if (e == g_grab_eye && vz < -0.01) {  // the round's centre in this image (the capture's crop)
+        if (!mon && e == g_grab_eye && vz < -0.01) {  // the round's centre in this image (the capture's crop)
             const double x = k.L[0][3], y = k.L[1][3], z = vz;
             const double nx = (2 * x / -z - (c.r + c.l)) / (c.r - c.l), ny = (2 * y / -z - (c.u + c.dn)) / (c.u - c.dn);
             cx = static_cast<int>((nx * 0.5 + 0.5) * iw);
@@ -990,16 +1234,34 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
         }
         cl->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
         cl->OMSetRenderTargets(1, &rtv[e], FALSE, &dsv);
-        // every query is ended each use (an empty one counts 0): the round's, then the row's
-        cl->BeginQuery(g_qheap, D3D12_QUERY_TYPE_OCCLUSION, static_cast<UINT>(slot * 4 + e));
+        // every query is ended each use (an empty one counts 0): the round's, then the row's (the eyes' only)
+        if (!mon) cl->BeginQuery(g_qheap, D3D12_QUERY_TYPE_OCCLUSION, static_cast<UINT>(slot * 4 + e));
         if (round_ok) {
             cl->SetGraphicsRoot32BitConstants(0, kConsts, &k, 0);
             cl->DrawInstanced(m.count, 1, m.first, 0);
         }
-        cl->EndQuery(g_qheap, D3D12_QUERY_TYPE_OCCLUSION, static_cast<UINT>(slot * 4 + e));
-        cl->BeginQuery(g_qheap, D3D12_QUERY_TYPE_OCCLUSION, static_cast<UINT>(slot * 4 + 2 + e));
+        // a clip's (or magazine's) pose and the rounds left on the Mauser's clip: its top ones, each a place higher
+        auto draw_clip = [&](const float* q, int model, int rounds) {
+            place(q, q + 3, q + 6, q + 9, nullptr);
+            cl->SetGraphicsRoot32BitConstants(0, kConsts, &k, 0);
+            cl->DrawInstanced(g_model[model].count, 1, g_model[model].first, 0);
+            for (int r = 10 - rounds; r < 10; ++r) {
+                float rp[3];
+                for (int i = 0; i < 3; ++i) rp[i] = q[9 + i] + q[3 + i] * (0.0099f * r);
+                place(q, q + 3, q + 6, rp, nullptr);
+                cl->SetGraphicsRoot32BitConstants(0, kConsts, &k, 0);
+                cl->DrawInstanced(g_model[7].count, 1, g_model[7].first, 0);
+            }
+        };
+        if (want_drop) draw_clip(dpz, drop_model, drop_rounds);
+        if (want_seat) draw_clip(spz, 5, seat_rounds);
+        if (want_drop || want_seat) place(X, Y, Z, P, nullptr);  // (the round's, for the rest)
+        if (!mon) {
+            cl->EndQuery(g_qheap, D3D12_QUERY_TYPE_OCCLUSION, static_cast<UINT>(slot * 4 + e));
+            cl->BeginQuery(g_qheap, D3D12_QUERY_TYPE_OCCLUSION, static_cast<UINT>(slot * 4 + 2 + e));
+        }
         if (want_row) {
-            const int nr = row.n > 6 ? 6 : row.n;
+            const int nr = row.n > 8 ? 8 : row.n;  // (the Volcanic's eight)
             for (int r = 0; r < nr; ++r) {
                 const float side = (static_cast<float>(r) - 0.5f * static_cast<float>(nr - 1)) * gap;
                 const float Pr[3] = {row.at[0] + row.rgt[0] * side, row.at[1] + row.rgt[1] * side, row.at[2] + row.rgt[2] * side};
@@ -1008,7 +1270,7 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
                 cl->DrawInstanced(rm.count, 1, rm.first, 0);
             }
         }
-        cl->EndQuery(g_qheap, D3D12_QUERY_TYPE_OCCLUSION, static_cast<UINT>(slot * 4 + 2 + e));
+        if (!mon) cl->EndQuery(g_qheap, D3D12_QUERY_TYPE_OCCLUSION, static_cast<UINT>(slot * 4 + 2 + e));
         if (want_laser) {
             // the beam in segments growing away from the muzzle (s_i = L (i/N)^2), each as wide as kBeamRad of this eye's
             // distance to it (at least kBeamMin): about a pixel's width near and far
@@ -1050,13 +1312,17 @@ void record(ID3D12Device* dev, ID3D12GraphicsCommandList* cl, ID3D12Resource* co
             k.scale[3] = bias;
         }
     }
+    if (mon) {
+        g_mon_drawn.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     if (want_laser) aim::count_laser_drawn();
     cl->ResolveQueryData(g_qheap, D3D12_QUERY_TYPE_OCCLUSION, static_cast<UINT>(slot * 4), 4, g_qread, slot * 4 * sizeof(uint64_t));
     g_q_pending[slot] = true;
     if (round_ok) g_drawn.fetch_add(1, std::memory_order_relaxed);
     if (want_row) g_row_drawn.fetch_add(1, std::memory_order_relaxed);
-
 }
+}  // namespace
 
 std::string command(const std::string& line) {
     std::istringstream in(line);
@@ -1160,12 +1426,12 @@ void status_text(char* out, size_t len) {
         std::memcpy(a, g_axis, sizeof(a));
     }
     std::snprintf(out, len,
-                  "round %s (mode %d), held %d (hand %d, family %d), pipeline %s, records %llu, drawn %llu, no cameras %llu, no depth %llu, "
+                  "round %s (mode %d), held %d (hand %d, family %d), pipeline %s, records %llu, drawn %llu (monitor %llu), no cameras %llu, no depth %llu, "
                   "pixels L %llu R %llu (frames counted %llu, seen L %llu R %llu), depth taps %llu (frames %llu, most a frame %d, extra %llu), "
                   "depth %ux%u pitch %u format %u, occlude %d, axes from %d, offset %.3f %.3f %.3f, axis %.2f %.2f %.2f, threads pass %u tap %u record %u",
                   g_on.load() ? "on" : "off", g_mode.load(), held_now() ? 1 : 0, g_hand.load(), g_family.load(), g_ready ? "made" : g_failed ? "failed" : "not made",
                   static_cast<unsigned long long>(g_records.load()), static_cast<unsigned long long>(g_drawn.load()),
-                  static_cast<unsigned long long>(g_no_cam.load()), static_cast<unsigned long long>(g_no_depth.load()),
+                  static_cast<unsigned long long>(g_mon_drawn.load()), static_cast<unsigned long long>(g_no_cam.load()), static_cast<unsigned long long>(g_no_depth.load()),
                   static_cast<unsigned long long>(g_px[0].load()), static_cast<unsigned long long>(g_px[1].load()),
                   static_cast<unsigned long long>(g_px_frames.load()), static_cast<unsigned long long>(g_px_seen[0].load()),
                   static_cast<unsigned long long>(g_px_seen[1].load()), static_cast<unsigned long long>(g_taps.load()),
